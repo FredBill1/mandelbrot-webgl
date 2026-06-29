@@ -30,8 +30,53 @@ describe("ReferenceManager", () => {
 
     const selected = manager.selectBest(nearShort, maxIter, view.revision);
     expect(selected?.centerRe).toBe("complete");
+    expect(manager.selectCandidates(nearShort, maxIter, view.revision, 2).map((reference) => reference.centerRe)).toEqual(["complete", "short"]);
+  });
+
+  it("does not evict references just because the count exceeds 128", async () => {
+    const maxIter = 16;
+    const client = makeClient(maxIter);
+    const manager = new ReferenceManager(client);
+    const view = makeView(maxIter);
+
+    for (let i = 0; i < 140; i += 1) {
+      await manager.ensureTileReference(view, makeTile(`ref-${i}`, i, i), 128);
+    }
+
+    expect(manager.size).toBe(140);
+    expect(manager.bytes).toBeLessThan(128 * 1024 * 1024);
+  });
+
+  it("keeps pinned active references when trimming old revisions", async () => {
+    const maxIter = 16;
+    const client = makeClient(maxIter);
+    const manager = new ReferenceManager(client);
+    const oldView = makeView(maxIter);
+    const oldReference = await manager.ensureTileReference(oldView, makeTile("old", 100, 100), 128);
+    manager.setPinnedReferenceIds([oldReference.id]);
+
+    await manager.ensureViewReference({ ...oldView, re: "new", revision: 5 });
+
+    expect(manager.getById(oldReference.id)?.centerRe).toBe("old");
   });
 });
+
+function makeClient(maxIter: number): ReferenceClient {
+  return {
+    compute: vi.fn(async (centerRe: string, centerIm: string, _scale: string, requestedMaxIter: number, minPrecisionBits: number) => {
+      const escapedAt = centerRe === "complete" ? requestedMaxIter : Math.min(maxIter, 32);
+      return {
+        centerRe,
+        centerIm,
+        precisionBits: minPrecisionBits,
+        escapedAt,
+        orbitRe: new Float64Array(escapedAt + 1),
+        orbitIm: new Float64Array(escapedAt + 1)
+      } satisfies RawReferenceResult;
+    }),
+    dispose: vi.fn()
+  } as unknown as ReferenceClient;
+}
 
 function makeView(maxIter: number): RuntimeView {
   return {

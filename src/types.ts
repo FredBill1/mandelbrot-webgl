@@ -1,6 +1,7 @@
 export const BASE_VIEW_WIDTH = 3.5;
 export const TILE_SIZE = 128;
 export const TEXTURE_CACHE_BYTES = 256 * 1024 * 1024;
+export const REFERENCE_CACHE_SOFT_BYTES = 128 * 1024 * 1024;
 export const SERIES_DEGREE = 8;
 
 export interface ViewState {
@@ -63,11 +64,19 @@ export interface RenderTileMessage {
   canvasHeight: number;
   pixelSpan: number;
   maxIter: number;
-  reference: ReferenceSnapshot;
+  references: ReferenceSnapshot[];
   seriesDegree: number;
   paletteId: string;
   refined: boolean;
   refinementLevel: number;
+}
+
+export interface UnresolvedCluster {
+  screenX: number;
+  screenY: number;
+  pixelCount: number;
+  survivedIter: number;
+  radiusPx: number;
 }
 
 export interface TileStats {
@@ -77,8 +86,10 @@ export interface TileStats {
   escapedPixels: number;
   seriesSkip: number;
   referenceId: string;
+  referenceIdsUsed: string[];
   unresolvedScreenX: number | undefined;
   unresolvedScreenY: number | undefined;
+  unresolvedClusters: UnresolvedCluster[];
 }
 
 export interface TileDoneMessage {

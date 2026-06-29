@@ -1,4 +1,4 @@
-import type { ReferenceSnapshot, RuntimeView, TileDescriptor } from "../types";
+import { REFERENCE_CACHE_SOFT_BYTES, type ReferenceSnapshot, type RuntimeView, type TileDescriptor } from "../types";
 import { ReferenceClient } from "./referenceClient";
 
 interface ReferenceKey {
@@ -10,6 +10,7 @@ interface ReferenceKey {
 
 export class ReferenceManager {
   private readonly references = new Map<string, ReferenceSnapshot>();
+  private readonly pinnedReferenceIds = new Set<string>();
   private currentViewReference: ReferenceSnapshot | undefined;
   private sequence = 0;
 
@@ -21,6 +22,22 @@ export class ReferenceManager {
 
   get entries(): ReferenceSnapshot[] {
     return [...this.references.values()];
+  }
+
+  get bytes(): number {
+    let total = 0;
+    for (const reference of this.references.values()) total += referenceBytes(reference);
+    return total;
+  }
+
+  getById(id: string): ReferenceSnapshot | undefined {
+    return this.entries.find((reference) => reference.id === id);
+  }
+
+  setPinnedReferenceIds(ids: Iterable<string>): void {
+    this.pinnedReferenceIds.clear();
+    for (const id of ids) this.pinnedReferenceIds.add(id);
+    this.trim(this.currentViewReference?.revision ?? 0);
   }
 
   async ensureViewReference(view: RuntimeView): Promise<ReferenceSnapshot> {
@@ -52,25 +69,36 @@ export class ReferenceManager {
   }
 
   selectBest(tile: TileDescriptor, maxIter: number, revision: number): ReferenceSnapshot | undefined {
-    let bestComplete: ReferenceSnapshot | undefined;
-    let bestCompleteDistance = Number.POSITIVE_INFINITY;
-    let bestAny: ReferenceSnapshot | undefined;
-    let bestAnyDistance = Number.POSITIVE_INFINITY;
-    for (const reference of this.references.values()) {
-      if (reference.maxIter !== maxIter || reference.revision !== revision) continue;
-      const distance = Math.hypot(tile.centerScreenX - reference.screenX, tile.centerScreenY - reference.screenY);
-      if (reference.escapedAt >= maxIter && distance < bestCompleteDistance) {
-        bestCompleteDistance = distance;
-        bestComplete = reference;
-      }
-      if (distance < bestAnyDistance) {
-        bestAnyDistance = distance;
-        bestAny = reference;
-      }
+    return this.selectCandidates(tile, maxIter, revision, 1)[0];
+  }
+
+  selectCandidates(tile: TileDescriptor, maxIter: number, revision: number, maxCount: number): ReferenceSnapshot[] {
+    const candidates = this.entries
+      .filter((reference) => reference.maxIter === maxIter && reference.revision === revision)
+      .map((reference) => ({
+        reference,
+        distance: Math.hypot(tile.centerScreenX - reference.screenX, tile.centerScreenY - reference.screenY)
+      }));
+    if (candidates.length === 0) {
+      return this.currentViewReference?.revision === revision ? [this.currentViewReference] : [];
     }
-    if (bestComplete && bestCompleteDistance <= 2048) return bestComplete;
-    if (bestAny && bestAnyDistance <= 768) return bestAny;
-    return this.currentViewReference?.revision === revision ? this.currentViewReference : bestAny;
+
+    const byOrbit = [...candidates].sort((a, b) => {
+      const completeDelta = Number(b.reference.escapedAt >= maxIter) - Number(a.reference.escapedAt >= maxIter);
+      if (completeDelta !== 0) return completeDelta;
+      const escapedDelta = b.reference.escapedAt - a.reference.escapedAt;
+      if (escapedDelta !== 0) return escapedDelta;
+      return a.distance - b.distance;
+    });
+    const byDistance = [...candidates].sort((a, b) => a.distance - b.distance);
+
+    const selected = new Map<string, ReferenceSnapshot>();
+    for (const entry of byOrbit.slice(0, Math.max(1, Math.ceil(maxCount * 0.75)))) selected.set(entry.reference.id, entry.reference);
+    for (const entry of byDistance) {
+      selected.set(entry.reference.id, entry.reference);
+      if (selected.size >= maxCount) break;
+    }
+    return [...selected.values()].slice(0, maxCount);
   }
 
   dispose(): void {
@@ -130,16 +158,25 @@ export class ReferenceManager {
 
   private trim(currentRevision: number): void {
     for (const [key, reference] of this.references.entries()) {
-      if (reference.revision < currentRevision - 2) this.references.delete(key);
+      if (reference.revision < currentRevision - 2 && !this.pinnedReferenceIds.has(reference.id)) this.references.delete(key);
     }
-    while (this.references.size > 128) {
-      const first = this.references.keys().next().value as string | undefined;
-      if (!first) break;
-      this.references.delete(first);
+    while (this.bytes > REFERENCE_CACHE_SOFT_BYTES) {
+      let deleted = false;
+      for (const [key, reference] of this.references.entries()) {
+        if (this.pinnedReferenceIds.has(reference.id)) continue;
+        this.references.delete(key);
+        deleted = true;
+        break;
+      }
+      if (!deleted) break;
     }
   }
 }
 
 function referenceKey(key: ReferenceKey): string {
   return `${key.centerRe}|${key.centerIm}|${key.maxIter}|${key.precisionBits}`;
+}
+
+function referenceBytes(reference: ReferenceSnapshot): number {
+  return reference.orbitRe.byteLength + reference.orbitIm.byteLength;
 }

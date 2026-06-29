@@ -1,47 +1,72 @@
 import { buildSeriesPlan, evaluateSeries } from "../math/series";
-import type { ReferenceSnapshot, RenderTileMessage, TileDoneMessage } from "../types";
+import type { ReferenceSnapshot, RenderTileMessage, TileDoneMessage, UnresolvedCluster } from "../types";
 
 interface PixelResult {
   iter: number;
   mag2: number;
   glitch: boolean;
   unresolved: boolean;
+  survivedIter: number;
 }
 
-const MAX_REFERENCE_REFINEMENTS = 8;
+interface ReferenceContext {
+  reference: ReferenceSnapshot;
+  orbitRe: Float64Array;
+  orbitIm: Float64Array;
+  series: ReturnType<typeof buildSeriesPlan>;
+}
+
+interface ClusterAccumulator {
+  count: number;
+  sumX: number;
+  sumY: number;
+  bestX: number;
+  bestY: number;
+  bestSurvivedIter: number;
+}
 
 export function renderPerturbationTile(message: RenderTileMessage): TileDoneMessage {
   const started = performance.now();
-  const { tile, reference, pixelSpan, maxIter, seriesDegree } = message;
-  const refinementLevel = Math.max(0, message.refinementLevel);
+  const { tile, pixelSpan, maxIter, seriesDegree } = message;
   const width = Math.max(1, Math.floor(tile.rect.width));
   const height = Math.max(1, Math.floor(tile.rect.height));
   const rgba = new Uint8ClampedArray(width * height * 4);
-  const orbitRe = asFloat64(reference.orbitRe);
-  const orbitIm = asFloat64(reference.orbitIm);
-  const radius = tileRadius(tile.rect, reference, pixelSpan);
-  const series = buildSeriesPlan(orbitRe, orbitIm, seriesDegree, 64, radius);
+  const contexts = message.references.map((reference) => {
+    const orbitRe = asFloat64(reference.orbitRe);
+    const orbitIm = asFloat64(reference.orbitIm);
+    const radius = tileRadius(tile.rect, reference, pixelSpan);
+    return {
+      reference,
+      orbitRe,
+      orbitIm,
+      series: buildSeriesPlan(orbitRe, orbitIm, seriesDegree, 64, radius)
+    } satisfies ReferenceContext;
+  });
 
   let glitchCount = 0;
   let unresolvedCount = 0;
   let escapedPixels = 0;
   let unresolvedScreenXSum = 0;
   let unresolvedScreenYSum = 0;
+  let seriesSkip = 0;
+  const usedReferenceIds = new Set<string>();
+  const clusters = createClusterAccumulators();
 
   for (let py = 0; py < height; py += 1) {
     for (let px = 0; px < width; px += 1) {
       const screenX = tile.rect.x + px + 0.5;
       const screenY = tile.rect.y + py + 0.5;
-      const cRe = (screenX - reference.screenX) * pixelSpan;
-      const cIm = (screenY - reference.screenY) * pixelSpan;
-      const result = perturb(cRe, cIm, orbitRe, orbitIm, maxIter, series);
+      const { result, referenceId, skip } = renderPixelWithReferences(screenX, screenY, pixelSpan, maxIter, contexts);
       const offset = (py * width + px) * 4;
       if (result.iter < maxIter) escapedPixels += 1;
       if (result.glitch) glitchCount += 1;
+      if (referenceId) usedReferenceIds.add(referenceId);
+      seriesSkip = Math.max(seriesSkip, skip);
       if (result.unresolved) {
         unresolvedCount += 1;
         unresolvedScreenXSum += screenX;
         unresolvedScreenYSum += screenY;
+        recordUnresolvedCluster(clusters, tile.rect, screenX, screenY, result.survivedIter);
       }
       colorPixel(rgba, offset, result.iter, maxIter, result.mag2);
     }
@@ -49,7 +74,8 @@ export function renderPerturbationTile(message: RenderTileMessage): TileDoneMess
 
   const unresolvedScreenX = unresolvedCount > 0 ? unresolvedScreenXSum / unresolvedCount : undefined;
   const unresolvedScreenY = unresolvedCount > 0 ? unresolvedScreenYSum / unresolvedCount : undefined;
-  const needsReference = unresolvedCount > 0 && refinementLevel < MAX_REFERENCE_REFINEMENTS;
+  const unresolvedClusters = buildUnresolvedClusters(clusters, tile.rect);
+  const referenceIdsUsed = [...usedReferenceIds];
 
   return {
     type: "tileDone",
@@ -59,17 +85,49 @@ export function renderPerturbationTile(message: RenderTileMessage): TileDoneMess
     width,
     height,
     rgba: rgba.buffer,
-    needsReference,
+    needsReference: unresolvedClusters.length > 0,
     stats: {
       elapsedMs: performance.now() - started,
       glitchCount,
       unresolvedCount,
       escapedPixels,
-      seriesSkip: series.skip,
-      referenceId: reference.id,
+      seriesSkip,
+      referenceId: referenceIdsUsed[0] ?? contexts[0]?.reference.id ?? "",
+      referenceIdsUsed,
       unresolvedScreenX,
-      unresolvedScreenY
+      unresolvedScreenY,
+      unresolvedClusters
     }
+  };
+}
+
+function renderPixelWithReferences(
+  screenX: number,
+  screenY: number,
+  pixelSpan: number,
+  maxIter: number,
+  contexts: ReferenceContext[]
+): { result: PixelResult; referenceId: string | undefined; skip: number } {
+  let bestUnresolved: PixelResult | undefined;
+  let bestUnresolvedReferenceId: string | undefined;
+  let maxSkip = 0;
+
+  for (const context of contexts) {
+    const cRe = (screenX - context.reference.screenX) * pixelSpan;
+    const cIm = (screenY - context.reference.screenY) * pixelSpan;
+    const result = perturb(cRe, cIm, context.orbitRe, context.orbitIm, maxIter, context.series);
+    maxSkip = Math.max(maxSkip, context.series.skip);
+    if (!result.unresolved) return { result, referenceId: context.reference.id, skip: maxSkip };
+    if (!bestUnresolved || result.survivedIter > bestUnresolved.survivedIter) {
+      bestUnresolved = result;
+      bestUnresolvedReferenceId = context.reference.id;
+    }
+  }
+
+  return {
+    result: bestUnresolved ?? { iter: maxIter, mag2: 0, glitch: true, unresolved: true, survivedIter: 0 },
+    referenceId: bestUnresolvedReferenceId,
+    skip: maxSkip
   };
 }
 
@@ -96,7 +154,7 @@ function perturb(
 
   const limit = Math.min(maxIter, orbitRe.length - 1);
   if (limit < 0 || iter > limit) {
-    return { iter: maxIter, mag2, glitch: true, unresolved: true };
+    return { iter: maxIter, mag2, glitch: true, unresolved: true, survivedIter: Math.max(0, limit) };
   }
 
   for (; iter <= limit; iter += 1) {
@@ -110,7 +168,7 @@ function perturb(
     const zRe = refRe + dzRe;
     const zIm = refIm + dzIm;
     mag2 = zRe * zRe + zIm * zIm;
-    if (mag2 > 4) return { iter, mag2, glitch, unresolved: false };
+    if (mag2 > 4) return { iter, mag2, glitch, unresolved: false, survivedIter: iter };
 
     const refMag2 = refRe * refRe + refIm * refIm;
     const dzMag2BeforeStep = dzRe * dzRe + dzIm * dzIm;
@@ -135,8 +193,57 @@ function perturb(
     }
   }
 
-  if (glitch || limit < maxIter) return { iter: maxIter, mag2, glitch: true, unresolved: true };
-  return { iter: maxIter, mag2, glitch: false, unresolved: false };
+  if (glitch || limit < maxIter) return { iter: maxIter, mag2, glitch: true, unresolved: true, survivedIter: Math.min(iter, limit) };
+  return { iter: maxIter, mag2, glitch: false, unresolved: false, survivedIter: maxIter };
+}
+
+function createClusterAccumulators(): ClusterAccumulator[] {
+  return Array.from({ length: 4 }, () => ({
+    count: 0,
+    sumX: 0,
+    sumY: 0,
+    bestX: 0,
+    bestY: 0,
+    bestSurvivedIter: -1
+  }));
+}
+
+function recordUnresolvedCluster(
+  clusters: ClusterAccumulator[],
+  rect: { x: number; y: number; width: number; height: number },
+  screenX: number,
+  screenY: number,
+  survivedIter: number
+): void {
+  const midpointX = rect.x + rect.width * 0.5;
+  const midpointY = rect.y + rect.height * 0.5;
+  const index = (screenX >= midpointX ? 1 : 0) + (screenY >= midpointY ? 2 : 0);
+  const cluster = clusters[index];
+  cluster.count += 1;
+  cluster.sumX += screenX;
+  cluster.sumY += screenY;
+  if (survivedIter > cluster.bestSurvivedIter) {
+    cluster.bestSurvivedIter = survivedIter;
+    cluster.bestX = screenX;
+    cluster.bestY = screenY;
+  }
+}
+
+function buildUnresolvedClusters(
+  clusters: ClusterAccumulator[],
+  rect: { x: number; y: number; width: number; height: number }
+): UnresolvedCluster[] {
+  const radiusPx = Math.max(0.5, Math.hypot(rect.width, rect.height) * 0.25);
+  return clusters
+    .filter((cluster) => cluster.count > 0)
+    .map((cluster) => ({
+      screenX: cluster.bestX || cluster.sumX / cluster.count,
+      screenY: cluster.bestY || cluster.sumY / cluster.count,
+      pixelCount: cluster.count,
+      survivedIter: Math.max(0, cluster.bestSurvivedIter),
+      radiusPx
+    }))
+    .sort((a, b) => b.pixelCount - a.pixelCount || b.survivedIter - a.survivedIter);
 }
 
 function isCancellationGlitch(mag2: number, refMag2: number, dzMag2: number): boolean {

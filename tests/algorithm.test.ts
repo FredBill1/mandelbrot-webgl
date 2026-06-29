@@ -27,7 +27,7 @@ describe("perturbation renderer", () => {
       canvasHeight: 1,
       pixelSpan: 3.5 / Number(scale) || 3.5e-100,
       maxIter,
-      reference,
+      references: [reference],
       seriesDegree: 8,
       paletteId: "cosine",
       refined: true,
@@ -96,6 +96,43 @@ describe("perturbation renderer", () => {
     expect(result.stats.unresolvedCount).toBe(0);
     expect(result.stats.escapedPixels).toBe(1);
   });
+
+  it.each([
+    [
+      "near-real scale-15",
+      {
+        re: "-1.7195312667941079545586189454398113271069746647515813505680542504632787025805573e0",
+        im: "6.5505858903810377100204901499228868589789948177206009920848026920443700420219874e-4",
+        scale: "1.4879731724872819376827096167093147183191284045682361153628693061499318199119286e1",
+        maxIter: 588
+      },
+      { x: 624, y: 624 }
+    ],
+    [
+      "near-real scale-299",
+      {
+        re: "-1.7837703627058171488767894782491136871879847141256353015158193606747347767684793e0",
+        im: "5.5357063425251600676626417761698877134903352475830355358631008611595013848605954e-4",
+        scale: "2.9886740096705962489052976484705668623645989664805902945876196244325516986288952e2",
+        maxIter: 671
+      },
+      { x: 624, y: 336 }
+    ]
+  ])("resolves %s with accumulated references instead of staying unresolved", (_name, view, screen) => {
+    const point = pointAtScreen(view, screen.x, screen.y);
+    const direct = direct_escape(point.re, point.im, view.maxIter, 224);
+    const centerReference = makeReference(view.re, view.im, view.maxIter, 224, 1912 * 0.5, 948 * 0.5);
+    const pointReference = makeReference(point.re, point.im, view.maxIter, 224, screen.x, screen.y);
+
+    const unresolved = renderSinglePixelWithReferences(view, point, screen.x, screen.y, [centerReference], 0);
+    expect(centerReference.escapedAt).toBeLessThan(direct);
+    expect(unresolved.stats.unresolvedCount).toBe(1);
+    expect(unresolved.stats.unresolvedClusters.length).toBeGreaterThan(0);
+
+    const resolved = renderSinglePixelWithReferences(view, point, screen.x, screen.y, [centerReference, pointReference], 1);
+    expect(resolved.stats.unresolvedCount).toBe(0);
+    expect(resolved.stats.escapedPixels).toBe(direct < view.maxIter ? 1 : 0);
+  });
 });
 
 function makeReference(re: string, im: string, maxIter: number, precisionBits: number, screenX = 0.5, screenY = 0.5): ReferenceSnapshot {
@@ -130,6 +167,17 @@ function renderSinglePixel(
   reference: ReferenceSnapshot,
   refinementLevel: number
 ) {
+  return renderSinglePixelWithReferences(view, point, screenX, screenY, [reference], refinementLevel);
+}
+
+function renderSinglePixelWithReferences(
+  view: { re: string; im: string; scale: string; maxIter: number },
+  point: { re: string; im: string },
+  screenX: number,
+  screenY: number,
+  references: ReferenceSnapshot[],
+  refinementLevel: number
+) {
   const tile: TileDescriptor = {
     id: "sample-tile",
     key: { level: 0, x: 0, y: 0, span: 1 },
@@ -147,7 +195,7 @@ function renderSinglePixel(
     canvasHeight: 948,
     pixelSpan: pixelSpan(view.scale, 1912),
     maxIter: view.maxIter,
-    reference,
+    references,
     seriesDegree: 8,
     paletteId: "cosine",
     refined: refinementLevel > 0,

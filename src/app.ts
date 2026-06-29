@@ -10,7 +10,15 @@ import {
 } from "./state/urlState";
 import { defaultMaxIter, formatCompactDecimal, pixelSpanForView } from "./math/view";
 import { initWasm, pointToViewCenter, transformView } from "./wasmApi";
-import { SERIES_DEGREE, TILE_SIZE, type NeedReferenceMessage, type RuntimeView, type TileDescriptor, type ViewState } from "./types";
+import {
+  SERIES_DEGREE,
+  TILE_SIZE,
+  type NeedReferenceMessage,
+  type RuntimeView,
+  type TileDescriptor,
+  type UnresolvedCluster,
+  type ViewState
+} from "./types";
 
 interface Stats {
   fps: number;
@@ -24,7 +32,21 @@ interface Stats {
   status: string;
 }
 
-const MIN_SUBTILE_SIZE = 32;
+interface TileWorkState {
+  tile: TileDescriptor;
+  referenceIds: Set<string>;
+  requestedReferenceKeys: Set<string>;
+  refinementLevel: number;
+  splitLevel: number;
+  inFlight: boolean;
+  completed: boolean;
+  pendingReferences: number;
+}
+
+const MAX_TILE_REFERENCES = 16;
+const MAX_CLUSTER_REFERENCES_PER_PASS = 4;
+const MIN_NORMAL_SUBTILE_SIZE = 8;
+const MICROTILE_SIZE = 1;
 
 export async function startApp(root: HTMLElement): Promise<void> {
   root.innerHTML = `
@@ -74,6 +96,7 @@ export async function startApp(root: HTMLElement): Promise<void> {
     void refineReference(message);
   });
   const pendingTileIds = new Set<string>();
+  const tileStates = new Map<string, TileWorkState>();
 
   let runtime = currentRuntimeView();
   resize();
@@ -165,6 +188,7 @@ export async function startApp(root: HTMLElement): Promise<void> {
     stats.completedTiles = 0;
     stats.glitches = 0;
     pendingTileIds.clear();
+    tileStates.clear();
 
     const viewReference = await references.ensureViewReference(localRuntime);
     if (token !== renderToken) return;
@@ -178,35 +202,68 @@ export async function startApp(root: HTMLElement): Promise<void> {
     );
     if (token !== renderToken) return;
 
-    for (const tile of tiles) pendingTileIds.add(tile.id);
+    for (const tile of tiles) createTileState(tile, [viewReference.id], 0);
+    syncPinnedReferences();
     stats.pending = pendingTileIds.size;
     stats.references = references.size;
     stats.status = `rendering ${tiles.length} tiles`;
 
-    for (const tile of tiles) {
-      const reference = references.selectBest(tile, localRuntime.maxIter, localRuntime.revision) ?? viewReference;
-      void submitTile(localRuntime, tile, reference.id, 0);
-    }
+    for (const tile of tiles) void submitTile(localRuntime, mustTileState(tile.id));
   }
 
-  async function submitTile(localRuntime: RuntimeView, tile: TileDescriptor, referenceId: string, refinementLevel: number): Promise<void> {
-    const reference = references.entries.find((entry) => entry.id === referenceId) ?? references.selectBest(tile, localRuntime.maxIter, localRuntime.revision);
-    if (!reference) return;
+  function createTileState(tile: TileDescriptor, referenceIds: Iterable<string>, splitLevel: number): TileWorkState {
+    const state: TileWorkState = {
+      tile,
+      referenceIds: new Set(referenceIds),
+      requestedReferenceKeys: new Set(),
+      refinementLevel: 0,
+      splitLevel,
+      inFlight: false,
+      completed: false,
+      pendingReferences: 0
+    };
+    tileStates.set(tile.id, state);
+    pendingTileIds.add(tile.id);
+    return state;
+  }
+
+  function mustTileState(tileId: string): TileWorkState {
+    const state = tileStates.get(tileId);
+    if (!state) throw new Error(`Missing tile state ${tileId}`);
+    return state;
+  }
+
+  async function submitTile(localRuntime: RuntimeView, state: TileWorkState): Promise<void> {
+    if (state.inFlight || state.completed || state.tile.revision !== revision) return;
+    const candidates = buildReferenceCandidates(state, localRuntime);
+    if (candidates.length === 0) {
+      const reference = await references.ensureTileReference(localRuntime, state.tile, 128);
+      if (state.tile.revision !== revision || state.completed) return;
+      state.referenceIds.add(reference.id);
+      syncPinnedReferences();
+      void submitTile(localRuntime, state);
+      return;
+    }
+
+    for (const reference of candidates) state.referenceIds.add(reference.id);
+    syncPinnedReferences();
+    state.inFlight = true;
     try {
       const result = await pool.render({
         type: "renderTile",
-        tile,
+        tile: state.tile,
         canvasWidth: localRuntime.width,
         canvasHeight: localRuntime.height,
         pixelSpan: pixelSpanForView(localRuntime, localRuntime.width),
         maxIter: localRuntime.maxIter,
-        reference,
+        references: candidates,
         seriesDegree: SERIES_DEGREE,
         paletteId: "cosine",
-        refined: refinementLevel > 0,
-        refinementLevel
+        refined: state.refinementLevel > 0,
+        refinementLevel: state.refinementLevel
       });
-      if (result.revision !== revision) return;
+      state.inFlight = false;
+      if (result.revision !== revision || state.completed || state.tile.revision !== revision) return;
       stats.lastTileMs = result.stats.elapsedMs;
       stats.lastSeriesSkip = result.stats.seriesSkip;
       stats.glitches += result.stats.glitchCount;
@@ -214,34 +271,48 @@ export async function startApp(root: HTMLElement): Promise<void> {
       stats.references = references.size;
 
       if (result.stats.unresolvedCount > 0) {
-        if (result.needsReference) {
+        const queued = queueClusterReferences(localRuntime, state, result.stats.unresolvedClusters);
+        if (queued > 0 || state.pendingReferences > 0) {
           stats.pending = pendingTileIds.size;
           stats.status = "refining";
           return;
         }
-        if (canSplitTile(tile)) {
-          await splitTile(localRuntime, tile);
+        if (canSplitTile(state.tile)) {
+          await splitTile(localRuntime, state);
           return;
         }
-        stats.pending = pendingTileIds.size;
-        stats.status = "unresolved";
+        await forceCenterReference(localRuntime, state);
         return;
       }
 
       renderer.uploadTile(result);
+      state.completed = true;
       stats.completedTiles += 1;
-      pendingTileIds.delete(tile.id);
+      pendingTileIds.delete(state.tile.id);
+      syncPinnedReferences();
       stats.pending = pendingTileIds.size;
       renderer.pruneRetainedWhenActiveCoverage(Math.max(1, Math.floor((localRuntime.width * localRuntime.height) / (TILE_SIZE * TILE_SIZE) * 0.7)));
       stats.status = stats.pending > 0 ? "rendering" : "stable";
     } catch (error) {
+      state.inFlight = false;
       stats.status = error instanceof Error ? error.message : String(error);
     }
   }
 
   async function refineReference(message: NeedReferenceMessage): Promise<void> {
     if (message.tile.revision !== revision) return;
+    const state = tileStates.get(message.tile.id);
+    if (!state || state.completed) return;
     const localRuntime = currentRuntimeView();
+    const requestKey = referenceRequestKey(message.targetScreenX, message.targetScreenY, message.requiredPrecision);
+    if (state.requestedReferenceKeys.has(requestKey)) return;
+    if (state.referenceIds.size + state.pendingReferences >= MAX_TILE_REFERENCES && canSplitTile(state.tile)) return;
+
+    state.requestedReferenceKeys.add(requestKey);
+    state.pendingReferences += 1;
+    stats.pending = pendingTileIds.size;
+    stats.status = "refining";
+
     const targetCenter = await pointToViewCenter(view, localRuntime.width, localRuntime.height, message.targetScreenX, message.targetScreenY);
     const targetTile: TileDescriptor = {
       ...message.tile,
@@ -251,35 +322,111 @@ export async function startApp(root: HTMLElement): Promise<void> {
       centerIm: targetCenter.im
     };
     const reference = await references.ensureTileReference(localRuntime, targetTile, message.requiredPrecision);
-    if (message.tile.revision !== revision) return;
+    state.pendingReferences = Math.max(0, state.pendingReferences - 1);
+    if (message.tile.revision !== revision || state.completed) return;
+    state.referenceIds.add(reference.id);
+    state.refinementLevel = Math.max(state.refinementLevel, message.refinementLevel);
+    syncPinnedReferences();
     stats.references = references.size;
-    await submitTile(localRuntime, message.tile, reference.id, message.refinementLevel);
+    if (!state.inFlight) await submitTile(localRuntime, state);
   }
 
-  async function splitTile(localRuntime: RuntimeView, tile: TileDescriptor): Promise<void> {
+  function buildReferenceCandidates(state: TileWorkState, localRuntime: RuntimeView) {
+    const explicit = [...state.referenceIds]
+      .map((id) => references.getById(id))
+      .filter((reference): reference is NonNullable<typeof reference> => Boolean(reference));
+    const selected = references.selectCandidates(state.tile, localRuntime.maxIter, localRuntime.revision, MAX_TILE_REFERENCES);
+    const merged = new Map<string, (typeof selected)[number]>();
+    for (const reference of explicit) merged.set(reference.id, reference);
+    for (const reference of selected) merged.set(reference.id, reference);
+    return [...merged.values()].slice(0, MAX_TILE_REFERENCES);
+  }
+
+  function queueClusterReferences(localRuntime: RuntimeView, state: TileWorkState, clusters: UnresolvedCluster[]): number {
+    if (clusters.length === 0) return 0;
+    if (state.referenceIds.size + state.pendingReferences >= MAX_TILE_REFERENCES && canSplitTile(state.tile)) return 0;
+    let queued = 0;
+    const highestPrecision = buildReferenceCandidates(state, localRuntime).reduce((bits, reference) => Math.max(bits, reference.precisionBits), 128);
+    for (const cluster of clusters.slice(0, MAX_CLUSTER_REFERENCES_PER_PASS)) {
+      if (state.referenceIds.size + state.pendingReferences + queued >= MAX_TILE_REFERENCES && canSplitTile(state.tile)) break;
+      const requestKey = referenceRequestKey(cluster.screenX, cluster.screenY, highestPrecision + 32);
+      if (state.requestedReferenceKeys.has(requestKey)) continue;
+      state.pendingReferences += 1;
+      state.requestedReferenceKeys.add(requestKey);
+      queued += 1;
+      void requestReferenceForPoint(localRuntime, state, cluster.screenX, cluster.screenY, highestPrecision + 32, state.refinementLevel + 1);
+    }
+    return queued;
+  }
+
+  async function requestReferenceForPoint(
+    localRuntime: RuntimeView,
+    state: TileWorkState,
+    screenX: number,
+    screenY: number,
+    requiredPrecision: number,
+    refinementLevel: number
+  ): Promise<void> {
+    const targetCenter = await pointToViewCenter(view, localRuntime.width, localRuntime.height, screenX, screenY);
+    const targetTile: TileDescriptor = {
+      ...state.tile,
+      centerScreenX: screenX,
+      centerScreenY: screenY,
+      centerRe: targetCenter.re,
+      centerIm: targetCenter.im
+    };
+    const reference = await references.ensureTileReference(localRuntime, targetTile, requiredPrecision);
+    state.pendingReferences = Math.max(0, state.pendingReferences - 1);
+    if (state.tile.revision !== revision || state.completed) return;
+    state.referenceIds.add(reference.id);
+    state.refinementLevel = Math.max(state.refinementLevel, refinementLevel);
+    syncPinnedReferences();
+    stats.references = references.size;
+    if (!state.inFlight) await submitTile(localRuntime, state);
+  }
+
+  async function forceCenterReference(localRuntime: RuntimeView, state: TileWorkState): Promise<void> {
+    const highestPrecision = buildReferenceCandidates(state, localRuntime).reduce((bits, reference) => Math.max(bits, reference.precisionBits), 128);
+    state.referenceIds.clear();
+    state.requestedReferenceKeys.clear();
+    state.pendingReferences = 0;
+    state.refinementLevel += 1;
+    const reference = await references.ensureTileReference(localRuntime, state.tile, highestPrecision + 64);
+    if (state.tile.revision !== revision || state.completed) return;
+    state.referenceIds.add(reference.id);
+    syncPinnedReferences();
+    stats.references = references.size;
+    stats.status = "refining";
+    await submitTile(localRuntime, state);
+  }
+
+  async function splitTile(localRuntime: RuntimeView, state: TileWorkState): Promise<void> {
+    const tile = state.tile;
     if (tile.revision !== revision) return;
     const subtiles = await createSubtiles(localRuntime, tile);
     if (tile.revision !== revision || subtiles.length === 0) return;
 
     pendingTileIds.delete(tile.id);
+    tileStates.delete(tile.id);
     for (const subtile of subtiles) pendingTileIds.add(subtile.id);
     stats.pending = pendingTileIds.size;
     stats.status = "splitting";
 
     for (const subtile of subtiles) {
-      const reference = references.selectBest(subtile, localRuntime.maxIter, localRuntime.revision);
-      if (reference) void submitTile(localRuntime, subtile, reference.id, 0);
-      else void references.ensureTileReference(localRuntime, subtile, 128).then((nextReference) => submitTile(localRuntime, subtile, nextReference.id, 0));
+      const seedReferences = references.selectCandidates(subtile, localRuntime.maxIter, localRuntime.revision, 4).map((reference) => reference.id);
+      const child = createTileState(subtile, seedReferences, state.splitLevel + 1);
+      void submitTile(localRuntime, child);
     }
+    syncPinnedReferences();
   }
 
   async function createSubtiles(localRuntime: RuntimeView, tile: TileDescriptor): Promise<TileDescriptor[]> {
-    const splitX = tile.rect.width > MIN_SUBTILE_SIZE;
-    const splitY = tile.rect.height > MIN_SUBTILE_SIZE;
+    const splitX = tile.rect.width > MICROTILE_SIZE;
+    const splitY = tile.rect.height > MICROTILE_SIZE;
     if (!splitX && !splitY) return [];
 
-    const xCuts = splitX ? [0, Math.floor(tile.rect.width * 0.5), tile.rect.width] : [0, tile.rect.width];
-    const yCuts = splitY ? [0, Math.floor(tile.rect.height * 0.5), tile.rect.height] : [0, tile.rect.height];
+    const xCuts = splitAxis(tile.rect.width);
+    const yCuts = splitAxis(tile.rect.height);
     const subtiles: TileDescriptor[] = [];
 
     for (let yi = 0; yi < yCuts.length - 1; yi += 1) {
@@ -291,11 +438,12 @@ export async function startApp(root: HTMLElement): Promise<void> {
           height: yCuts[yi + 1] - yCuts[yi]
         };
         if (rect.width <= 0 || rect.height <= 0) continue;
+        const span = Math.max(MICROTILE_SIZE, Math.floor(Math.max(rect.width, rect.height)));
         const key = {
           level: tile.key.level + 1,
-          x: tile.key.x * 2 + xi,
-          y: tile.key.y * 2 + yi,
-          span: Math.max(MIN_SUBTILE_SIZE, Math.floor(tile.key.span * 0.5))
+          x: tile.key.x * 16 + xi,
+          y: tile.key.y * 16 + yi,
+          span
         };
         const centerScreenX = rect.x + rect.width * 0.5;
         const centerScreenY = rect.y + rect.height * 0.5;
@@ -316,7 +464,31 @@ export async function startApp(root: HTMLElement): Promise<void> {
   }
 
   function canSplitTile(tile: TileDescriptor): boolean {
-    return tile.rect.width > MIN_SUBTILE_SIZE || tile.rect.height > MIN_SUBTILE_SIZE;
+    return tile.rect.width > MICROTILE_SIZE || tile.rect.height > MICROTILE_SIZE;
+  }
+
+  function splitAxis(length: number): number[] {
+    if (length <= MICROTILE_SIZE) return [0, length];
+    if (length <= MIN_NORMAL_SUBTILE_SIZE) {
+      const cuts = [0];
+      for (let value = 1; value < length; value += 1) cuts.push(value);
+      cuts.push(length);
+      return cuts;
+    }
+    return [0, Math.floor(length * 0.5), length];
+  }
+
+  function referenceRequestKey(screenX: number, screenY: number, precisionBits: number): string {
+    return `${Math.round(screenX * 4) / 4}:${Math.round(screenY * 4) / 4}:${precisionBits}`;
+  }
+
+  function syncPinnedReferences(): void {
+    const ids = new Set<string>();
+    for (const state of tileStates.values()) {
+      if (state.completed) continue;
+      for (const id of state.referenceIds) ids.add(id);
+    }
+    references.setPinnedReferenceIds(ids);
   }
 
   function resize(): void {
