@@ -67,14 +67,18 @@ export interface RenderTileMessage {
   seriesDegree: number;
   paletteId: string;
   refined: boolean;
+  refinementLevel: number;
 }
 
 export interface TileStats {
   elapsedMs: number;
   glitchCount: number;
+  unresolvedCount: number;
   escapedPixels: number;
   seriesSkip: number;
   referenceId: string;
+  unresolvedScreenX: number | undefined;
+  unresolvedScreenY: number | undefined;
 }
 
 export interface TileDoneMessage {
@@ -94,6 +98,10 @@ export interface NeedReferenceMessage {
   tile: TileDescriptor;
   requiredPrecision: number;
   maxIter: number;
+  targetScreenX: number;
+  targetScreenY: number;
+  refinementLevel: number;
+  sourceReferenceId: string;
 }
 
 export type TileWorkerOutMessage = TileDoneMessage | NeedReferenceMessage;

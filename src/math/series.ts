@@ -17,10 +17,23 @@ export function buildSeriesPlan(
   maxSkip: number,
   tileRadius: number
 ): SeriesPlan {
-  const coeffRe = new Float64Array(degree + 1);
-  const coeffIm = new Float64Array(degree + 1);
-  const nextRe = new Float64Array(degree + 1);
-  const nextIm = new Float64Array(degree + 1);
+  const normalizedDegree = Math.max(0, Math.floor(degree));
+  const coeffRe = new Float64Array(normalizedDegree + 1);
+  const coeffIm = new Float64Array(normalizedDegree + 1);
+  if (
+    normalizedDegree < 2 ||
+    maxSkip <= 0 ||
+    !Number.isFinite(tileRadius) ||
+    tileRadius <= 0 ||
+    tileRadius > 1e-8 ||
+    orbitRe.length < 2 ||
+    orbitIm.length < 2
+  ) {
+    return { skip: 0, degree: normalizedDegree, coeffRe, coeffIm };
+  }
+
+  const nextRe = new Float64Array(normalizedDegree + 1);
+  const nextIm = new Float64Array(normalizedDegree + 1);
   let skip = 0;
 
   for (let n = 0; n < Math.min(maxSkip, orbitRe.length - 1); n += 1) {
@@ -30,7 +43,7 @@ export function buildSeriesPlan(
     const zi = orbitIm[n] ?? 0;
     if (!Number.isFinite(zr) || !Number.isFinite(zi)) break;
 
-    for (let k = 1; k <= degree; k += 1) {
+    for (let k = 1; k <= normalizedDegree; k += 1) {
       const ar = coeffRe[k];
       const ai = coeffIm[k];
       nextRe[k] += 2 * (zr * ar - zi * ai);
@@ -49,14 +62,19 @@ export function buildSeriesPlan(
 
     let stable = true;
     let radiusPower = tileRadius;
-    for (let k = 1; k <= degree; k += 1) {
+    let contributionSum = 0;
+    let lastContribution = 0;
+    for (let k = 1; k <= normalizedDegree; k += 1) {
       const contribution = Math.hypot(nextRe[k], nextIm[k]) * radiusPower;
-      if (!Number.isFinite(contribution) || contribution > 0.35) {
+      contributionSum += contribution;
+      lastContribution = contribution;
+      if (!Number.isFinite(contribution) || contribution > 0.05 || contributionSum > 0.18) {
         stable = false;
         break;
       }
       radiusPower *= tileRadius;
     }
+    if (lastContribution > 1e-16) stable = false;
     if (!stable) break;
 
     coeffRe.set(nextRe);
@@ -64,7 +82,7 @@ export function buildSeriesPlan(
     skip = n + 1;
   }
 
-  return { skip, degree, coeffRe, coeffIm };
+  return { skip, degree: normalizedDegree, coeffRe, coeffIm };
 }
 
 export function evaluateSeries(plan: SeriesPlan, cRe: number, cIm: number): Complex {

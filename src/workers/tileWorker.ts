@@ -9,7 +9,11 @@ self.onmessage = (event: MessageEvent<RenderTileMessage>) => {
       type: "needReference",
       tile: event.data.tile,
       requiredPrecision: event.data.reference.precisionBits + 32,
-      maxIter: event.data.maxIter
+      maxIter: event.data.maxIter,
+      targetScreenX: result.stats.unresolvedScreenX ?? event.data.tile.centerScreenX,
+      targetScreenY: result.stats.unresolvedScreenY ?? event.data.tile.centerScreenY,
+      refinementLevel: event.data.refinementLevel + 1,
+      sourceReferenceId: event.data.reference.id
     };
     self.postMessage(request satisfies TileWorkerOutMessage);
   }

@@ -1,7 +1,7 @@
 import { ReferenceManager } from "./reference/referenceManager";
 import { WebglTileRenderer } from "./render/webglRenderer";
 import { TileWorkerPool } from "./scheduler/workerPool";
-import { createVisibleTileShells } from "./tiles/tileKey";
+import { createVisibleTileShells, tileKeyToId } from "./tiles/tileKey";
 import {
   DEEP_TEST_VIEW,
   DEFAULT_VIEW,
@@ -23,6 +23,8 @@ interface Stats {
   glitches: number;
   status: string;
 }
+
+const MIN_SUBTILE_SIZE = 32;
 
 export async function startApp(root: HTMLElement): Promise<void> {
   root.innerHTML = `
@@ -71,6 +73,7 @@ export async function startApp(root: HTMLElement): Promise<void> {
   const pool = new TileWorkerPool(undefined, (message) => {
     void refineReference(message);
   });
+  const pendingTileIds = new Set<string>();
 
   let runtime = currentRuntimeView();
   resize();
@@ -161,6 +164,7 @@ export async function startApp(root: HTMLElement): Promise<void> {
     stats.pending = 0;
     stats.completedTiles = 0;
     stats.glitches = 0;
+    pendingTileIds.clear();
 
     const viewReference = await references.ensureViewReference(localRuntime);
     if (token !== renderToken) return;
@@ -174,17 +178,18 @@ export async function startApp(root: HTMLElement): Promise<void> {
     );
     if (token !== renderToken) return;
 
-    stats.pending = tiles.length;
+    for (const tile of tiles) pendingTileIds.add(tile.id);
+    stats.pending = pendingTileIds.size;
     stats.references = references.size;
     stats.status = `rendering ${tiles.length} tiles`;
 
     for (const tile of tiles) {
       const reference = references.selectBest(tile, localRuntime.maxIter, localRuntime.revision) ?? viewReference;
-      void submitTile(localRuntime, tile, reference.id, false);
+      void submitTile(localRuntime, tile, reference.id, 0);
     }
   }
 
-  async function submitTile(localRuntime: RuntimeView, tile: TileDescriptor, referenceId: string, refined: boolean): Promise<void> {
+  async function submitTile(localRuntime: RuntimeView, tile: TileDescriptor, referenceId: string, refinementLevel: number): Promise<void> {
     const reference = references.entries.find((entry) => entry.id === referenceId) ?? references.selectBest(tile, localRuntime.maxIter, localRuntime.revision);
     if (!reference) return;
     try {
@@ -198,17 +203,35 @@ export async function startApp(root: HTMLElement): Promise<void> {
         reference,
         seriesDegree: SERIES_DEGREE,
         paletteId: "cosine",
-        refined
+        refined: refinementLevel > 0,
+        refinementLevel
       });
       if (result.revision !== revision) return;
-      renderer.uploadTile(result);
-      stats.completedTiles += 1;
-      stats.pending = Math.max(0, stats.pending - 1);
       stats.lastTileMs = result.stats.elapsedMs;
       stats.lastSeriesSkip = result.stats.seriesSkip;
       stats.glitches += result.stats.glitchCount;
       stats.activeWorkers = pool.active;
       stats.references = references.size;
+
+      if (result.stats.unresolvedCount > 0) {
+        if (result.needsReference) {
+          stats.pending = pendingTileIds.size;
+          stats.status = "refining";
+          return;
+        }
+        if (canSplitTile(tile)) {
+          await splitTile(localRuntime, tile);
+          return;
+        }
+        stats.pending = pendingTileIds.size;
+        stats.status = "unresolved";
+        return;
+      }
+
+      renderer.uploadTile(result);
+      stats.completedTiles += 1;
+      pendingTileIds.delete(tile.id);
+      stats.pending = pendingTileIds.size;
       renderer.pruneRetainedWhenActiveCoverage(Math.max(1, Math.floor((localRuntime.width * localRuntime.height) / (TILE_SIZE * TILE_SIZE) * 0.7)));
       stats.status = stats.pending > 0 ? "rendering" : "stable";
     } catch (error) {
@@ -219,10 +242,81 @@ export async function startApp(root: HTMLElement): Promise<void> {
   async function refineReference(message: NeedReferenceMessage): Promise<void> {
     if (message.tile.revision !== revision) return;
     const localRuntime = currentRuntimeView();
-    const reference = await references.ensureTileReference(localRuntime, message.tile, message.requiredPrecision);
+    const targetCenter = await pointToViewCenter(view, localRuntime.width, localRuntime.height, message.targetScreenX, message.targetScreenY);
+    const targetTile: TileDescriptor = {
+      ...message.tile,
+      centerScreenX: message.targetScreenX,
+      centerScreenY: message.targetScreenY,
+      centerRe: targetCenter.re,
+      centerIm: targetCenter.im
+    };
+    const reference = await references.ensureTileReference(localRuntime, targetTile, message.requiredPrecision);
     if (message.tile.revision !== revision) return;
     stats.references = references.size;
-    await submitTile(localRuntime, message.tile, reference.id, true);
+    await submitTile(localRuntime, message.tile, reference.id, message.refinementLevel);
+  }
+
+  async function splitTile(localRuntime: RuntimeView, tile: TileDescriptor): Promise<void> {
+    if (tile.revision !== revision) return;
+    const subtiles = await createSubtiles(localRuntime, tile);
+    if (tile.revision !== revision || subtiles.length === 0) return;
+
+    pendingTileIds.delete(tile.id);
+    for (const subtile of subtiles) pendingTileIds.add(subtile.id);
+    stats.pending = pendingTileIds.size;
+    stats.status = "splitting";
+
+    for (const subtile of subtiles) {
+      const reference = references.selectBest(subtile, localRuntime.maxIter, localRuntime.revision);
+      if (reference) void submitTile(localRuntime, subtile, reference.id, 0);
+      else void references.ensureTileReference(localRuntime, subtile, 128).then((nextReference) => submitTile(localRuntime, subtile, nextReference.id, 0));
+    }
+  }
+
+  async function createSubtiles(localRuntime: RuntimeView, tile: TileDescriptor): Promise<TileDescriptor[]> {
+    const splitX = tile.rect.width > MIN_SUBTILE_SIZE;
+    const splitY = tile.rect.height > MIN_SUBTILE_SIZE;
+    if (!splitX && !splitY) return [];
+
+    const xCuts = splitX ? [0, Math.floor(tile.rect.width * 0.5), tile.rect.width] : [0, tile.rect.width];
+    const yCuts = splitY ? [0, Math.floor(tile.rect.height * 0.5), tile.rect.height] : [0, tile.rect.height];
+    const subtiles: TileDescriptor[] = [];
+
+    for (let yi = 0; yi < yCuts.length - 1; yi += 1) {
+      for (let xi = 0; xi < xCuts.length - 1; xi += 1) {
+        const rect = {
+          x: tile.rect.x + xCuts[xi],
+          y: tile.rect.y + yCuts[yi],
+          width: xCuts[xi + 1] - xCuts[xi],
+          height: yCuts[yi + 1] - yCuts[yi]
+        };
+        if (rect.width <= 0 || rect.height <= 0) continue;
+        const key = {
+          level: tile.key.level + 1,
+          x: tile.key.x * 2 + xi,
+          y: tile.key.y * 2 + yi,
+          span: Math.max(MIN_SUBTILE_SIZE, Math.floor(tile.key.span * 0.5))
+        };
+        const centerScreenX = rect.x + rect.width * 0.5;
+        const centerScreenY = rect.y + rect.height * 0.5;
+        const center = await pointToViewCenter(view, localRuntime.width, localRuntime.height, centerScreenX, centerScreenY);
+        subtiles.push({
+          id: tileKeyToId(key, tile.revision),
+          key,
+          rect,
+          centerScreenX,
+          centerScreenY,
+          centerRe: center.re,
+          centerIm: center.im,
+          revision: tile.revision
+        });
+      }
+    }
+    return subtiles;
+  }
+
+  function canSplitTile(tile: TileDescriptor): boolean {
+    return tile.rect.width > MIN_SUBTILE_SIZE || tile.rect.height > MIN_SUBTILE_SIZE;
   }
 
   function resize(): void {

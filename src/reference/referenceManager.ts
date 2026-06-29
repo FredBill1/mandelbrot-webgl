@@ -52,18 +52,25 @@ export class ReferenceManager {
   }
 
   selectBest(tile: TileDescriptor, maxIter: number, revision: number): ReferenceSnapshot | undefined {
-    let best: ReferenceSnapshot | undefined;
-    let bestDistance = Number.POSITIVE_INFINITY;
+    let bestComplete: ReferenceSnapshot | undefined;
+    let bestCompleteDistance = Number.POSITIVE_INFINITY;
+    let bestAny: ReferenceSnapshot | undefined;
+    let bestAnyDistance = Number.POSITIVE_INFINITY;
     for (const reference of this.references.values()) {
       if (reference.maxIter !== maxIter || reference.revision !== revision) continue;
       const distance = Math.hypot(tile.centerScreenX - reference.screenX, tile.centerScreenY - reference.screenY);
-      if (distance < bestDistance) {
-        bestDistance = distance;
-        best = reference;
+      if (reference.escapedAt >= maxIter && distance < bestCompleteDistance) {
+        bestCompleteDistance = distance;
+        bestComplete = reference;
+      }
+      if (distance < bestAnyDistance) {
+        bestAnyDistance = distance;
+        bestAny = reference;
       }
     }
-    if (best && bestDistance <= 768) return best;
-    return this.currentViewReference?.revision === revision ? this.currentViewReference : best;
+    if (bestComplete && bestCompleteDistance <= 2048) return bestComplete;
+    if (bestAny && bestAnyDistance <= 768) return bestAny;
+    return this.currentViewReference?.revision === revision ? this.currentViewReference : bestAny;
   }
 
   dispose(): void {
@@ -125,7 +132,7 @@ export class ReferenceManager {
     for (const [key, reference] of this.references.entries()) {
       if (reference.revision < currentRevision - 2) this.references.delete(key);
     }
-    while (this.references.size > 48) {
+    while (this.references.size > 128) {
       const first = this.references.keys().next().value as string | undefined;
       if (!first) break;
       this.references.delete(first);

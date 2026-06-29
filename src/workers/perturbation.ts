@@ -5,11 +5,15 @@ interface PixelResult {
   iter: number;
   mag2: number;
   glitch: boolean;
+  unresolved: boolean;
 }
+
+const MAX_REFERENCE_REFINEMENTS = 8;
 
 export function renderPerturbationTile(message: RenderTileMessage): TileDoneMessage {
   const started = performance.now();
   const { tile, reference, pixelSpan, maxIter, seriesDegree } = message;
+  const refinementLevel = Math.max(0, message.refinementLevel);
   const width = Math.max(1, Math.floor(tile.rect.width));
   const height = Math.max(1, Math.floor(tile.rect.height));
   const rgba = new Uint8ClampedArray(width * height * 4);
@@ -19,7 +23,10 @@ export function renderPerturbationTile(message: RenderTileMessage): TileDoneMess
   const series = buildSeriesPlan(orbitRe, orbitIm, seriesDegree, 64, radius);
 
   let glitchCount = 0;
+  let unresolvedCount = 0;
   let escapedPixels = 0;
+  let unresolvedScreenXSum = 0;
+  let unresolvedScreenYSum = 0;
 
   for (let py = 0; py < height; py += 1) {
     for (let px = 0; px < width; px += 1) {
@@ -31,9 +38,18 @@ export function renderPerturbationTile(message: RenderTileMessage): TileDoneMess
       const offset = (py * width + px) * 4;
       if (result.iter < maxIter) escapedPixels += 1;
       if (result.glitch) glitchCount += 1;
+      if (result.unresolved) {
+        unresolvedCount += 1;
+        unresolvedScreenXSum += screenX;
+        unresolvedScreenYSum += screenY;
+      }
       colorPixel(rgba, offset, result.iter, maxIter, result.mag2);
     }
   }
+
+  const unresolvedScreenX = unresolvedCount > 0 ? unresolvedScreenXSum / unresolvedCount : undefined;
+  const unresolvedScreenY = unresolvedCount > 0 ? unresolvedScreenYSum / unresolvedCount : undefined;
+  const needsReference = unresolvedCount > 0 && refinementLevel < MAX_REFERENCE_REFINEMENTS;
 
   return {
     type: "tileDone",
@@ -43,13 +59,16 @@ export function renderPerturbationTile(message: RenderTileMessage): TileDoneMess
     width,
     height,
     rgba: rgba.buffer,
-    needsReference: !message.refined && glitchCount > width * height * 0.015,
+    needsReference,
     stats: {
       elapsedMs: performance.now() - started,
       glitchCount,
+      unresolvedCount,
       escapedPixels,
       seriesSkip: series.skip,
-      referenceId: reference.id
+      referenceId: reference.id,
+      unresolvedScreenX,
+      unresolvedScreenY
     }
   };
 }
@@ -76,6 +95,10 @@ function perturb(
   }
 
   const limit = Math.min(maxIter, orbitRe.length - 1);
+  if (limit < 0 || iter > limit) {
+    return { iter: maxIter, mag2, glitch: true, unresolved: true };
+  }
+
   for (; iter <= limit; iter += 1) {
     const refRe = orbitRe[iter];
     const refIm = orbitIm[iter];
@@ -87,7 +110,15 @@ function perturb(
     const zRe = refRe + dzRe;
     const zIm = refIm + dzIm;
     mag2 = zRe * zRe + zIm * zIm;
-    if (mag2 > 4) return { iter, mag2, glitch };
+    if (mag2 > 4) return { iter, mag2, glitch, unresolved: false };
+
+    const refMag2 = refRe * refRe + refIm * refIm;
+    const dzMag2BeforeStep = dzRe * dzRe + dzIm * dzIm;
+    if (isCancellationGlitch(mag2, refMag2, dzMag2BeforeStep)) {
+      glitch = true;
+      break;
+    }
+
     if (iter === limit) break;
 
     const dz2Re = dzRe * dzRe - dzIm * dzIm;
@@ -97,7 +128,6 @@ function perturb(
     dzRe = twoRefDzRe + dz2Re + cRe;
     dzIm = twoRefDzIm + dz2Im + cIm;
 
-    const refMag2 = refRe * refRe + refIm * refIm;
     const dzMag2 = dzRe * dzRe + dzIm * dzIm;
     if (!Number.isFinite(dzMag2) || (refMag2 > 1e-24 && dzMag2 > refMag2 * 1e8)) {
       glitch = true;
@@ -105,7 +135,14 @@ function perturb(
     }
   }
 
-  return { iter: maxIter, mag2, glitch };
+  if (glitch || limit < maxIter) return { iter: maxIter, mag2, glitch: true, unresolved: true };
+  return { iter: maxIter, mag2, glitch: false, unresolved: false };
+}
+
+function isCancellationGlitch(mag2: number, refMag2: number, dzMag2: number): boolean {
+  if (!Number.isFinite(mag2) || !Number.isFinite(refMag2) || !Number.isFinite(dzMag2)) return true;
+  if (refMag2 <= 1e-30 || dzMag2 <= 1e-30) return false;
+  return dzMag2 > refMag2 * 1e-4 && mag2 < refMag2 * 1e-20;
 }
 
 function tileRadius(rect: { x: number; y: number; width: number; height: number }, reference: ReferenceSnapshot, pixelSpan: number): number {
