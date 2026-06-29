@@ -1,0 +1,19 @@
+[package]
+name = "mandelbrot_wasm"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+astro-float = { version = "0.9.5", default-features = false, features = ["std"] }
+wasm-bindgen = "0.2.126"
+serde = { version = "1.0", features = ["derive"] }
+serde-wasm-bindgen = "0.6"
+js-sys = "0.3"
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1

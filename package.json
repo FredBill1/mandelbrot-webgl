@@ -1,0 +1,27 @@
+{
+  "name": "mandelbrot-webgl",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "scripts": {
+    "build:wasm": "wasm-pack build wasm --target web --out-dir ../src/wasm/pkg --release",
+    "predev": "npm run build:wasm",
+    "dev": "vite --host 127.0.0.1",
+    "prebuild": "npm run build:wasm",
+    "build": "tsc -b && vite build",
+    "preview": "vite preview --host 127.0.0.1",
+    "pretest": "npm run build:wasm",
+    "test": "vitest run",
+    "pretest:e2e": "npm run build",
+    "test:e2e": "playwright test",
+    "typecheck": "tsc -b"
+  },
+  "dependencies": {},
+  "devDependencies": {
+    "@playwright/test": "^1.61.1",
+    "@types/node": "^24.10.1",
+    "typescript": "^6.0.3",
+    "vite": "^8.1.0",
+    "vitest": "^4.1.9"
+  }
+}
