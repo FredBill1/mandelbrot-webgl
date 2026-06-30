@@ -90,6 +90,8 @@ export interface TileStats {
   unresolvedCount: number;
   escapedPixels: number;
   periodicInteriorCount: number;
+  rebaseCount: number;
+  rebaseLimitCount: number;
   seriesSkip: number;
   referenceId: string;
   referenceIdsUsed: string[];

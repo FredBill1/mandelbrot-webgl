@@ -8,6 +8,8 @@ interface PixelResult {
   unresolved: boolean;
   survivedIter: number;
   periodicInterior: boolean;
+  rebaseCount: number;
+  rebaseLimit: boolean;
 }
 
 interface ReferenceContext {
@@ -30,6 +32,8 @@ interface ClusterAccumulator {
 }
 
 const MIN_PIXEL_SPAN_FOR_PERIODIC_INTERIOR = 1e-18;
+const REBASE_G = 1e-8;
+const MAX_REBASES_PER_PIXEL = 64;
 
 export function renderPerturbationTile(message: RenderTileMessage): TileDoneMessage {
   const started = performance.now();
@@ -54,6 +58,8 @@ export function renderPerturbationTile(message: RenderTileMessage): TileDoneMess
   let unresolvedCount = 0;
   let escapedPixels = 0;
   let periodicInteriorCount = 0;
+  let rebaseCount = 0;
+  let rebaseLimitCount = 0;
   let unresolvedScreenXSum = 0;
   let unresolvedScreenYSum = 0;
   let seriesSkip = 0;
@@ -69,6 +75,8 @@ export function renderPerturbationTile(message: RenderTileMessage): TileDoneMess
       const offset = (py * width + px) * 4;
       if (result.iter < maxIter) escapedPixels += 1;
       if (result.periodicInterior) periodicInteriorCount += 1;
+      rebaseCount += result.rebaseCount;
+      if (result.rebaseLimit) rebaseLimitCount += 1;
       if (result.glitch) glitchCount += 1;
       if (referenceId) usedReferenceIds.add(referenceId);
       seriesSkip = Math.max(seriesSkip, skip);
@@ -105,6 +113,8 @@ export function renderPerturbationTile(message: RenderTileMessage): TileDoneMess
       unresolvedCount,
       escapedPixels,
       periodicInteriorCount,
+      rebaseCount,
+      rebaseLimitCount,
       seriesSkip,
       referenceId: referenceIdsUsed[0] ?? contexts[0]?.reference.id ?? "",
       referenceIdsUsed,
@@ -141,7 +151,16 @@ function renderPixelWithReferences(
   }
 
   return {
-    result: bestUnresolved ?? { iter: maxIter, mag2: 0, glitch: true, unresolved: true, survivedIter: 0, periodicInterior: false },
+    result: bestUnresolved ?? {
+      iter: maxIter,
+      mag2: 0,
+      glitch: true,
+      unresolved: true,
+      survivedIter: 0,
+      periodicInterior: false,
+      rebaseCount: 0,
+      rebaseLimit: false
+    },
     referenceId: bestUnresolvedReferenceId,
     skip: maxSkip
   };
@@ -159,8 +178,11 @@ function perturb(
   let dzRe = 0;
   let dzIm = 0;
   let iter = 0;
+  let refIndex = 0;
   let mag2 = 0;
   let glitch = false;
+  let rebaseCount = 0;
+  let rebaseLimit = false;
   const checkpointRe = allowPeriodicInterior ? new Float64Array(32) : undefined;
   const checkpointIm = allowPeriodicInterior ? new Float64Array(32) : undefined;
   const checkpointIter = allowPeriodicInterior ? new Int32Array(32) : undefined;
@@ -172,16 +194,17 @@ function perturb(
     dzRe = dz.re;
     dzIm = dz.im;
     iter = series.skip;
+    refIndex = series.skip;
   }
 
   const limit = Math.min(maxIter, orbitRe.length - 1);
-  if (limit < 0 || iter > limit) {
-    return { iter: maxIter, mag2, glitch: true, unresolved: true, survivedIter: Math.max(0, limit), periodicInterior: false };
+  if (limit < 0 || refIndex > limit) {
+    return failureResult(maxIter, mag2, true, Math.max(0, limit), rebaseCount, rebaseLimit);
   }
 
-  for (; iter <= limit; iter += 1) {
-    const refRe = orbitRe[iter];
-    const refIm = orbitIm[iter];
+  while (iter <= maxIter && refIndex <= limit) {
+    const refRe = orbitRe[refIndex];
+    const refIm = orbitIm[refIndex];
     if (!Number.isFinite(refRe) || !Number.isFinite(refIm)) {
       glitch = true;
       break;
@@ -190,7 +213,8 @@ function perturb(
     const zRe = refRe + dzRe;
     const zIm = refIm + dzIm;
     mag2 = zRe * zRe + zIm * zIm;
-    if (mag2 > 4) return { iter, mag2, glitch, unresolved: false, survivedIter: iter, periodicInterior: false };
+    if (mag2 > 4) return successResult(iter, mag2, glitch, false, rebaseCount, rebaseLimit);
+    if (iter >= maxIter) return successResult(maxIter, mag2, false, false, rebaseCount, rebaseLimit);
 
     if (checkpointRe && checkpointIm && checkpointIter && iter > 32 && iter % 8 === 0) {
       const cycleTolerance = 1e-20 * Math.max(1, mag2);
@@ -200,7 +224,7 @@ function perturb(
         const cycleDeltaIm = zIm - checkpointIm[checkpoint];
         const cycleDelta2 = cycleDeltaRe * cycleDeltaRe + cycleDeltaIm * cycleDeltaIm;
         if (Number.isFinite(cycleDelta2) && cycleDelta2 < cycleTolerance) {
-          return { iter: maxIter, mag2, glitch: false, unresolved: false, survivedIter: maxIter, periodicInterior: true };
+          return successResult(maxIter, mag2, false, true, rebaseCount, rebaseLimit);
         }
       }
       checkpointRe[checkpointIndex] = zRe;
@@ -212,31 +236,71 @@ function perturb(
 
     const refMag2 = refRe * refRe + refIm * refIm;
     const dzMag2BeforeStep = dzRe * dzRe + dzIm * dzIm;
-    if (isCancellationGlitch(mag2, refMag2, dzMag2BeforeStep)) {
+    let stepRefRe = refRe;
+    let stepRefIm = refIm;
+    let stepRefMag2 = refMag2;
+    if (shouldRebase(mag2, refMag2, refIndex)) {
+      if (rebaseCount >= MAX_REBASES_PER_PIXEL) {
+        glitch = true;
+        rebaseLimit = true;
+        break;
+      }
+      dzRe = zRe;
+      dzIm = zIm;
+      refIndex = 0;
+      stepRefRe = orbitRe[0] ?? 0;
+      stepRefIm = orbitIm[0] ?? 0;
+      stepRefMag2 = stepRefRe * stepRefRe + stepRefIm * stepRefIm;
+      rebaseCount += 1;
+    } else if (isCancellationGlitch(mag2, refMag2, dzMag2BeforeStep)) {
       glitch = true;
       break;
     }
 
-    if (iter === limit) break;
+    if (refIndex === limit) break;
 
     const dz2Re = dzRe * dzRe - dzIm * dzIm;
     const dz2Im = 2 * dzRe * dzIm;
-    const twoRefDzRe = 2 * (refRe * dzRe - refIm * dzIm);
-    const twoRefDzIm = 2 * (refRe * dzIm + refIm * dzRe);
+    const twoRefDzRe = 2 * (stepRefRe * dzRe - stepRefIm * dzIm);
+    const twoRefDzIm = 2 * (stepRefRe * dzIm + stepRefIm * dzRe);
     dzRe = twoRefDzRe + dz2Re + cRe;
     dzIm = twoRefDzIm + dz2Im + cIm;
+    iter += 1;
+    refIndex += 1;
 
     const dzMag2 = dzRe * dzRe + dzIm * dzIm;
-    if (!Number.isFinite(dzMag2) || (refMag2 > 1e-24 && dzMag2 > refMag2 * 1e8)) {
+    if (!Number.isFinite(dzMag2) || (stepRefMag2 > 1e-24 && dzMag2 > stepRefMag2 * 1e8)) {
       glitch = true;
       break;
     }
   }
 
-  if (glitch || limit < maxIter) {
-    return { iter: maxIter, mag2, glitch: true, unresolved: true, survivedIter: Math.min(iter, limit), periodicInterior: false };
+  if (glitch || iter < maxIter) {
+    return failureResult(maxIter, mag2, true, Math.min(iter, maxIter), rebaseCount, rebaseLimit);
   }
-  return { iter: maxIter, mag2, glitch: false, unresolved: false, survivedIter: maxIter, periodicInterior: false };
+  return successResult(maxIter, mag2, false, false, rebaseCount, rebaseLimit);
+}
+
+function successResult(
+  iter: number,
+  mag2: number,
+  glitch: boolean,
+  periodicInterior: boolean,
+  rebaseCount: number,
+  rebaseLimit: boolean
+): PixelResult {
+  return { iter, mag2, glitch, unresolved: false, survivedIter: iter, periodicInterior, rebaseCount, rebaseLimit };
+}
+
+function failureResult(
+  iter: number,
+  mag2: number,
+  glitch: boolean,
+  survivedIter: number,
+  rebaseCount: number,
+  rebaseLimit: boolean
+): PixelResult {
+  return { iter, mag2, glitch, unresolved: true, survivedIter, periodicInterior: false, rebaseCount, rebaseLimit };
 }
 
 function createClusterAccumulators(rect: { x: number; y: number; width: number; height: number }): ClusterAccumulator[] {
@@ -360,6 +424,12 @@ function isCancellationGlitch(mag2: number, refMag2: number, dzMag2: number): bo
   if (!Number.isFinite(mag2) || !Number.isFinite(refMag2) || !Number.isFinite(dzMag2)) return true;
   if (refMag2 <= 1e-30 || dzMag2 <= 1e-30) return false;
   return dzMag2 > refMag2 * 1e-4 && mag2 < refMag2 * 1e-20;
+}
+
+function shouldRebase(mag2: number, refMag2: number, refIndex: number): boolean {
+  if (refIndex <= 0) return false;
+  if (!Number.isFinite(mag2) || !Number.isFinite(refMag2) || refMag2 <= 1e-30) return false;
+  return mag2 < refMag2 * REBASE_G;
 }
 
 function tileRadius(rect: { x: number; y: number; width: number; height: number }, reference: ReferenceSnapshot, pixelSpan: number): number {

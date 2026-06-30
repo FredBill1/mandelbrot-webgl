@@ -1,10 +1,14 @@
 import { describe, expect, it } from "vitest";
 import {
+  clusterReferenceLimit,
+  FIRST_CLUSTER_REFERENCES,
   maxReferencesForRect,
+  MAX_CLUSTER_REFERENCES_PER_PASS,
   MAX_TILE_REFERENCES_LARGE,
   MAX_TILE_REFERENCES_SMALL,
   nextStalledRefinementRounds,
   shouldSplitTile,
+  STALLED_CLUSTER_REFERENCES,
   splitAxis
 } from "../src/scheduler/tilePolicy";
 
@@ -12,6 +16,13 @@ describe("tile refinement policy", () => {
   it("uses larger reference budgets for large tiles", () => {
     expect(maxReferencesForRect({ x: 0, y: 0, width: 128, height: 128 })).toBe(MAX_TILE_REFERENCES_LARGE);
     expect(maxReferencesForRect({ x: 0, y: 0, width: 32, height: 16 })).toBe(MAX_TILE_REFERENCES_SMALL);
+  });
+
+  it("ramps cluster reference requests in stages", () => {
+    expect(clusterReferenceLimit(0, 0)).toBe(FIRST_CLUSTER_REFERENCES);
+    expect(clusterReferenceLimit(2, 0)).toBe(FIRST_CLUSTER_REFERENCES);
+    expect(clusterReferenceLimit(2, 1)).toBe(STALLED_CLUSTER_REFERENCES);
+    expect(clusterReferenceLimit(2, 2)).toBe(MAX_CLUSTER_REFERENCES_PER_PASS);
   });
 
   it("keeps refining when unresolved pixels improve substantially", () => {

@@ -1,4 +1,10 @@
 interface PendingReference {
+  requestId: number;
+  centerRe: string;
+  centerIm: string;
+  scale: string;
+  maxIter: number;
+  minPrecisionBits: number;
   resolve: (value: RawReferenceResult) => void;
   reject: (reason: Error) => void;
 }
@@ -13,50 +19,100 @@ export interface RawReferenceResult {
 }
 
 export class ReferenceClient {
-  private readonly worker = new Worker(new URL("../workers/referenceWorker.ts", import.meta.url), { type: "module" });
-  private readonly pending = new Map<number, PendingReference>();
+  private readonly workers: Worker[] = [];
+  private readonly idle: Worker[] = [];
+  private readonly queue: PendingReference[] = [];
+  private readonly inFlight = new Map<Worker, PendingReference>();
   private requestId = 0;
 
-  constructor() {
-    this.worker.onmessage = (event: MessageEvent) => {
-      const data = event.data as
-        | { type: "referenceDone"; requestId: number; reference: RawReferenceResult }
-        | { type: "referenceError"; requestId: number; message: string };
-      const pending = this.pending.get(data.requestId);
-      if (!pending) return;
-      this.pending.delete(data.requestId);
-      if (data.type === "referenceDone") {
-        pending.resolve({
-          ...data.reference,
-          orbitRe: data.reference.orbitRe instanceof Float64Array ? data.reference.orbitRe : Float64Array.from(data.reference.orbitRe),
-          orbitIm: data.reference.orbitIm instanceof Float64Array ? data.reference.orbitIm : Float64Array.from(data.reference.orbitIm)
-        });
-      } else {
-        pending.reject(new Error(data.message));
-      }
-    };
+  constructor(size = resolveReferenceWorkerCount()) {
+    for (let index = 0; index < size; index += 1) {
+      const worker = new Worker(new URL("../workers/referenceWorker.ts", import.meta.url), { type: "module" });
+      worker.onmessage = (event: MessageEvent) => {
+        const data = event.data as
+          | { type: "referenceDone"; requestId: number; reference: RawReferenceResult }
+          | { type: "referenceError"; requestId: number; message: string };
+        this.handleMessage(worker, data);
+      };
+      worker.onerror = (event) => this.handleError(worker, new Error(event.message));
+      this.workers.push(worker);
+      this.idle.push(worker);
+    }
+  }
+
+  get size(): number {
+    return this.workers.length;
   }
 
   compute(centerRe: string, centerIm: string, scale: string, maxIter: number, minPrecisionBits = 128): Promise<RawReferenceResult> {
     const requestId = ++this.requestId;
     const promise = new Promise<RawReferenceResult>((resolve, reject) => {
-      this.pending.set(requestId, { resolve, reject });
+      this.queue.push({ requestId, centerRe, centerIm, scale, maxIter, minPrecisionBits, resolve, reject });
     });
-    this.worker.postMessage({
-      type: "computeReference",
-      requestId,
-      centerRe,
-      centerIm,
-      scale,
-      maxIter,
-      minPrecisionBits
-    });
+    this.pump();
     return promise;
   }
 
   dispose(): void {
-    this.worker.terminate();
-    for (const pending of this.pending.values()) pending.reject(new Error("Reference worker terminated"));
-    this.pending.clear();
+    for (const worker of this.workers) worker.terminate();
+    for (const pending of this.queue) pending.reject(new Error("Reference worker terminated"));
+    for (const pending of this.inFlight.values()) pending.reject(new Error("Reference worker terminated"));
+    this.queue.splice(0);
+    this.inFlight.clear();
+    this.idle.splice(0);
   }
+
+  private handleMessage(
+    worker: Worker,
+    data:
+      | { type: "referenceDone"; requestId: number; reference: RawReferenceResult }
+      | { type: "referenceError"; requestId: number; message: string }
+  ): void {
+    const pending = this.inFlight.get(worker);
+    if (!pending) return;
+    this.inFlight.delete(worker);
+    this.idle.push(worker);
+    if (data.type === "referenceDone") {
+      pending.resolve({
+        ...data.reference,
+        orbitRe: data.reference.orbitRe instanceof Float64Array ? data.reference.orbitRe : Float64Array.from(data.reference.orbitRe),
+        orbitIm: data.reference.orbitIm instanceof Float64Array ? data.reference.orbitIm : Float64Array.from(data.reference.orbitIm)
+      });
+    } else {
+      pending.reject(new Error(data.message));
+    }
+    this.pump();
+  }
+
+  private handleError(worker: Worker, error: Error): void {
+    const pending = this.inFlight.get(worker);
+    if (pending) {
+      this.inFlight.delete(worker);
+      pending.reject(error);
+    }
+    this.idle.push(worker);
+    this.pump();
+  }
+
+  private pump(): void {
+    while (this.idle.length > 0 && this.queue.length > 0) {
+      const worker = this.idle.pop();
+      const pending = this.queue.shift();
+      if (!worker || !pending) break;
+      this.inFlight.set(worker, pending);
+      worker.postMessage({
+        type: "computeReference",
+        requestId: pending.requestId,
+        centerRe: pending.centerRe,
+        centerIm: pending.centerIm,
+        scale: pending.scale,
+        maxIter: pending.maxIter,
+        minPrecisionBits: pending.minPrecisionBits
+      });
+    }
+  }
+}
+
+export function resolveReferenceWorkerCount(hardwareConcurrency = globalThis.navigator?.hardwareConcurrency ?? 4): number {
+  return Math.min(4, Math.max(1, Math.floor(hardwareConcurrency / 4)));
 }

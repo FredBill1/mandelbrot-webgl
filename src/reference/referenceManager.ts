@@ -10,6 +10,7 @@ interface ReferenceKey {
 
 export class ReferenceManager {
   private readonly references = new Map<string, ReferenceSnapshot>();
+  private readonly pendingReferences = new Map<string, Promise<ReferenceSnapshot>>();
   private readonly pinnedReferenceIds = new Set<string>();
   private currentViewReference: ReferenceSnapshot | undefined;
   private sequence = 0;
@@ -121,45 +122,78 @@ export class ReferenceManager {
     revision: number;
     minPrecisionBits: number;
   }): Promise<ReferenceSnapshot> {
+    const satisfying = this.findSatisfyingReference(input.centerRe, input.centerIm, input.maxIter, input.minPrecisionBits);
+    if (satisfying) {
+      satisfying.screenX = input.screenX;
+      satisfying.screenY = input.screenY;
+      satisfying.revision = input.revision;
+      return satisfying;
+    }
+
     const roughKey: ReferenceKey = {
       centerRe: input.centerRe,
       centerIm: input.centerIm,
       maxIter: input.maxIter,
       precisionBits: input.minPrecisionBits
     };
-    const existing = this.references.get(referenceKey(roughKey));
-    if (existing) {
-      existing.screenX = input.screenX;
-      existing.screenY = input.screenY;
-      existing.revision = input.revision;
-      return existing;
+    const key = referenceKey(roughKey);
+    const pending = this.pendingReferences.get(key);
+    if (pending) {
+      const reference = await pending;
+      reference.screenX = input.screenX;
+      reference.screenY = input.screenY;
+      reference.revision = input.revision;
+      return reference;
     }
 
-    const raw = await this.client.compute(input.centerRe, input.centerIm, input.scale, input.maxIter, input.minPrecisionBits);
-    const snapshot: ReferenceSnapshot = {
-      id: `ref-${++this.sequence}`,
-      centerRe: raw.centerRe,
-      centerIm: raw.centerIm,
-      screenX: input.screenX,
-      screenY: input.screenY,
-      precisionBits: raw.precisionBits,
-      escapedAt: raw.escapedAt,
-      maxIter: input.maxIter,
-      revision: input.revision,
-      orbitRe: raw.orbitRe,
-      orbitIm: raw.orbitIm
-    };
-    this.references.set(
-      referenceKey({
-        centerRe: snapshot.centerRe,
-        centerIm: snapshot.centerIm,
-        maxIter: snapshot.maxIter,
-        precisionBits: input.minPrecisionBits
-      }),
-      snapshot
+    const promise = this.client
+      .compute(input.centerRe, input.centerIm, input.scale, input.maxIter, input.minPrecisionBits)
+      .then((raw) => {
+        const snapshot: ReferenceSnapshot = {
+          id: `ref-${++this.sequence}`,
+          centerRe: raw.centerRe,
+          centerIm: raw.centerIm,
+          screenX: input.screenX,
+          screenY: input.screenY,
+          precisionBits: raw.precisionBits,
+          escapedAt: raw.escapedAt,
+          maxIter: input.maxIter,
+          revision: input.revision,
+          orbitRe: raw.orbitRe,
+          orbitIm: raw.orbitIm
+        };
+        this.references.set(
+          referenceKey({
+            centerRe: snapshot.centerRe,
+            centerIm: snapshot.centerIm,
+            maxIter: snapshot.maxIter,
+            precisionBits: input.minPrecisionBits
+          }),
+          snapshot
+        );
+        this.trim(input.revision);
+        return snapshot;
+      })
+      .finally(() => {
+        this.pendingReferences.delete(key);
+      });
+    this.pendingReferences.set(key, promise);
+    return promise;
+  }
+
+  private findSatisfyingReference(
+    centerRe: string,
+    centerIm: string,
+    maxIter: number,
+    minPrecisionBits: number
+  ): ReferenceSnapshot | undefined {
+    return this.entries.find(
+      (reference) =>
+        reference.centerRe === centerRe &&
+        reference.centerIm === centerIm &&
+        reference.maxIter === maxIter &&
+        reference.precisionBits >= minPrecisionBits
     );
-    this.trim(input.revision);
-    return snapshot;
   }
 
   private referenceCandidatesWithDistance(tile: TileDescriptor, maxIter: number, revision: number): Array<{ reference: ReferenceSnapshot; distance: number }> {

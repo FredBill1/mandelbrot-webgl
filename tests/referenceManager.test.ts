@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
 import { ReferenceManager } from "../src/reference/referenceManager";
-import type { RawReferenceResult, ReferenceClient } from "../src/reference/referenceClient";
+import { resolveReferenceWorkerCount, type RawReferenceResult, type ReferenceClient } from "../src/reference/referenceClient";
 import type { RuntimeView, TileDescriptor } from "../src/types";
 
 describe("ReferenceManager", () => {
@@ -59,23 +59,79 @@ describe("ReferenceManager", () => {
 
     expect(manager.getById(oldReference.id)?.centerRe).toBe("old");
   });
+
+  it("deduplicates identical pending reference computations", async () => {
+    const maxIter = 64;
+    let release: (() => void) | undefined;
+    const client = {
+      compute: vi.fn(
+        async (centerRe: string, centerIm: string, _scale: string, requestedMaxIter: number, minPrecisionBits: number) => {
+          await new Promise<void>((resolve) => {
+            release = resolve;
+          });
+          return makeRawReference(centerRe, centerIm, requestedMaxIter, minPrecisionBits);
+        }
+      ),
+      dispose: vi.fn()
+    } as unknown as ReferenceClient;
+    const manager = new ReferenceManager(client);
+    const view = makeView(maxIter);
+    const tile = makeTile("same", 100, 100);
+
+    const first = manager.ensureTileReference(view, tile, 160);
+    const second = manager.ensureTileReference(view, tile, 160);
+    release?.();
+
+    expect(await first).toBe(await second);
+    expect(client.compute).toHaveBeenCalledTimes(1);
+  });
+
+  it("reuses a higher precision reference for lower precision requests", async () => {
+    const maxIter = 64;
+    const client = makeClient(maxIter);
+    const manager = new ReferenceManager(client);
+    const view = makeView(maxIter);
+    const tile = makeTile("precise", 100, 100);
+
+    const high = await manager.ensureTileReference(view, tile, 256);
+    const low = await manager.ensureTileReference(view, tile, 128);
+
+    expect(low).toBe(high);
+    expect(client.compute).toHaveBeenCalledTimes(1);
+  });
+
+  it("caps reference worker count to a small CPU fraction", () => {
+    expect(resolveReferenceWorkerCount(1)).toBe(1);
+    expect(resolveReferenceWorkerCount(8)).toBe(2);
+    expect(resolveReferenceWorkerCount(16)).toBe(4);
+    expect(resolveReferenceWorkerCount(64)).toBe(4);
+  });
 });
 
 function makeClient(maxIter: number): ReferenceClient {
   return {
     compute: vi.fn(async (centerRe: string, centerIm: string, _scale: string, requestedMaxIter: number, minPrecisionBits: number) => {
-      const escapedAt = centerRe === "complete" ? requestedMaxIter : Math.min(maxIter, 32);
-      return {
-        centerRe,
-        centerIm,
-        precisionBits: minPrecisionBits,
-        escapedAt,
-        orbitRe: new Float64Array(escapedAt + 1),
-        orbitIm: new Float64Array(escapedAt + 1)
-      } satisfies RawReferenceResult;
+      return makeRawReference(centerRe, centerIm, requestedMaxIter, minPrecisionBits, centerRe === "complete" ? requestedMaxIter : Math.min(maxIter, 32));
     }),
     dispose: vi.fn()
   } as unknown as ReferenceClient;
+}
+
+function makeRawReference(
+  centerRe: string,
+  centerIm: string,
+  maxIter: number,
+  precisionBits: number,
+  escapedAt = maxIter
+): RawReferenceResult {
+  return {
+    centerRe,
+    centerIm,
+    precisionBits,
+    escapedAt,
+    orbitRe: new Float64Array(escapedAt + 1),
+    orbitIm: new Float64Array(escapedAt + 1)
+  };
 }
 
 function makeView(maxIter: number): RuntimeView {

@@ -33,6 +33,8 @@ const DEEP_INTERIOR_REGRESSION_URL =
   "/?re=-1.5738375605512487151154265653948631632264711132220526532084658732407373266127815e0&im=-5.436641856961396284208136132163104968082086032418720386308428789634830866733822e-10&scale=1.1351152221045656587152530244486905603141464775053705184640271695455593072075544e9&iter=1092";
 const FALSE_PERIODIC_INTERIOR_URL =
   "/?re=4.3792424135946285718646361930043170565329095266291420488816260206742136590487596e-1&im=3.4189208433811610894511184773165189135789717878674952119590075744029026125433273e-1&scale=1.0835064437740330620649324308790033236032009031542860476819043611262629043597067e27&iter=2243";
+const REFERENCE_EXPLOSION_REGRESSION_URL =
+  "/?re=-1.4844984007770583397190828833694392678094050320358041080022085134265597136975238e0&im=-1.1888756927003972876725424636547540252174013462943168696052865147067734469300689e-5&scale=5.4036493724669001296700958127360151018828249203074393236865719904836523640593173e5&iter=879";
 
 test("renders, pans, zooms, and restores URL state", async ({ page }) => {
   await page.goto("/");
@@ -133,6 +135,17 @@ test("does not leave false periodic disks black at 1e27", async ({ page }) => {
   }
 });
 
+test("keeps reference count bounded on the 120-tile reference explosion view", async ({ page }) => {
+  test.setTimeout(90_000);
+  await page.setViewportSize({ width: 1912, height: 948 });
+  await page.goto(REFERENCE_EXPLOSION_REGRESSION_URL);
+  await waitForNonBlankCanvas(page, 75_000);
+
+  const tileCounts = await readTileCounts(page);
+  expect(tileCounts.completed).toBe(tileCounts.total);
+  expect(await readReferenceCount(page)).toBeLessThan(300);
+});
+
 async function waitForNonBlankCanvas(page: import("@playwright/test").Page, timeout = 15_000): Promise<void> {
   await expect(page.locator("#readStatus")).toHaveText("stable", { timeout });
   await expect
@@ -199,4 +212,9 @@ async function readTileCounts(page: import("@playwright/test").Page): Promise<{ 
   const match = /^(\d+)\/(\d+)$/.exec(text ?? "");
   if (!match) return { completed: 0, total: Number.POSITIVE_INFINITY };
   return { completed: Number(match[1]), total: Number(match[2]) };
+}
+
+async function readReferenceCount(page: import("@playwright/test").Page): Promise<number> {
+  const text = await page.locator("#readRefs").textContent();
+  return Number(text ?? Number.POSITIVE_INFINITY);
 }
