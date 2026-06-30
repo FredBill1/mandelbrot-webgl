@@ -18,7 +18,7 @@ import {
   parseViewFromUrl,
   writeViewToUrl
 } from "./state/urlState";
-import { decimalLog10, defaultMaxIter, formatCompactDecimal, pixelSpanForView } from "./math/view";
+import { defaultMaxIter, formatCompactDecimal, pixelSpanForView } from "./math/view";
 import { initWasm, pointToViewCenter, transformView } from "./wasmApi";
 import {
   SERIES_DEGREE,
@@ -58,6 +58,9 @@ interface TileWorkState {
   previewUploaded: boolean;
   microtileAllowed: boolean;
   splitReason: string | undefined;
+  centerReferenceAttempted: boolean;
+  referenceWaveLevel: number;
+  lastReferencePressure: number;
 }
 
 interface ReferenceBrokerWaiter {
@@ -71,19 +74,16 @@ interface ReferenceBrokerEntry {
   targetScreenX: number;
   targetScreenY: number;
   requiredPrecision: number;
+  cellSize: number;
+  survivedIter: number;
+  pixelCount: number;
   waiters: ReferenceBrokerWaiter[];
 }
 
 const MAX_RENDER_REFERENCES = 16;
-const COARSE_REFERENCE_CELL_PX = 64;
-const FINE_REFERENCE_CELL_PX = 32;
-const AGGRESSIVE_REFERENCE_SHARING_MIN_LOG10 = 5;
-const AGGRESSIVE_REFERENCE_SHARING_MAX_LOG10 = 7.5;
-
-function useAggressiveReferenceSharing(localRuntime: RuntimeView): boolean {
-  const zoomLog10 = decimalLog10(localRuntime.scale);
-  return zoomLog10 >= AGGRESSIVE_REFERENCE_SHARING_MIN_LOG10 && zoomLog10 <= AGGRESSIVE_REFERENCE_SHARING_MAX_LOG10;
-}
+const HIGH_REFERENCE_PRESSURE = 0.12;
+const LOW_REFERENCE_PRESSURE = 0.01;
+const BROKER_FLUSH_DELAY_MS = 12;
 
 export async function startApp(root: HTMLElement): Promise<void> {
   root.innerHTML = `
@@ -135,6 +135,7 @@ export async function startApp(root: HTMLElement): Promise<void> {
   const pendingTileIds = new Set<string>();
   const tileStates = new Map<string, TileWorkState>();
   const referenceBroker = new Map<string, ReferenceBrokerEntry>();
+  let referenceBrokerFlush = 0;
 
   let runtime = currentRuntimeView();
   resize();
@@ -228,6 +229,8 @@ export async function startApp(root: HTMLElement): Promise<void> {
     pendingTileIds.clear();
     tileStates.clear();
     referenceBroker.clear();
+    window.clearTimeout(referenceBrokerFlush);
+    referenceBrokerFlush = 0;
 
     await references.ensureViewReference(localRuntime);
     if (token !== renderToken) return;
@@ -267,7 +270,10 @@ export async function startApp(root: HTMLElement): Promise<void> {
       stalledRefinementRounds: 0,
       previewUploaded: false,
       microtileAllowed: false,
-      splitReason: undefined
+      splitReason: undefined,
+      centerReferenceAttempted: false,
+      referenceWaveLevel: 0,
+      lastReferencePressure: 0
     };
     tileStates.set(tile.id, state);
     pendingTileIds.add(tile.id);
@@ -366,12 +372,22 @@ export async function startApp(root: HTMLElement): Promise<void> {
       if (result.stats.unresolvedCount > 0) {
         renderer.uploadTile(result);
         state.previewUploaded = true;
+        state.lastReferencePressure = unresolvedPressure(state, result.stats.unresolvedCount);
         state.stalledRefinementRounds = nextStalledRefinementRounds(
           state.lastUnresolvedCount,
           result.stats.unresolvedCount,
           state.stalledRefinementRounds
         );
         state.lastUnresolvedCount = result.stats.unresolvedCount;
+
+        if (shouldRequestCenterReferenceFirst(localRuntime, state, result.stats.referenceIdsUsed)) {
+          const queuedCenter = requestCenterReference(localRuntime, state, highestPrecisionForState(state, localRuntime) + 32);
+          if (queuedCenter) {
+            stats.pending = pendingTileIds.size;
+            stats.status = "refining";
+            return;
+          }
+        }
 
         const queued = queueClusterReferences(localRuntime, state, result.stats.unresolvedClusters);
         if (queued > 0 || state.pendingReferences > 0) {
@@ -423,7 +439,8 @@ export async function startApp(root: HTMLElement): Promise<void> {
     const state = tileStates.get(message.tile.id);
     if (!state || state.completed) return;
     const localRuntime = currentRuntimeView();
-    const requestKey = referenceRequestKey(localRuntime, message.targetScreenX, message.targetScreenY, message.requiredPrecision, message.refinementLevel).key;
+    const request = referenceRequestKey(localRuntime, message.targetScreenX, message.targetScreenY, message.requiredPrecision, 32);
+    const requestKey = request.key;
     if (state.requestedReferenceKeys.has(requestKey)) return;
     if (state.referenceIds.size + state.pendingReferences >= maxReferencesForRect(state.tile.rect) && canSplitTile(state.tile)) return;
 
@@ -432,7 +449,12 @@ export async function startApp(root: HTMLElement): Promise<void> {
     state.localReferenceRequests += 1;
     stats.pending = pendingTileIds.size;
     stats.status = "refining";
-    enqueueBrokerReference(localRuntime, state, message.targetScreenX, message.targetScreenY, message.requiredPrecision, message.refinementLevel, requestKey);
+    enqueueBrokerReference(localRuntime, state, {
+      ...request,
+      refinementLevel: message.refinementLevel,
+      survivedIter: 0,
+      pixelCount: 1
+    });
   }
 
   function buildReferenceCandidates(state: TileWorkState, localRuntime: RuntimeView) {
@@ -440,7 +462,7 @@ export async function startApp(root: HTMLElement): Promise<void> {
       .map((id) => references.getById(id))
       .filter((reference): reference is NonNullable<typeof reference> => Boolean(reference));
     explicit.sort((a, b) => referenceDistance(state.tile, a) - referenceDistance(state.tile, b));
-    const maxReferences = useAggressiveReferenceSharing(localRuntime)
+    const maxReferences = state.lastReferencePressure >= HIGH_REFERENCE_PRESSURE
       ? Math.min(MAX_RENDER_REFERENCES, maxReferencesForRect(state.tile.rect))
       : maxReferencesForRect(state.tile.rect);
     const localReferenceLimit = Math.max(1, Math.ceil(maxReferences * 0.75));
@@ -457,58 +479,86 @@ export async function startApp(root: HTMLElement): Promise<void> {
     const maxReferences = maxReferencesForRect(state.tile.rect);
     if (state.referenceIds.size + state.pendingReferences >= maxReferences && canSplitTile(state.tile)) return 0;
     let queued = 0;
-    const highestPrecision = buildReferenceCandidates(state, localRuntime).reduce((bits, reference) => Math.max(bits, reference.precisionBits), 128);
+    const highestPrecision = highestPrecisionForState(state, localRuntime);
     const perPassLimit = clusterReferenceLimitForState(localRuntime, state);
+    const cellSize = referenceWaveCellSize(state);
     for (const cluster of clusters.slice(0, perPassLimit)) {
       if (state.referenceIds.size + state.pendingReferences >= maxReferences && canSplitTile(state.tile)) break;
-      const request = referenceRequestKey(localRuntime, cluster.screenX, cluster.screenY, highestPrecision + 32, state.refinementLevel + 1);
+      const request = referenceRequestKey(localRuntime, cluster.screenX, cluster.screenY, highestPrecision + 32, cellSize);
       const requestKey = request.key;
       if (state.requestedReferenceKeys.has(requestKey)) continue;
       state.pendingReferences += 1;
       state.localReferenceRequests += 1;
       state.requestedReferenceKeys.add(requestKey);
       queued += 1;
-      enqueueBrokerReference(
-        localRuntime,
-        state,
-        request.targetScreenX,
-        request.targetScreenY,
-        request.requiredPrecision,
-        state.refinementLevel + 1,
-        requestKey
-      );
+      enqueueBrokerReference(localRuntime, state, {
+        ...request,
+        refinementLevel: state.refinementLevel + 1,
+        survivedIter: cluster.survivedIter,
+        pixelCount: cluster.pixelCount
+      });
     }
+    if (queued > 0) state.referenceWaveLevel += 1;
     return queued;
   }
 
   function enqueueBrokerReference(
     localRuntime: RuntimeView,
     state: TileWorkState,
-    screenX: number,
-    screenY: number,
-    requiredPrecision: number,
-    refinementLevel: number,
-    requestKey: string
+    request: ReturnType<typeof referenceRequestKey> & { refinementLevel: number; survivedIter: number; pixelCount: number }
   ): void {
-    const existing = referenceBroker.get(requestKey);
+    const existing = referenceBroker.get(request.key);
     if (existing) {
-      existing.waiters.push({ tileId: state.tile.id, refinementLevel });
+      existing.waiters.push({ tileId: state.tile.id, refinementLevel: request.refinementLevel });
+      if (isBetterBrokerRepresentative(request, existing)) {
+        existing.targetScreenX = request.targetScreenX;
+        existing.targetScreenY = request.targetScreenY;
+        existing.survivedIter = request.survivedIter;
+        existing.pixelCount = request.pixelCount;
+      }
       return;
     }
     const entry: ReferenceBrokerEntry = {
-      key: requestKey,
+      key: request.key,
       revision: localRuntime.revision,
-      targetScreenX: screenX,
-      targetScreenY: screenY,
-      requiredPrecision,
-      waiters: [{ tileId: state.tile.id, refinementLevel }]
+      targetScreenX: request.targetScreenX,
+      targetScreenY: request.targetScreenY,
+      requiredPrecision: request.requiredPrecision,
+      cellSize: request.cellSize,
+      survivedIter: request.survivedIter,
+      pixelCount: request.pixelCount,
+      waiters: [{ tileId: state.tile.id, refinementLevel: request.refinementLevel }]
     };
-    referenceBroker.set(requestKey, entry);
-    void computeBrokerReference(localRuntime, entry);
+    referenceBroker.set(request.key, entry);
+    scheduleBrokerFlush(localRuntime);
+  }
+
+  function scheduleBrokerFlush(localRuntime: RuntimeView): void {
+    if (referenceBrokerFlush !== 0) return;
+    referenceBrokerFlush = window.setTimeout(() => {
+      referenceBrokerFlush = 0;
+      const entries = [...referenceBroker.values()]
+        .filter((entry) => entry.revision === localRuntime.revision)
+        .sort((a, b) => b.survivedIter - a.survivedIter || b.pixelCount - a.pixelCount);
+      for (const entry of entries) void computeBrokerReference(localRuntime, entry);
+    }, BROKER_FLUSH_DELAY_MS);
   }
 
   async function computeBrokerReference(localRuntime: RuntimeView, entry: ReferenceBrokerEntry): Promise<void> {
     try {
+      const reusable = references.findReusableNear(
+        entry.targetScreenX,
+        entry.targetScreenY,
+        Math.max(0.5, entry.cellSize * 0.75),
+        localRuntime.maxIter,
+        entry.revision,
+        entry.requiredPrecision
+      );
+      if (reusable) {
+        distributeBrokerReference(localRuntime, entry, reusable.id);
+        return;
+      }
+
       const targetCenter = await pointToViewCenter(view, localRuntime.width, localRuntime.height, entry.targetScreenX, entry.targetScreenY);
       if (entry.revision !== revision) return;
       const targetTile: TileDescriptor = {
@@ -523,18 +573,7 @@ export async function startApp(root: HTMLElement): Promise<void> {
       };
       const reference = await references.ensureTileReference(localRuntime, targetTile, entry.requiredPrecision);
       if (entry.revision !== revision) return;
-      for (const waiter of entry.waiters) {
-        const waiterState = tileStates.get(waiter.tileId);
-        if (!waiterState) continue;
-        waiterState.pendingReferences = Math.max(0, waiterState.pendingReferences - 1);
-        if (waiterState.completed || waiterState.tile.revision !== revision) continue;
-        waiterState.referenceIds.add(reference.id);
-        waiterState.refinementLevel = Math.max(waiterState.refinementLevel, waiter.refinementLevel);
-        if (!waiterState.inFlight) void submitTile(localRuntime, waiterState);
-      }
-      syncPinnedReferences();
-      stats.references = references.size;
-      updateWorkStatus("refining");
+      distributeBrokerReference(localRuntime, entry, reference.id);
     } catch (error) {
       for (const waiter of entry.waiters) {
         const waiterState = tileStates.get(waiter.tileId);
@@ -547,19 +586,12 @@ export async function startApp(root: HTMLElement): Promise<void> {
   }
 
   async function forceCenterReference(localRuntime: RuntimeView, state: TileWorkState): Promise<void> {
-    const highestPrecision = buildReferenceCandidates(state, localRuntime).reduce((bits, reference) => Math.max(bits, reference.precisionBits), 128);
-    state.referenceIds.clear();
-    state.requestedReferenceKeys.clear();
-    state.pendingReferences = 0;
-    state.localReferenceRequests += 1;
-    state.refinementLevel += 1;
-    const reference = await references.ensureTileReference(localRuntime, state.tile, highestPrecision + 64);
-    if (state.tile.revision !== revision || state.completed) return;
-    state.referenceIds.add(reference.id);
-    syncPinnedReferences();
-    stats.references = references.size;
-    stats.status = "refining";
-    await submitTile(localRuntime, state);
+    if (requestCenterReference(localRuntime, state, highestPrecisionForState(state, localRuntime) + 64)) return;
+    if (canSplitTile(state.tile)) {
+      state.microtileAllowed = true;
+      state.splitReason = "center reference exhausted";
+      await splitTile(localRuntime, state);
+    }
   }
 
   async function splitTile(localRuntime: RuntimeView, state: TileWorkState): Promise<void> {
@@ -579,6 +611,8 @@ export async function startApp(root: HTMLElement): Promise<void> {
       const child = createTileState(subtile, state.referenceIds, state.splitLevel + 1);
       child.microtileAllowed = state.microtileAllowed;
       child.localReferenceRequests = state.localReferenceRequests;
+      child.centerReferenceAttempted = state.centerReferenceAttempted;
+      child.referenceWaveLevel = state.referenceWaveLevel;
       void submitPreview(localRuntime, child);
       void submitTile(localRuntime, child);
     }
@@ -653,9 +687,33 @@ export async function startApp(root: HTMLElement): Promise<void> {
     stats.status = hasOutstandingWork() ? activeStatus : "stable";
   }
 
-  function clusterReferenceLimitForState(localRuntime: RuntimeView, state: TileWorkState): number {
-    if (!useAggressiveReferenceSharing(localRuntime)) return MAX_CLUSTER_REFERENCES_PER_PASS;
-    return Math.min(MAX_CLUSTER_REFERENCES_PER_PASS, clusterReferenceLimit(state.localReferenceRequests, state.stalledRefinementRounds));
+  function distributeBrokerReference(localRuntime: RuntimeView, entry: ReferenceBrokerEntry, referenceId: string): void {
+    for (const waiter of entry.waiters) {
+      const waiterState = tileStates.get(waiter.tileId);
+      if (!waiterState) continue;
+      waiterState.pendingReferences = Math.max(0, waiterState.pendingReferences - 1);
+      if (waiterState.completed || waiterState.tile.revision !== revision) continue;
+      waiterState.referenceIds.add(referenceId);
+      waiterState.refinementLevel = Math.max(waiterState.refinementLevel, waiter.refinementLevel);
+      if (!waiterState.inFlight) void submitTile(localRuntime, waiterState);
+    }
+    syncPinnedReferences();
+    stats.references = references.size;
+    updateWorkStatus("refining");
+  }
+
+  function clusterReferenceLimitForState(_localRuntime: RuntimeView, state: TileWorkState): number {
+    const stagedLimit = Math.min(MAX_CLUSTER_REFERENCES_PER_PASS, clusterReferenceLimit(state.localReferenceRequests, state.stalledRefinementRounds));
+    if (state.lastReferencePressure >= HIGH_REFERENCE_PRESSURE && state.referenceWaveLevel === 0) return Math.min(2, stagedLimit);
+    if (state.referenceWaveLevel <= 1) return Math.min(4, stagedLimit);
+    return stagedLimit;
+  }
+
+  function referenceWaveCellSize(state: TileWorkState): number {
+    if (state.lastReferencePressure < LOW_REFERENCE_PRESSURE && state.referenceWaveLevel > 0) return 1;
+    if (state.referenceWaveLevel <= 0) return 128;
+    if (state.referenceWaveLevel === 1) return 64;
+    return 32;
   }
 
   function referenceRequestKey(
@@ -663,20 +721,72 @@ export async function startApp(root: HTMLElement): Promise<void> {
     screenX: number,
     screenY: number,
     precisionBits: number,
-    refinementLevel: number
-  ): { key: string; targetScreenX: number; targetScreenY: number; requiredPrecision: number } {
-    const cellSize = useAggressiveReferenceSharing(localRuntime)
-      ? (refinementLevel <= 1 ? COARSE_REFERENCE_CELL_PX : FINE_REFERENCE_CELL_PX)
-      : 1;
-    const cellX = Math.floor(screenX / cellSize);
-    const cellY = Math.floor(screenY / cellSize);
+    cellSize: number
+  ): { key: string; targetScreenX: number; targetScreenY: number; requiredPrecision: number; cellSize: number } {
+    const normalizedCellSize = Math.max(1, Math.floor(cellSize));
+    const cellX = Math.floor(screenX / normalizedCellSize);
+    const cellY = Math.floor(screenY / normalizedCellSize);
     const requiredPrecision = Math.ceil(precisionBits / 32) * 32;
     return {
-      key: `${localRuntime.revision}:${localRuntime.maxIter}:${requiredPrecision}:${cellSize}:${cellX}:${cellY}`,
+      key: `${localRuntime.revision}:${localRuntime.maxIter}:${requiredPrecision}:${normalizedCellSize}:${cellX}:${cellY}`,
       targetScreenX: Math.max(0.5, Math.min(localRuntime.width - 0.5, screenX)),
       targetScreenY: Math.max(0.5, Math.min(localRuntime.height - 0.5, screenY)),
-      requiredPrecision
+      requiredPrecision,
+      cellSize: normalizedCellSize
     };
+  }
+
+  function highestPrecisionForState(state: TileWorkState, localRuntime: RuntimeView): number {
+    return buildReferenceCandidates(state, localRuntime).reduce((bits, reference) => Math.max(bits, reference.precisionBits), 128);
+  }
+
+  function unresolvedPressure(state: TileWorkState, unresolvedCount: number): number {
+    return unresolvedCount / Math.max(1, Math.ceil(state.tile.rect.width) * Math.ceil(state.tile.rect.height));
+  }
+
+  function shouldRequestCenterReferenceFirst(localRuntime: RuntimeView, state: TileWorkState, referenceIdsUsed: string[]): boolean {
+    if (state.centerReferenceAttempted || state.localReferenceRequests > 0 || state.pendingReferences > 0) return false;
+    const usedReferences = referenceIdsUsed.map((id) => references.getById(id)).filter((reference): reference is NonNullable<typeof reference> => Boolean(reference));
+    const bestEscapedAt = usedReferences.reduce((best, reference) => Math.max(best, reference.escapedAt), 0);
+    return usedReferences.length === 0 || bestEscapedAt < localRuntime.maxIter || state.lastReferencePressure >= HIGH_REFERENCE_PRESSURE;
+  }
+
+  function requestCenterReference(localRuntime: RuntimeView, state: TileWorkState, precisionBits: number): boolean {
+    const requestKey = `center:${state.tile.id}:${Math.ceil(precisionBits / 32) * 32}`;
+    if (state.requestedReferenceKeys.has(requestKey)) return false;
+    if (state.referenceIds.size + state.pendingReferences >= maxReferencesForRect(state.tile.rect) && canSplitTile(state.tile)) return false;
+
+    state.requestedReferenceKeys.add(requestKey);
+    state.pendingReferences += 1;
+    state.localReferenceRequests += 1;
+    state.centerReferenceAttempted = true;
+    void computeCenterReference(localRuntime, state, precisionBits);
+    return true;
+  }
+
+  async function computeCenterReference(localRuntime: RuntimeView, state: TileWorkState, precisionBits: number): Promise<void> {
+    try {
+      const reference = await references.ensureTileReference(localRuntime, state.tile, precisionBits);
+      state.pendingReferences = Math.max(0, state.pendingReferences - 1);
+      if (state.tile.revision !== revision || state.completed) return;
+      state.referenceIds.add(reference.id);
+      state.refinementLevel = Math.max(state.refinementLevel, 1);
+      syncPinnedReferences();
+      stats.references = references.size;
+      if (!state.inFlight) void submitTile(localRuntime, state);
+    } catch (error) {
+      state.pendingReferences = Math.max(0, state.pendingReferences - 1);
+      stats.status = error instanceof Error ? error.message : String(error);
+    }
+  }
+
+  function isBetterBrokerRepresentative(
+    request: { survivedIter: number; pixelCount: number; targetScreenX: number; targetScreenY: number },
+    existing: ReferenceBrokerEntry
+  ): boolean {
+    if (request.survivedIter !== existing.survivedIter) return request.survivedIter > existing.survivedIter;
+    if (request.pixelCount !== existing.pixelCount) return request.pixelCount > existing.pixelCount;
+    return Math.hypot(request.targetScreenX - existing.targetScreenX, request.targetScreenY - existing.targetScreenY) < existing.cellSize * 0.25;
   }
 
   function referenceDistance(tile: TileDescriptor, reference: { screenX: number; screenY: number }): number {

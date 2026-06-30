@@ -57,6 +57,15 @@ export interface ReferenceSnapshot {
   orbitIm: Float64Array;
 }
 
+export interface ReferenceHandle {
+  id: string;
+  screenX: number;
+  screenY: number;
+  precisionBits: number;
+  escapedAt: number;
+  maxIter: number;
+}
+
 export interface RenderTileMessage {
   type: "renderTile";
   tile: TileDescriptor;
@@ -64,13 +73,23 @@ export interface RenderTileMessage {
   canvasHeight: number;
   pixelSpan: number;
   maxIter: number;
-  references: ReferenceSnapshot[];
+  references: Array<ReferenceHandle | ReferenceSnapshot>;
   seriesDegree: number;
   paletteId: string;
   refined: boolean;
   refinementLevel: number;
   renderMode: "preview" | "final";
   sampleStep: number;
+}
+
+export interface CacheReferencesMessage {
+  type: "cacheReferences";
+  references: ReferenceSnapshot[];
+}
+
+export interface DropReferencesMessage {
+  type: "dropReferences";
+  referenceIds: string[];
 }
 
 export interface UnresolvedCluster {
@@ -92,6 +111,9 @@ export interface TileStats {
   periodicInteriorCount: number;
   rebaseCount: number;
   rebaseLimitCount: number;
+  blaSkipCount: number;
+  blaStepCount: number;
+  referenceCacheMissCount: number;
   seriesSkip: number;
   referenceId: string;
   referenceIdsUsed: string[];
@@ -125,4 +147,5 @@ export interface NeedReferenceMessage {
   sourceReferenceId: string;
 }
 
+export type TileWorkerInMessage = RenderTileMessage | CacheReferencesMessage | DropReferencesMessage;
 export type TileWorkerOutMessage = TileDoneMessage | NeedReferenceMessage;

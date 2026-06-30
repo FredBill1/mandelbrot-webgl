@@ -35,6 +35,28 @@ const FALSE_PERIODIC_INTERIOR_URL =
   "/?re=4.3792424135946285718646361930043170565329095266291420488816260206742136590487596e-1&im=3.4189208433811610894511184773165189135789717878674952119590075744029026125433273e-1&scale=1.0835064437740330620649324308790033236032009031542860476819043611262629043597067e27&iter=2243";
 const REFERENCE_EXPLOSION_REGRESSION_URL =
   "/?re=-1.4844984007770583397190828833694392678094050320358041080022085134265597136975238e0&im=-1.1888756927003972876725424636547540252174013462943168696052865147067734469300689e-5&scale=5.4036493724669001296700958127360151018828249203074393236865719904836523640593173e5&iter=879";
+const SHALLOW_REFERENCE_PRESSURE_URL =
+  "/?re=-7.555285830155848864404330289173214045991921102938369079173868192729048678452592e-1&im=-1.1299255326048044095654679100367577109576335059729038978640756697388655423467892e-1&scale=4.2521082000062727600593870163935622685108740541205488909679304242435828818426798e1&iter=617";
+const UNSAFE_BLA_TILE_REGRESSIONS = [
+  {
+    url:
+      "/?re=-7.4966934496787838098731959297327082792276256276453894183802736415249648212435748e-1&im=-3.6835970065942988109940808475490090964316091450085844904438388017995897542104474e-2&scale=6.3270229281225222636256752583925066391594865119590585837604607679616921758554968e2&iter=692",
+    sampleX: 1000 / 1912,
+    sampleY: 500 / 948
+  },
+  {
+    url:
+      "/?re=-7.4966934496787838098731959297327082792276256276453894183834598253472297257976325e-1&im=-3.6861521736029792925609229356779358072862177412970006775043765158497834429601425e-2&scale=8.5405876252614986071100413930631932487692657156726781640555443950802640849770656e2&iter=700",
+    sampleX: 1000 / 1912,
+    sampleY: 110 / 948
+  },
+  {
+    url:
+      "/?re=-7.5334616440141300198402043563623536803333838622141813662066992521181596683305397e-1&im=-4.696919675440392553632571151226876300052345258551595459624481658859540695903849e-2&scale=1.0846546284082077156096591056319128446503558802465354324581765182582005442316815e5&iter=835",
+    sampleX: 1008 / 1912,
+    sampleY: 546 / 948
+  }
+] as const;
 
 test("renders, pans, zooms, and restores URL state", async ({ page }) => {
   await page.goto("/");
@@ -146,41 +168,48 @@ test("keeps reference count bounded on the 120-tile reference explosion view", a
   expect(await readReferenceCount(page)).toBeLessThan(300);
 });
 
+test("keeps early-escape reference pressure bounded on the shallow 120-tile view", async ({ page }) => {
+  test.setTimeout(60_000);
+  await page.setViewportSize({ width: 1912, height: 948 });
+  const started = Date.now();
+  await page.goto(SHALLOW_REFERENCE_PRESSURE_URL);
+  await waitForNonBlankCanvas(page, 30_000);
+  const stableMs = Date.now() - started;
+
+  const tileCounts = await readTileCounts(page);
+  expect(tileCounts.completed).toBe(tileCounts.total);
+  expect(await readReferenceCount(page)).toBeLessThan(300);
+  expect(stableMs).toBeLessThan(20_000);
+});
+
+test("does not render unsafe BLA tiles on the reported medium-zoom views", async ({ page }) => {
+  test.setTimeout(140_000);
+  await page.setViewportSize({ width: 1912, height: 948 });
+
+  for (const view of UNSAFE_BLA_TILE_REGRESSIONS) {
+    await page.goto(view.url);
+    await waitForNonBlankCanvas(page, 75_000);
+    const tileCounts = await readTileCounts(page);
+    expect(tileCounts.completed).toBe(tileCounts.total);
+
+    const pixel = await readCanvasPixel(page, view.sampleX, view.sampleY);
+    expect(pixel[3]).toBe(255);
+    expect(pixel[0] + pixel[1] + pixel[2]).toBeLessThan(30);
+  }
+});
+
 async function waitForNonBlankCanvas(page: import("@playwright/test").Page, timeout = 15_000): Promise<void> {
   await expect(page.locator("#readStatus")).toHaveText("stable", { timeout });
   await expect
     .poll(async () => {
-      return page.evaluate(() => {
-        return new Promise<number>((resolve) => {
-          requestAnimationFrame(() => {
-            const canvas = document.querySelector<HTMLCanvasElement>("#fractal");
-            const gl = canvas?.getContext("webgl2", { alpha: false, antialias: false, preserveDrawingBuffer: true });
-            if (!canvas || !gl || gl.isContextLost() || canvas.width === 0 || canvas.height === 0) {
-              resolve(0);
-              return;
-            }
-            const samples = new Uint8Array(4 * 9);
-            let offset = 0;
-            for (const x of [0.25, 0.5, 0.75]) {
-              for (const y of [0.25, 0.5, 0.75]) {
-                const pixel = new Uint8Array(4);
-                gl.readPixels(
-                  Math.floor(canvas.width * x),
-                  Math.floor(canvas.height * y),
-                  1,
-                  1,
-                  gl.RGBA,
-                  gl.UNSIGNED_BYTE,
-                  pixel
-                );
-                samples.set(pixel, offset);
-                offset += 4;
-              }
-            }
-            resolve(samples.reduce((sum, value) => sum + value, 0));
-          });
-        });
-      });
+      let sum = 0;
+      for (const x of [0.1, 0.25, 0.5, 0.75, 0.9]) {
+        for (const y of [0.1, 0.25, 0.5, 0.75, 0.9]) {
+          const pixel = await readCanvasPixel(page, x, y);
+          sum += pixel[0] + pixel[1] + pixel[2] + pixel[3];
+        }
+      }
+      return sum;
     })
     .toBeGreaterThan(100);
 }

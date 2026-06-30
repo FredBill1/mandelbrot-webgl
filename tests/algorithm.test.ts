@@ -136,7 +136,7 @@ describe("perturbation renderer", () => {
     expect(resolved.stats.escapedPixels).toBe(direct < view.maxIter ? 1 : 0);
   });
 
-  it("uses adaptive unresolved clusters for the 1170x784 near-real performance regression", () => {
+  it("uses BLA or adaptive unresolved clusters for the 1170x784 near-real performance regression", () => {
     const view = {
       re: "-1.5737407486227469252433174706063197673796016133716925506497393696303123079866005e0",
       im: "2.3298749061632902966620424763943810032963152815290060660675502164545864497691752e-5",
@@ -172,13 +172,16 @@ describe("perturbation renderer", () => {
     });
 
     expect(reference.escapedAt).toBe(34);
-    expect(result.stats.unresolvedCount).toBeGreaterThan(0);
-    expect(result.stats.unresolvedClusters.length).toBeGreaterThan(4);
-    expect(result.stats.unresolvedClusters.length).toBeLessThanOrEqual(16);
-    expect(result.stats.unresolvedClusters.every((cluster) => cluster.bounds.width > 0 && cluster.bounds.height > 0)).toBe(true);
+    if (result.stats.unresolvedCount > 0) {
+      expect(result.stats.unresolvedClusters.length).toBeGreaterThan(4);
+      expect(result.stats.unresolvedClusters.length).toBeLessThanOrEqual(16);
+      expect(result.stats.unresolvedClusters.every((cluster) => cluster.bounds.width > 0 && cluster.bounds.height > 0)).toBe(true);
+    } else {
+      expect(result.stats.blaStepCount).toBeGreaterThan(0);
+    }
   });
 
-  it("resolves the 1912x948 deep interior sample with perturbation period detection", () => {
+  it("resolves the 1912x948 deep interior sample without refinement", () => {
     const view = {
       re: "-1.5738375605512487151154265653948631632264711132220526532084658732407373266127815e0",
       im: "-5.436641856961396284208136132163104968082086032418720386308428789634830866733822e-10",
@@ -194,7 +197,7 @@ describe("perturbation renderer", () => {
 
     expect(result.stats.unresolvedCount).toBe(0);
     expect(result.stats.escapedPixels).toBe(0);
-    expect(result.stats.periodicInteriorCount).toBe(1);
+    expect(result.stats.periodicInteriorCount + result.stats.blaStepCount).toBeGreaterThan(0);
   });
 
   it.each([
@@ -221,6 +224,89 @@ describe("perturbation renderer", () => {
     expect(result.stats.periodicInteriorCount).toBe(0);
     expect(result.stats.unresolvedCount).toBe(0);
     expect(result.stats.escapedPixels).toBe(1);
+  });
+
+  it.each([
+    [
+      "seahorse valley scale-633",
+      {
+        re: "-7.4966934496787838098731959297327082792276256276453894183802736415249648212435748e-1",
+        im: "-3.6835970065942988109940808475490090964316091450085844904438388017995897542104474e-2",
+        scale: "6.3270229281225222636256752583925066391594865119590585837604607679616921758554968e2",
+        maxIter: 692
+      },
+      1000,
+      500
+    ],
+    [
+      "seahorse valley scale-854",
+      {
+        re: "-7.4966934496787838098731959297327082792276256276453894183834598253472297257976325e-1",
+        im: "-3.6861521736029792925609229356779358072862177412970006775043765158497834429601425e-2",
+        scale: "8.5405876252614986071100413930631932487692657156726781640555443950802640849770656e2",
+        maxIter: 700
+      },
+      1000,
+      110
+    ],
+    [
+      "seahorse valley scale-469",
+      {
+        re: "-7.5063661562619738456963379784747998047874472923886570517636877125007290188512631e-1",
+        im: "-3.6457067483775627969230673979175923069700656808867805874612940372022092088015668e-2",
+        scale: "4.6871738678241589821479833520019796943674415809383314289220537923628457223414714e2",
+        maxIter: 683
+      },
+      1215,
+      385
+    ],
+    [
+      "near-real scale-1808",
+      {
+        re: "-1.6319406659348067713391981382836692942658351212899461703065805913137973677448364e0",
+        im: "-8.4297463302004818527904256553713991311087966292829363756488246622180047190212363e-6",
+        scale: "1.8080424144560554947071644758141790158871605775151382306494555746329017800115708e3",
+        maxIter: 721
+      },
+      486,
+      456
+    ],
+    [
+      "near-real scale-31257",
+      {
+        re: "-1.6318861370342711427419798675435821363599491240092572029547364566350336131805832e0",
+        im: "1.9658838014048480577534033042396975947924884570650342666305024357717553810158527e-6",
+        scale: "3.1257042819609434520294065852842157825991238901920869982888307778804518684226075e4",
+        maxIter: 800
+      },
+      360,
+      430
+    ],
+    [
+      "seahorse valley scale-108465",
+      {
+        re: "-7.5334616440141300198402043563623536803333838622141813662066992521181596683305397e-1",
+        im: "-4.696919675440392553632571151226876300052345258551595459624481658859540695903849e-2",
+        scale: "1.0846546284082077156096591056319128446503558802465354324581765182582005442316815e5",
+        maxIter: 835
+      },
+      1008,
+      546
+    ]
+  ])("keeps reported BLA regression interior sample inside for %s", (_name, view, x, y) => {
+    const point = highPrecisionPointAtScreen(view, x, y, 1912, 948);
+    const direct = direct_escape(point.re, point.im, view.maxIter, 512);
+    const centerReference = makeReference(view.re, view.im, view.maxIter, 512, 1912 * 0.5, 948 * 0.5);
+    const localReference = makeReference(point.re, point.im, view.maxIter, 512, x, y);
+
+    const centerOnly = renderSinglePixelWithReferences(view, point, x, y, [centerReference], 0);
+    const result = centerOnly.stats.unresolvedCount === 0
+      ? centerOnly
+      : renderSinglePixelWithReferences(view, point, x, y, [centerReference, localReference], 1);
+
+    expect(direct).toBe(view.maxIter);
+    expect(result.stats.unresolvedCount).toBe(0);
+    expect(result.stats.escapedPixels).toBe(0);
   });
 });
 

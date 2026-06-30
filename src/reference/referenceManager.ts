@@ -108,6 +108,26 @@ export class ReferenceManager {
     return [...selected.values()].slice(0, maxCount);
   }
 
+  findReusableNear(
+    screenX: number,
+    screenY: number,
+    radiusPx: number,
+    maxIter: number,
+    revision: number,
+    minPrecisionBits: number
+  ): ReferenceSnapshot | undefined {
+    let best: { reference: ReferenceSnapshot; distance: number } | undefined;
+    for (const reference of this.references.values()) {
+      if (reference.revision !== revision || reference.maxIter !== maxIter || reference.precisionBits < minPrecisionBits) continue;
+      const distance = Math.hypot(reference.screenX - screenX, reference.screenY - screenY);
+      if (distance > radiusPx) continue;
+      if (!best || reference.escapedAt > best.reference.escapedAt || (reference.escapedAt === best.reference.escapedAt && distance < best.distance)) {
+        best = { reference, distance };
+      }
+    }
+    return best?.reference;
+  }
+
   dispose(): void {
     this.client.dispose();
   }

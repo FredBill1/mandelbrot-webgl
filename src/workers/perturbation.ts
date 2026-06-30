@@ -10,6 +10,8 @@ interface PixelResult {
   periodicInterior: boolean;
   rebaseCount: number;
   rebaseLimit: boolean;
+  blaSkipCount: number;
+  blaStepCount: number;
 }
 
 interface ReferenceContext {
@@ -17,7 +19,26 @@ interface ReferenceContext {
   orbitRe: Float64Array;
   orbitIm: Float64Array;
   series: ReturnType<typeof buildSeriesPlan>;
+  bla: BlaTable | undefined;
 }
+
+interface PeriodicScratch {
+  checkpointRe: Float64Array;
+  checkpointIm: Float64Array;
+  checkpointIter: Int32Array;
+}
+
+interface BlaLevel {
+  skip: number;
+  ar: Float64Array;
+  ai: Float64Array;
+  br: Float64Array;
+  bi: Float64Array;
+  radius: Float64Array;
+  maxRefMag2: Float64Array;
+}
+
+type BlaTable = BlaLevel[];
 
 interface ClusterAccumulator {
   binX: number;
@@ -34,6 +55,10 @@ interface ClusterAccumulator {
 const MIN_PIXEL_SPAN_FOR_PERIODIC_INTERIOR = 1e-18;
 const REBASE_G = 1e-8;
 const MAX_REBASES_PER_PIXEL = 64;
+const MAX_BLA_TILE_RADIUS = 1e-3;
+const BLA_CACHE_LIMIT = 512;
+const BLA_EPSILON = 1e-5;
+const blaCache = new Map<string, BlaTable>();
 
 export function renderPerturbationTile(message: RenderTileMessage): TileDoneMessage {
   const started = performance.now();
@@ -42,7 +67,7 @@ export function renderPerturbationTile(message: RenderTileMessage): TileDoneMess
   const width = Math.max(1, Math.ceil(tile.rect.width / sampleStep));
   const height = Math.max(1, Math.ceil(tile.rect.height / sampleStep));
   const rgba = new Uint8ClampedArray(width * height * 4);
-  const contexts = message.references.map((reference) => {
+  const contexts = message.references.filter(isReferenceSnapshot).map((reference) => {
     const orbitRe = asFloat64(reference.orbitRe);
     const orbitIm = asFloat64(reference.orbitIm);
     const radius = tileRadius(tile.rect, reference, pixelSpan);
@@ -50,9 +75,15 @@ export function renderPerturbationTile(message: RenderTileMessage): TileDoneMess
       reference,
       orbitRe,
       orbitIm,
-      series: buildSeriesPlan(orbitRe, orbitIm, seriesDegree, 64, radius)
+      series: buildSeriesPlan(orbitRe, orbitIm, seriesDegree, 64, radius),
+      bla: getBlaTable(reference.id, orbitRe, orbitIm, radius)
     } satisfies ReferenceContext;
   });
+  const scratch: PeriodicScratch = {
+    checkpointRe: new Float64Array(32),
+    checkpointIm: new Float64Array(32),
+    checkpointIter: new Int32Array(32)
+  };
 
   let glitchCount = 0;
   let unresolvedCount = 0;
@@ -60,6 +91,8 @@ export function renderPerturbationTile(message: RenderTileMessage): TileDoneMess
   let periodicInteriorCount = 0;
   let rebaseCount = 0;
   let rebaseLimitCount = 0;
+  let blaSkipCount = 0;
+  let blaStepCount = 0;
   let unresolvedScreenXSum = 0;
   let unresolvedScreenYSum = 0;
   let seriesSkip = 0;
@@ -71,12 +104,14 @@ export function renderPerturbationTile(message: RenderTileMessage): TileDoneMess
     for (let px = 0; px < width; px += 1) {
       const screenX = Math.min(tile.rect.x + tile.rect.width - 0.5, tile.rect.x + (px + 0.5) * sampleStep);
       const screenY = Math.min(tile.rect.y + tile.rect.height - 0.5, tile.rect.y + (py + 0.5) * sampleStep);
-      const { result, referenceId, skip } = renderPixelWithReferences(screenX, screenY, pixelSpan, maxIter, contexts);
+      const { result, referenceId, skip } = renderPixelWithReferences(screenX, screenY, pixelSpan, maxIter, contexts, scratch);
       const offset = (py * width + px) * 4;
       if (result.iter < maxIter) escapedPixels += 1;
       if (result.periodicInterior) periodicInteriorCount += 1;
       rebaseCount += result.rebaseCount;
       if (result.rebaseLimit) rebaseLimitCount += 1;
+      blaSkipCount += result.blaSkipCount;
+      blaStepCount += result.blaStepCount;
       if (result.glitch) glitchCount += 1;
       if (referenceId) usedReferenceIds.add(referenceId);
       seriesSkip = Math.max(seriesSkip, skip);
@@ -115,6 +150,9 @@ export function renderPerturbationTile(message: RenderTileMessage): TileDoneMess
       periodicInteriorCount,
       rebaseCount,
       rebaseLimitCount,
+      blaSkipCount,
+      blaStepCount,
+      referenceCacheMissCount: 0,
       seriesSkip,
       referenceId: referenceIdsUsed[0] ?? contexts[0]?.reference.id ?? "",
       referenceIdsUsed,
@@ -132,7 +170,8 @@ function renderPixelWithReferences(
   screenY: number,
   pixelSpan: number,
   maxIter: number,
-  contexts: ReferenceContext[]
+  contexts: ReferenceContext[],
+  scratch: PeriodicScratch
 ): { result: PixelResult; referenceId: string | undefined; skip: number } {
   let bestUnresolved: PixelResult | undefined;
   let bestUnresolvedReferenceId: string | undefined;
@@ -141,7 +180,17 @@ function renderPixelWithReferences(
   for (const context of contexts) {
     const cRe = (screenX - context.reference.screenX) * pixelSpan;
     const cIm = (screenY - context.reference.screenY) * pixelSpan;
-    const result = perturb(cRe, cIm, context.orbitRe, context.orbitIm, maxIter, context.series, pixelSpan >= MIN_PIXEL_SPAN_FOR_PERIODIC_INTERIOR);
+    const result = perturb(
+      cRe,
+      cIm,
+      context.orbitRe,
+      context.orbitIm,
+      maxIter,
+      context.series,
+      context.bla,
+      pixelSpan >= MIN_PIXEL_SPAN_FOR_PERIODIC_INTERIOR,
+      scratch
+    );
     maxSkip = Math.max(maxSkip, context.series.skip);
     if (!result.unresolved) return { result, referenceId: context.reference.id, skip: maxSkip };
     if (!bestUnresolved || result.survivedIter > bestUnresolved.survivedIter) {
@@ -159,7 +208,9 @@ function renderPixelWithReferences(
       survivedIter: 0,
       periodicInterior: false,
       rebaseCount: 0,
-      rebaseLimit: false
+      rebaseLimit: false,
+      blaSkipCount: 0,
+      blaStepCount: 0
     },
     referenceId: bestUnresolvedReferenceId,
     skip: maxSkip
@@ -173,7 +224,9 @@ function perturb(
   orbitIm: Float64Array,
   maxIter: number,
   series: ReturnType<typeof buildSeriesPlan>,
-  allowPeriodicInterior: boolean
+  bla: BlaTable | undefined,
+  allowPeriodicInterior: boolean,
+  scratch: PeriodicScratch
 ): PixelResult {
   let dzRe = 0;
   let dzIm = 0;
@@ -183,9 +236,11 @@ function perturb(
   let glitch = false;
   let rebaseCount = 0;
   let rebaseLimit = false;
-  const checkpointRe = allowPeriodicInterior ? new Float64Array(32) : undefined;
-  const checkpointIm = allowPeriodicInterior ? new Float64Array(32) : undefined;
-  const checkpointIter = allowPeriodicInterior ? new Int32Array(32) : undefined;
+  let blaSkipCount = 0;
+  let blaStepCount = 0;
+  const checkpointRe = allowPeriodicInterior ? scratch.checkpointRe : undefined;
+  const checkpointIm = allowPeriodicInterior ? scratch.checkpointIm : undefined;
+  const checkpointIter = allowPeriodicInterior ? scratch.checkpointIter : undefined;
   let checkpointCount = 0;
   let checkpointIndex = 0;
 
@@ -199,7 +254,7 @@ function perturb(
 
   const limit = Math.min(maxIter, orbitRe.length - 1);
   if (limit < 0 || refIndex > limit) {
-    return failureResult(maxIter, mag2, true, Math.max(0, limit), rebaseCount, rebaseLimit);
+    return failureResult(maxIter, mag2, true, Math.max(0, limit), rebaseCount, rebaseLimit, blaSkipCount, blaStepCount);
   }
 
   while (iter <= maxIter && refIndex <= limit) {
@@ -213,8 +268,8 @@ function perturb(
     const zRe = refRe + dzRe;
     const zIm = refIm + dzIm;
     mag2 = zRe * zRe + zIm * zIm;
-    if (mag2 > 4) return successResult(iter, mag2, glitch, false, rebaseCount, rebaseLimit);
-    if (iter >= maxIter) return successResult(maxIter, mag2, false, false, rebaseCount, rebaseLimit);
+    if (mag2 > 4) return successResult(iter, mag2, glitch, false, rebaseCount, rebaseLimit, blaSkipCount, blaStepCount);
+    if (iter >= maxIter) return successResult(maxIter, mag2, false, false, rebaseCount, rebaseLimit, blaSkipCount, blaStepCount);
 
     if (checkpointRe && checkpointIm && checkpointIter && iter > 32 && iter % 8 === 0) {
       const cycleTolerance = 1e-20 * Math.max(1, mag2);
@@ -224,7 +279,7 @@ function perturb(
         const cycleDeltaIm = zIm - checkpointIm[checkpoint];
         const cycleDelta2 = cycleDeltaRe * cycleDeltaRe + cycleDeltaIm * cycleDeltaIm;
         if (Number.isFinite(cycleDelta2) && cycleDelta2 < cycleTolerance) {
-          return successResult(maxIter, mag2, false, true, rebaseCount, rebaseLimit);
+          return successResult(maxIter, mag2, false, true, rebaseCount, rebaseLimit, blaSkipCount, blaStepCount);
         }
       }
       checkpointRe[checkpointIndex] = zRe;
@@ -259,6 +314,17 @@ function perturb(
 
     if (refIndex === limit) break;
 
+    const blaStep = tryBlaStep(bla, refIndex, dzRe, dzIm, cRe, cIm, limit);
+    if (blaStep) {
+      dzRe = blaStep.dzRe;
+      dzIm = blaStep.dzIm;
+      iter += blaStep.skip;
+      refIndex += blaStep.skip;
+      blaSkipCount += Math.max(0, blaStep.skip - 1);
+      blaStepCount += 1;
+      continue;
+    }
+
     const dz2Re = dzRe * dzRe - dzIm * dzIm;
     const dz2Im = 2 * dzRe * dzIm;
     const twoRefDzRe = 2 * (stepRefRe * dzRe - stepRefIm * dzIm);
@@ -276,9 +342,9 @@ function perturb(
   }
 
   if (glitch || iter < maxIter) {
-    return failureResult(maxIter, mag2, true, Math.min(iter, maxIter), rebaseCount, rebaseLimit);
+    return failureResult(maxIter, mag2, true, Math.min(iter, maxIter), rebaseCount, rebaseLimit, blaSkipCount, blaStepCount);
   }
-  return successResult(maxIter, mag2, false, false, rebaseCount, rebaseLimit);
+  return successResult(maxIter, mag2, false, false, rebaseCount, rebaseLimit, blaSkipCount, blaStepCount);
 }
 
 function successResult(
@@ -287,9 +353,11 @@ function successResult(
   glitch: boolean,
   periodicInterior: boolean,
   rebaseCount: number,
-  rebaseLimit: boolean
+  rebaseLimit: boolean,
+  blaSkipCount: number,
+  blaStepCount: number
 ): PixelResult {
-  return { iter, mag2, glitch, unresolved: false, survivedIter: iter, periodicInterior, rebaseCount, rebaseLimit };
+  return { iter, mag2, glitch, unresolved: false, survivedIter: iter, periodicInterior, rebaseCount, rebaseLimit, blaSkipCount, blaStepCount };
 }
 
 function failureResult(
@@ -298,9 +366,118 @@ function failureResult(
   glitch: boolean,
   survivedIter: number,
   rebaseCount: number,
-  rebaseLimit: boolean
+  rebaseLimit: boolean,
+  blaSkipCount: number,
+  blaStepCount: number
 ): PixelResult {
-  return { iter, mag2, glitch, unresolved: true, survivedIter, periodicInterior: false, rebaseCount, rebaseLimit };
+  return { iter, mag2, glitch, unresolved: true, survivedIter, periodicInterior: false, rebaseCount, rebaseLimit, blaSkipCount, blaStepCount };
+}
+
+function getBlaTable(referenceId: string, orbitRe: Float64Array, orbitIm: Float64Array, tileRadiusValue: number): BlaTable | undefined {
+  if (!Number.isFinite(tileRadiusValue) || tileRadiusValue <= 0 || tileRadiusValue > MAX_BLA_TILE_RADIUS || orbitRe.length < 3) {
+    return undefined;
+  }
+  const radiusBucket = Math.ceil(Math.log2(1 / Math.max(tileRadiusValue, 1e-300)));
+  const key = `${referenceId}:${radiusBucket}`;
+  const cached = blaCache.get(key);
+  if (cached) return cached;
+
+  const baseLength = Math.max(0, Math.min(orbitRe.length, orbitIm.length) - 1);
+  const base = createBlaLevel(1, baseLength);
+  const cBudget = Math.max(tileRadiusValue, 1e-300);
+  for (let index = 0; index < baseLength; index += 1) {
+    const zr = orbitRe[index] ?? 0;
+    const zi = orbitIm[index] ?? 0;
+    const absZ = Math.hypot(zr, zi);
+    const absA = 2 * absZ;
+    base.ar[index] = 2 * zr;
+    base.ai[index] = 2 * zi;
+    base.br[index] = 1;
+    base.bi[index] = 0;
+    base.radius[index] = Math.max(0, (BLA_EPSILON * Math.max(0, absZ * 0.5 - cBudget)) / (absA + 1));
+    base.maxRefMag2[index] = zr * zr + zi * zi;
+  }
+
+  const table: BlaTable = [base];
+  while (table.length < 10) {
+    const previous = table[table.length - 1];
+    const length = previous.ar.length - previous.skip;
+    if (length <= 0) break;
+    const next = createBlaLevel(previous.skip * 2, length);
+    for (let index = 0; index < length; index += 1) {
+      const secondIndex = index + previous.skip;
+      const a1r = previous.ar[index];
+      const a1i = previous.ai[index];
+      const b1r = previous.br[index];
+      const b1i = previous.bi[index];
+      const a2r = previous.ar[secondIndex];
+      const a2i = previous.ai[secondIndex];
+      const b2r = previous.br[secondIndex];
+      const b2i = previous.bi[secondIndex];
+
+      next.ar[index] = a2r * a1r - a2i * a1i;
+      next.ai[index] = a2r * a1i + a2i * a1r;
+      next.br[index] = a2r * b1r - a2i * b1i + b2r;
+      next.bi[index] = a2r * b1i + a2i * b1r + b2i;
+      const absAx = Math.hypot(a1r, a1i);
+      const absBx = Math.hypot(b1r, b1i);
+      const transportedRadius = (previous.radius[secondIndex] - absBx * cBudget) / Math.max(absAx, 1e-300);
+      next.radius[index] = Math.max(0, Math.min(previous.radius[index], transportedRadius));
+      next.maxRefMag2[index] = Math.max(previous.maxRefMag2[index], previous.maxRefMag2[secondIndex]);
+    }
+    table.push(next);
+  }
+
+  blaCache.set(key, table);
+  while (blaCache.size > BLA_CACHE_LIMIT) {
+    const first = blaCache.keys().next().value;
+    if (!first) break;
+    blaCache.delete(first);
+  }
+  return table;
+}
+
+function createBlaLevel(skip: number, length: number): BlaLevel {
+  return {
+    skip,
+    ar: new Float64Array(length),
+    ai: new Float64Array(length),
+    br: new Float64Array(length),
+    bi: new Float64Array(length),
+    radius: new Float64Array(length),
+    maxRefMag2: new Float64Array(length)
+  };
+}
+
+function tryBlaStep(
+  table: BlaTable | undefined,
+  refIndex: number,
+  dzRe: number,
+  dzIm: number,
+  cRe: number,
+  cIm: number,
+  limit: number
+): { dzRe: number; dzIm: number; skip: number } | undefined {
+  if (!table) return undefined;
+  const dzMag2 = dzRe * dzRe + dzIm * dzIm;
+  for (let levelIndex = table.length - 1; levelIndex >= 0; levelIndex -= 1) {
+    const level = table[levelIndex];
+    if (level.skip <= 1) continue;
+    if (refIndex + level.skip > limit || refIndex >= level.ar.length) continue;
+    const radius = level.radius[refIndex];
+    if (radius <= 0 || dzMag2 > radius * radius) continue;
+    if (level.maxRefMag2[refIndex] > 3.25) continue;
+    const ar = level.ar[refIndex];
+    const ai = level.ai[refIndex];
+    const br = level.br[refIndex];
+    const bi = level.bi[refIndex];
+    return {
+      dzRe: ar * dzRe - ai * dzIm + br * cRe - bi * cIm,
+      dzIm: ar * dzIm + ai * dzRe + br * cIm + bi * cRe,
+      skip: level.skip
+    };
+  }
+  return undefined;
 }
 
 function createClusterAccumulators(rect: { x: number; y: number; width: number; height: number }): ClusterAccumulator[] {
@@ -466,4 +643,13 @@ function colorPixel(buffer: Uint8ClampedArray, offset: number, iter: number, max
 
 function asFloat64(value: Float64Array | ArrayLike<number>): Float64Array {
   return value instanceof Float64Array ? value : Float64Array.from(value);
+}
+
+function isReferenceSnapshot(reference: unknown): reference is ReferenceSnapshot {
+  return (
+    typeof reference === "object" &&
+    reference !== null &&
+    "orbitRe" in reference &&
+    "orbitIm" in reference
+  );
 }
