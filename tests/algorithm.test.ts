@@ -31,7 +31,9 @@ describe("perturbation renderer", () => {
       seriesDegree: 8,
       paletteId: "cosine",
       refined: true,
-      refinementLevel: 1
+      refinementLevel: 1,
+      renderMode: "final",
+      sampleStep: 1
     };
     const result = renderPerturbationTile(message);
     expect(result.stats.escapedPixels).toBe(escaped < maxIter ? 1 : 0);
@@ -164,7 +166,9 @@ describe("perturbation renderer", () => {
       seriesDegree: 8,
       paletteId: "cosine",
       refined: false,
-      refinementLevel: 0
+      refinementLevel: 0,
+      renderMode: "final",
+      sampleStep: 1
     });
 
     expect(reference.escapedAt).toBe(34);
@@ -172,6 +176,25 @@ describe("perturbation renderer", () => {
     expect(result.stats.unresolvedClusters.length).toBeGreaterThan(4);
     expect(result.stats.unresolvedClusters.length).toBeLessThanOrEqual(16);
     expect(result.stats.unresolvedClusters.every((cluster) => cluster.bounds.width > 0 && cluster.bounds.height > 0)).toBe(true);
+  });
+
+  it("resolves the 1912x948 deep interior sample with perturbation period detection", () => {
+    const view = {
+      re: "-1.5738375605512487151154265653948631632264711132220526532084658732407373266127815e0",
+      im: "-5.436641856961396284208136132163104968082086032418720386308428789634830866733822e-10",
+      scale: "1.1351152221045656587152530244486905603141464775053705184640271695455593072075544e9",
+      maxIter: 1092
+    };
+    const screen = { x: 1700, y: 700 };
+    const point = pointAtScreen(view, screen.x, screen.y);
+    const reference = makeReference(point.re, point.im, view.maxIter, 256, screen.x, screen.y);
+    expect(reference.escapedAt).toBe(view.maxIter);
+
+    const result = renderSinglePixelWithReferences(view, point, screen.x, screen.y, [reference], 1);
+
+    expect(result.stats.unresolvedCount).toBe(0);
+    expect(result.stats.escapedPixels).toBe(0);
+    expect(result.stats.periodicInteriorCount).toBe(1);
   });
 });
 
@@ -239,7 +262,9 @@ function renderSinglePixelWithReferences(
     seriesDegree: 8,
     paletteId: "cosine",
     refined: refinementLevel > 0,
-    refinementLevel
+    refinementLevel,
+    renderMode: "final",
+    sampleStep: 1
   };
   return renderPerturbationTile(message);
 }

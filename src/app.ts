@@ -48,12 +48,15 @@ interface TileWorkState {
   refinementLevel: number;
   splitLevel: number;
   inFlight: boolean;
+  previewInFlight: boolean;
   completed: boolean;
   pendingReferences: number;
+  localReferenceRequests: number;
   lastUnresolvedCount: number | undefined;
   stalledRefinementRounds: number;
   previewUploaded: boolean;
   microtileAllowed: boolean;
+  splitReason: string | undefined;
 }
 
 export async function startApp(root: HTMLElement): Promise<void> {
@@ -198,7 +201,7 @@ export async function startApp(root: HTMLElement): Promise<void> {
     pendingTileIds.clear();
     tileStates.clear();
 
-    const viewReference = await references.ensureViewReference(localRuntime);
+    await references.ensureViewReference(localRuntime);
     if (token !== renderToken) return;
 
     const shells = createVisibleTileShells(localRuntime, TILE_SIZE);
@@ -210,12 +213,13 @@ export async function startApp(root: HTMLElement): Promise<void> {
     );
     if (token !== renderToken) return;
 
-    for (const tile of tiles) createTileState(tile, [viewReference.id], 0);
+    for (const tile of tiles) createTileState(tile, [], 0);
     syncPinnedReferences();
     stats.pending = pendingTileIds.size;
     stats.references = references.size;
     stats.status = `rendering ${tiles.length} tiles`;
 
+    for (const tile of tiles) void submitPreview(localRuntime, mustTileState(tile.id));
     for (const tile of tiles) void submitTile(localRuntime, mustTileState(tile.id));
   }
 
@@ -227,12 +231,15 @@ export async function startApp(root: HTMLElement): Promise<void> {
       refinementLevel: 0,
       splitLevel,
       inFlight: false,
+      previewInFlight: false,
       completed: false,
       pendingReferences: 0,
+      localReferenceRequests: 0,
       lastUnresolvedCount: undefined,
       stalledRefinementRounds: 0,
       previewUploaded: false,
-      microtileAllowed: false
+      microtileAllowed: false,
+      splitReason: undefined
     };
     tileStates.set(tile.id, state);
     pendingTileIds.add(tile.id);
@@ -245,6 +252,47 @@ export async function startApp(root: HTMLElement): Promise<void> {
     return state;
   }
 
+  async function submitPreview(localRuntime: RuntimeView, state: TileWorkState): Promise<void> {
+    if (state.previewInFlight || state.previewUploaded || state.completed || state.tile.revision !== revision) return;
+    const candidates = buildReferenceCandidates(state, localRuntime);
+    if (candidates.length === 0) return;
+    state.previewInFlight = true;
+    try {
+      const result = await pool.render(
+        {
+          type: "renderTile",
+          tile: state.tile,
+          canvasWidth: localRuntime.width,
+          canvasHeight: localRuntime.height,
+          pixelSpan: pixelSpanForView(localRuntime, localRuntime.width),
+          maxIter: localRuntime.maxIter,
+          references: candidates,
+          seriesDegree: SERIES_DEGREE,
+          paletteId: "cosine",
+          refined: state.refinementLevel > 0,
+          refinementLevel: state.refinementLevel,
+          renderMode: "preview",
+          sampleStep: previewSampleStep(state.tile)
+        },
+        0
+      );
+      state.previewInFlight = false;
+      if (result.revision !== revision || state.tile.revision !== revision) return;
+      if (state.completed) {
+        updateWorkStatus("rendering");
+        return;
+      }
+      renderer.uploadTile(result);
+      state.previewUploaded = true;
+      stats.activeWorkers = pool.active;
+      stats.references = references.size;
+      updateWorkStatus("rendering");
+    } catch (error) {
+      state.previewInFlight = false;
+      stats.status = error instanceof Error ? error.message : String(error);
+    }
+  }
+
   async function submitTile(localRuntime: RuntimeView, state: TileWorkState): Promise<void> {
     if (state.inFlight || state.completed || state.tile.revision !== revision) return;
     const candidates = buildReferenceCandidates(state, localRuntime);
@@ -252,28 +300,33 @@ export async function startApp(root: HTMLElement): Promise<void> {
       const reference = await references.ensureTileReference(localRuntime, state.tile, 128);
       if (state.tile.revision !== revision || state.completed) return;
       state.referenceIds.add(reference.id);
+      state.localReferenceRequests += 1;
       syncPinnedReferences();
       void submitTile(localRuntime, state);
       return;
     }
 
-    for (const reference of candidates) state.referenceIds.add(reference.id);
     syncPinnedReferences();
     state.inFlight = true;
     try {
-      const result = await pool.render({
-        type: "renderTile",
-        tile: state.tile,
-        canvasWidth: localRuntime.width,
-        canvasHeight: localRuntime.height,
-        pixelSpan: pixelSpanForView(localRuntime, localRuntime.width),
-        maxIter: localRuntime.maxIter,
-        references: candidates,
-        seriesDegree: SERIES_DEGREE,
-        paletteId: "cosine",
-        refined: state.refinementLevel > 0,
-        refinementLevel: state.refinementLevel
-      });
+      const result = await pool.render(
+        {
+          type: "renderTile",
+          tile: state.tile,
+          canvasWidth: localRuntime.width,
+          canvasHeight: localRuntime.height,
+          pixelSpan: pixelSpanForView(localRuntime, localRuntime.width),
+          maxIter: localRuntime.maxIter,
+          references: candidates,
+          seriesDegree: SERIES_DEGREE,
+          paletteId: "cosine",
+          refined: state.refinementLevel > 0,
+          refinementLevel: state.refinementLevel,
+          renderMode: "final",
+          sampleStep: 1
+        },
+        state.refinementLevel > 0 ? 2 + state.splitLevel : 10 + state.splitLevel
+      );
       state.inFlight = false;
       if (result.revision !== revision || state.completed || state.tile.revision !== revision) return;
       stats.lastTileMs = result.stats.elapsedMs;
@@ -306,13 +359,16 @@ export async function startApp(root: HTMLElement): Promise<void> {
           pendingReferences: state.pendingReferences,
           referenceCount: state.referenceIds.size,
           maxReferences: maxReferencesForRect(state.tile.rect),
+          hasLocalRefinement: state.localReferenceRequests > 0,
           microtileAllowed: state.microtileAllowed
         })) {
+          state.splitReason = "stalled refinement";
           await splitTile(localRuntime, state);
           return;
         }
         if (canSplitTile(state.tile) && state.referenceIds.size >= maxReferencesForRect(state.tile.rect)) {
           state.microtileAllowed = true;
+          state.splitReason = "reference budget";
           await splitTile(localRuntime, state);
           return;
         }
@@ -327,7 +383,7 @@ export async function startApp(root: HTMLElement): Promise<void> {
       syncPinnedReferences();
       stats.pending = pendingTileIds.size;
       renderer.pruneRetainedWhenActiveCoverage(Math.max(1, Math.floor((localRuntime.width * localRuntime.height) / (TILE_SIZE * TILE_SIZE) * 0.7)));
-      stats.status = stats.pending > 0 ? "rendering" : "stable";
+      updateWorkStatus("rendering");
     } catch (error) {
       state.inFlight = false;
       stats.status = error instanceof Error ? error.message : String(error);
@@ -360,6 +416,7 @@ export async function startApp(root: HTMLElement): Promise<void> {
     state.pendingReferences = Math.max(0, state.pendingReferences - 1);
     if (message.tile.revision !== revision || state.completed) return;
     state.referenceIds.add(reference.id);
+    state.localReferenceRequests += 1;
     state.refinementLevel = Math.max(state.refinementLevel, message.refinementLevel);
     syncPinnedReferences();
     stats.references = references.size;
@@ -385,10 +442,11 @@ export async function startApp(root: HTMLElement): Promise<void> {
     let queued = 0;
     const highestPrecision = buildReferenceCandidates(state, localRuntime).reduce((bits, reference) => Math.max(bits, reference.precisionBits), 128);
     for (const cluster of clusters.slice(0, MAX_CLUSTER_REFERENCES_PER_PASS)) {
-      if (state.referenceIds.size + state.pendingReferences + queued >= maxReferences && canSplitTile(state.tile)) break;
+      if (state.referenceIds.size + state.pendingReferences >= maxReferences && canSplitTile(state.tile)) break;
       const requestKey = referenceRequestKey(cluster.screenX, cluster.screenY, highestPrecision + 32);
       if (state.requestedReferenceKeys.has(requestKey)) continue;
       state.pendingReferences += 1;
+      state.localReferenceRequests += 1;
       state.requestedReferenceKeys.add(requestKey);
       queued += 1;
       void requestReferenceForPoint(localRuntime, state, cluster.screenX, cluster.screenY, highestPrecision + 32, state.refinementLevel + 1);
@@ -427,6 +485,7 @@ export async function startApp(root: HTMLElement): Promise<void> {
     state.referenceIds.clear();
     state.requestedReferenceKeys.clear();
     state.pendingReferences = 0;
+    state.localReferenceRequests += 1;
     state.refinementLevel += 1;
     const reference = await references.ensureTileReference(localRuntime, state.tile, highestPrecision + 64);
     if (state.tile.revision !== revision || state.completed) return;
@@ -445,14 +504,16 @@ export async function startApp(root: HTMLElement): Promise<void> {
 
     pendingTileIds.delete(tile.id);
     tileStates.delete(tile.id);
-    for (const subtile of subtiles.slice(0, MAX_NEW_SUBTILES_PER_FRAME)) pendingTileIds.add(subtile.id);
+    const scheduledSubtiles = subtiles.slice(0, MAX_NEW_SUBTILES_PER_FRAME);
+    for (const subtile of scheduledSubtiles) pendingTileIds.add(subtile.id);
     stats.pending = pendingTileIds.size;
     stats.status = "splitting";
 
-    for (const subtile of subtiles.slice(0, MAX_NEW_SUBTILES_PER_FRAME)) {
-      const seedReferences = references.selectCandidates(subtile, localRuntime.maxIter, localRuntime.revision, 4).map((reference) => reference.id);
-      const child = createTileState(subtile, seedReferences, state.splitLevel + 1);
+    for (const subtile of scheduledSubtiles) {
+      const child = createTileState(subtile, state.referenceIds, state.splitLevel + 1);
       child.microtileAllowed = state.microtileAllowed;
+      child.localReferenceRequests = state.localReferenceRequests;
+      void submitPreview(localRuntime, child);
       void submitTile(localRuntime, child);
     }
     syncPinnedReferences();
@@ -502,6 +563,28 @@ export async function startApp(root: HTMLElement): Promise<void> {
 
   function canSplitTile(tile: TileDescriptor): boolean {
     return canSplitRect(tile.rect);
+  }
+
+  function previewSampleStep(tile: TileDescriptor): number {
+    const span = Math.max(tile.rect.width, tile.rect.height);
+    if (span >= 96) return 4;
+    if (span >= 32) return 2;
+    return 1;
+  }
+
+  function hasOutstandingWork(): boolean {
+    if (pendingTileIds.size > 0 || pool.pending > 0 || pool.active > 0) return true;
+    for (const state of tileStates.values()) {
+      if (state.inFlight || state.previewInFlight || state.pendingReferences > 0) return true;
+    }
+    return false;
+  }
+
+  function updateWorkStatus(activeStatus: string): void {
+    stats.pending = pendingTileIds.size;
+    stats.activeWorkers = pool.active;
+    stats.references = references.size;
+    stats.status = hasOutstandingWork() ? activeStatus : "stable";
   }
 
   function referenceRequestKey(screenX: number, screenY: number, precisionBits: number): string {

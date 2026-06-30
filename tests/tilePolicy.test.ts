@@ -26,6 +26,7 @@ describe("tile refinement policy", () => {
         pendingReferences: 0,
         referenceCount: 12,
         maxReferences: MAX_TILE_REFERENCES_LARGE,
+        hasLocalRefinement: true,
         microtileAllowed: false
       })
     ).toBe(false);
@@ -45,9 +46,26 @@ describe("tile refinement policy", () => {
         pendingReferences: 0,
         referenceCount: 20,
         maxReferences: MAX_TILE_REFERENCES_LARGE,
+        hasLocalRefinement: true,
         microtileAllowed: false
       })
     ).toBe(true);
+  });
+
+  it("does not split just because global candidates fill the render list", () => {
+    expect(
+      shouldSplitTile({
+        rect: { x: 0, y: 0, width: 128, height: 128 },
+        lastUnresolvedCount: 1000,
+        unresolvedCount: 900,
+        stalledRefinementRounds: 2,
+        pendingReferences: 0,
+        referenceCount: MAX_TILE_REFERENCES_LARGE,
+        maxReferences: MAX_TILE_REFERENCES_LARGE,
+        hasLocalRefinement: false,
+        microtileAllowed: false
+      })
+    ).toBe(false);
   });
 
   it("does not split normal small tiles into one-pixel microtiles unless explicitly allowed", () => {

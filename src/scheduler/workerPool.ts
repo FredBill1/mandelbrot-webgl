@@ -2,6 +2,8 @@ import type { NeedReferenceMessage, RenderTileMessage, TileDoneMessage, TileWork
 
 interface QueueItem {
   message: RenderTileMessage;
+  priority: number;
+  sequence: number;
   resolve: (result: TileDoneMessage) => void;
   reject: (error: Error) => void;
 }
@@ -11,6 +13,7 @@ export class TileWorkerPool {
   private readonly idle: Worker[] = [];
   private readonly queue: QueueItem[] = [];
   private readonly inFlight = new Map<Worker, QueueItem>();
+  private sequence = 0;
 
   constructor(
     readonly size = resolveWorkerCount(),
@@ -33,9 +36,10 @@ export class TileWorkerPool {
     return this.inFlight.size;
   }
 
-  render(message: RenderTileMessage): Promise<TileDoneMessage> {
+  render(message: RenderTileMessage, priority = defaultPriority(message)): Promise<TileDoneMessage> {
     const promise = new Promise<TileDoneMessage>((resolve, reject) => {
-      this.queue.push({ message, resolve, reject });
+      this.queue.push({ message, priority, sequence: ++this.sequence, resolve, reject });
+      this.queue.sort((a, b) => a.priority - b.priority || a.sequence - b.sequence);
     });
     this.pump();
     return promise;
@@ -91,4 +95,9 @@ export class TileWorkerPool {
 
 export function resolveWorkerCount(hardwareConcurrency = globalThis.navigator?.hardwareConcurrency ?? 4): number {
   return Math.max(1, Math.floor(hardwareConcurrency));
+}
+
+function defaultPriority(message: RenderTileMessage): number {
+  if (message.renderMode === "preview") return 0;
+  return message.refined ? 2 : 10;
 }

@@ -29,6 +29,8 @@ const REGRESSION_VIEWS = [
 
 const MICROTILE_REGRESSION_URL =
   "/?re=-1.5737407486227469252433174706063197673796016133716925506497393696303123079866005e0&im=2.3298749061632902966620424763943810032963152815290060660675502164545864497691752e-5&scale=5.166754427175971621093750355246036136162467976203352006225560442836867743195112e3&iter=750";
+const DEEP_INTERIOR_REGRESSION_URL =
+  "/?re=-1.5738375605512487151154265653948631632264711132220526532084658732407373266127815e0&im=-5.436641856961396284208136132163104968082086032418720386308428789634830866733822e-10&scale=1.1351152221045656587152530244486905603141464775053705184640271695455593072075544e9&iter=1092";
 
 test("renders, pans, zooms, and restores URL state", async ({ page }) => {
   await page.goto("/");
@@ -84,6 +86,30 @@ test("avoids microtile explosion on the 1170x784 near-real regression view", asy
     expect(pixel[3]).toBe(255);
     expect(pixel[0] + pixel[1] + pixel[2]).toBeGreaterThan(40);
   }
+});
+
+test("previews and stabilizes the 1912x948 deep interior regression view", async ({ page }) => {
+  test.setTimeout(90_000);
+  await page.setViewportSize({ width: 1912, height: 948 });
+  await page.goto(DEEP_INTERIOR_REGRESSION_URL);
+
+  await expect
+    .poll(async () => {
+      const pixel = await readCanvasPixel(page, 1700 / 1912, 700 / 948);
+      return pixel[0] + pixel[1] + pixel[2];
+    }, { timeout: 8_000 })
+    .toBeGreaterThan(10);
+
+  await waitForNonBlankCanvas(page, 75_000);
+  const tileCounts = await readTileCounts(page);
+  expect(tileCounts.completed).toBe(tileCounts.total);
+  expect(tileCounts.total).toBeLessThan(2500);
+  await page.waitForTimeout(3_000);
+  await expect(page.locator("#readStatus")).toHaveText("stable");
+
+  const pixel = await readCanvasPixel(page, 1700 / 1912, 700 / 948);
+  expect(pixel[3]).toBe(255);
+  expect(pixel[0] + pixel[1] + pixel[2]).toBeGreaterThan(10);
 });
 
 async function waitForNonBlankCanvas(page: import("@playwright/test").Page, timeout = 15_000): Promise<void> {

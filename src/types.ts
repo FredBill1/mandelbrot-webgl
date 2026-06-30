@@ -69,6 +69,8 @@ export interface RenderTileMessage {
   paletteId: string;
   refined: boolean;
   refinementLevel: number;
+  renderMode: "preview" | "final";
+  sampleStep: number;
 }
 
 export interface UnresolvedCluster {
@@ -87,12 +89,15 @@ export interface TileStats {
   glitchCount: number;
   unresolvedCount: number;
   escapedPixels: number;
+  periodicInteriorCount: number;
   seriesSkip: number;
   referenceId: string;
   referenceIdsUsed: string[];
   unresolvedScreenX: number | undefined;
   unresolvedScreenY: number | undefined;
   unresolvedClusters: UnresolvedCluster[];
+  preview: boolean;
+  renderMode: "preview" | "final";
 }
 
 export interface TileDoneMessage {
