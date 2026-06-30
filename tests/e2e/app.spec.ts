@@ -31,6 +31,8 @@ const MICROTILE_REGRESSION_URL =
   "/?re=-1.5737407486227469252433174706063197673796016133716925506497393696303123079866005e0&im=2.3298749061632902966620424763943810032963152815290060660675502164545864497691752e-5&scale=5.166754427175971621093750355246036136162467976203352006225560442836867743195112e3&iter=750";
 const DEEP_INTERIOR_REGRESSION_URL =
   "/?re=-1.5738375605512487151154265653948631632264711132220526532084658732407373266127815e0&im=-5.436641856961396284208136132163104968082086032418720386308428789634830866733822e-10&scale=1.1351152221045656587152530244486905603141464775053705184640271695455593072075544e9&iter=1092";
+const FALSE_PERIODIC_INTERIOR_URL =
+  "/?re=4.3792424135946285718646361930043170565329095266291420488816260206742136590487596e-1&im=3.4189208433811610894511184773165189135789717878674952119590075744029026125433273e-1&scale=1.0835064437740330620649324308790033236032009031542860476819043611262629043597067e27&iter=2243";
 
 test("renders, pans, zooms, and restores URL state", async ({ page }) => {
   await page.goto("/");
@@ -110,6 +112,25 @@ test("previews and stabilizes the 1912x948 deep interior regression view", async
   const pixel = await readCanvasPixel(page, 1700 / 1912, 700 / 948);
   expect(pixel[3]).toBe(255);
   expect(pixel[0] + pixel[1] + pixel[2]).toBeGreaterThan(10);
+});
+
+test("does not leave false periodic disks black at 1e27", async ({ page }) => {
+  test.setTimeout(90_000);
+  await page.setViewportSize({ width: 1912, height: 948 });
+  await page.goto(FALSE_PERIODIC_INTERIOR_URL);
+
+  for (const [x, y] of [
+    [1111.7 / 1912, 160.6 / 948],
+    [946.3 / 1912, 817.9 / 948],
+    [1233.0 / 1912, 485.5 / 948]
+  ]) {
+    await expect
+      .poll(async () => {
+        const pixel = await readCanvasPixel(page, x, y);
+        return pixel[0] + pixel[1] + pixel[2];
+      }, { timeout: 45_000 })
+      .toBeGreaterThan(40);
+  }
 });
 
 async function waitForNonBlankCanvas(page: import("@playwright/test").Page, timeout = 15_000): Promise<void> {

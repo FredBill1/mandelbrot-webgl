@@ -29,6 +29,8 @@ interface ClusterAccumulator {
   bestSurvivedIter: number;
 }
 
+const MIN_PIXEL_SPAN_FOR_PERIODIC_INTERIOR = 1e-18;
+
 export function renderPerturbationTile(message: RenderTileMessage): TileDoneMessage {
   const started = performance.now();
   const { tile, pixelSpan, maxIter, seriesDegree } = message;
@@ -129,7 +131,7 @@ function renderPixelWithReferences(
   for (const context of contexts) {
     const cRe = (screenX - context.reference.screenX) * pixelSpan;
     const cIm = (screenY - context.reference.screenY) * pixelSpan;
-    const result = perturb(cRe, cIm, context.orbitRe, context.orbitIm, maxIter, context.series);
+    const result = perturb(cRe, cIm, context.orbitRe, context.orbitIm, maxIter, context.series, pixelSpan >= MIN_PIXEL_SPAN_FOR_PERIODIC_INTERIOR);
     maxSkip = Math.max(maxSkip, context.series.skip);
     if (!result.unresolved) return { result, referenceId: context.reference.id, skip: maxSkip };
     if (!bestUnresolved || result.survivedIter > bestUnresolved.survivedIter) {
@@ -151,16 +153,17 @@ function perturb(
   orbitRe: Float64Array,
   orbitIm: Float64Array,
   maxIter: number,
-  series: ReturnType<typeof buildSeriesPlan>
+  series: ReturnType<typeof buildSeriesPlan>,
+  allowPeriodicInterior: boolean
 ): PixelResult {
   let dzRe = 0;
   let dzIm = 0;
   let iter = 0;
   let mag2 = 0;
   let glitch = false;
-  const checkpointRe = new Float64Array(32);
-  const checkpointIm = new Float64Array(32);
-  const checkpointIter = new Int32Array(32);
+  const checkpointRe = allowPeriodicInterior ? new Float64Array(32) : undefined;
+  const checkpointIm = allowPeriodicInterior ? new Float64Array(32) : undefined;
+  const checkpointIter = allowPeriodicInterior ? new Int32Array(32) : undefined;
   let checkpointCount = 0;
   let checkpointIndex = 0;
 
@@ -189,7 +192,7 @@ function perturb(
     mag2 = zRe * zRe + zIm * zIm;
     if (mag2 > 4) return { iter, mag2, glitch, unresolved: false, survivedIter: iter, periodicInterior: false };
 
-    if (iter > 32 && iter % 8 === 0) {
+    if (checkpointRe && checkpointIm && checkpointIter && iter > 32 && iter % 8 === 0) {
       const cycleTolerance = 1e-20 * Math.max(1, mag2);
       for (let checkpoint = 0; checkpoint < checkpointCount; checkpoint += 1) {
         if (iter - checkpointIter[checkpoint] < 32) continue;

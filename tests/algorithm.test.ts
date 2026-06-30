@@ -1,6 +1,6 @@
 import { beforeAll, describe, expect, it } from "vitest";
 import { readFileSync } from "node:fs";
-import init, { compute_reference, direct_escape } from "../src/wasm/pkg/mandelbrot_wasm";
+import init, { apply_view_transform, compute_reference, direct_escape } from "../src/wasm/pkg/mandelbrot_wasm";
 import { renderPerturbationTile } from "../src/workers/perturbation";
 import type { ReferenceSnapshot, RenderTileMessage, TileDescriptor } from "../src/types";
 
@@ -196,6 +196,32 @@ describe("perturbation renderer", () => {
     expect(result.stats.escapedPixels).toBe(0);
     expect(result.stats.periodicInteriorCount).toBe(1);
   });
+
+  it.each([
+    ["top large disk", 1111.7, 160.6],
+    ["bottom large disk", 946.3, 817.9],
+    ["mid-left disk", 825.0, 492.9],
+    ["mid-right disk", 1233.0, 485.5],
+    ["left-top disk", 514.2, 200.2],
+    ["central disk", 1029.0, 489.2]
+  ])("does not classify the false %s at 1e27 as interior", (_name, x, y) => {
+    const view = {
+      re: "4.3792424135946285718646361930043170565329095266291420488816260206742136590487596e-1",
+      im: "3.4189208433811610894511184773165189135789717878674952119590075744029026125433273e-1",
+      scale: "1.0835064437740330620649324308790033236032009031542860476819043611262629043597067e27",
+      maxIter: 2243
+    };
+    const point = highPrecisionPointAtScreen(view, x, y, 1912, 948);
+    const direct = direct_escape(point.re, point.im, view.maxIter, 4096);
+    const reference = makeReference(point.re, point.im, view.maxIter, 512, x, y);
+
+    const result = renderSinglePixelWithReferences(view, point, x, y, [reference], 1);
+
+    expect(direct).toBeLessThan(view.maxIter);
+    expect(result.stats.periodicInteriorCount).toBe(0);
+    expect(result.stats.unresolvedCount).toBe(0);
+    expect(result.stats.escapedPixels).toBe(1);
+  });
 });
 
 function makeReference(re: string, im: string, maxIter: number, precisionBits: number, screenX = 0.5, screenY = 0.5): ReferenceSnapshot {
@@ -274,6 +300,23 @@ function pointAtScreen(view: { re: string; im: string; scale: string }, x: numbe
   const re = Number(view.re) + (x - 1912 * 0.5) * span;
   const im = Number(view.im) + (y - 948 * 0.5) * span;
   return { re: re.toPrecision(18), im: im.toPrecision(18) };
+}
+
+function highPrecisionPointAtScreen(
+  view: { re: string; im: string; scale: string },
+  x: number,
+  y: number,
+  width: number,
+  height: number
+): { re: string; im: string } {
+  return apply_view_transform(
+    { re: view.re, im: view.im, scale: view.scale, width, height },
+    -(x - width * 0.5),
+    -(y - height * 0.5),
+    1,
+    width * 0.5,
+    height * 0.5
+  ) as { re: string; im: string };
 }
 
 function pixelSpan(scale: string, width: number): number {
