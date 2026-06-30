@@ -27,6 +27,9 @@ const REGRESSION_VIEWS = [
   }
 ] as const;
 
+const MICROTILE_REGRESSION_URL =
+  "/?re=-1.5737407486227469252433174706063197673796016133716925506497393696303123079866005e0&im=2.3298749061632902966620424763943810032963152815290060660675502164545864497691752e-5&scale=5.166754427175971621093750355246036136162467976203352006225560442836867743195112e3&iter=750";
+
 test("renders, pans, zooms, and restores URL state", async ({ page }) => {
   await page.goto("/");
   const canvas = page.locator("#fractal");
@@ -63,33 +66,60 @@ test("renders the reported regression views without false interior samples", asy
   }
 });
 
+test("avoids microtile explosion on the 1170x784 near-real regression view", async ({ page }) => {
+  await page.setViewportSize({ width: 1170, height: 784 });
+  await page.goto(MICROTILE_REGRESSION_URL);
+  await waitForNonBlankCanvas(page, 45_000);
+  const tileCounts = await readTileCounts(page);
+  expect(tileCounts.completed).toBe(tileCounts.total);
+  expect(tileCounts.total).toBeLessThan(2500);
+
+  for (const [x, y] of [
+    [585 / 1170, 392 / 784],
+    [760 / 1170, 330 / 784],
+    [330 / 1170, 310 / 784],
+    [30 / 1170, 330 / 784]
+  ]) {
+    const pixel = await readCanvasPixel(page, x, y);
+    expect(pixel[3]).toBe(255);
+    expect(pixel[0] + pixel[1] + pixel[2]).toBeGreaterThan(40);
+  }
+});
+
 async function waitForNonBlankCanvas(page: import("@playwright/test").Page, timeout = 15_000): Promise<void> {
   await expect(page.locator("#readStatus")).toHaveText("stable", { timeout });
   await expect
     .poll(async () => {
       return page.evaluate(() => {
-        const canvas = document.querySelector<HTMLCanvasElement>("#fractal");
-        const gl = canvas?.getContext("webgl2", { alpha: false, antialias: false, preserveDrawingBuffer: true });
-        if (!canvas || !gl || gl.isContextLost() || canvas.width === 0 || canvas.height === 0) return 0;
-        const samples = new Uint8Array(4 * 9);
-        let offset = 0;
-        for (const x of [0.25, 0.5, 0.75]) {
-          for (const y of [0.25, 0.5, 0.75]) {
-            const pixel = new Uint8Array(4);
-            gl.readPixels(
-              Math.floor(canvas.width * x),
-              Math.floor(canvas.height * y),
-              1,
-              1,
-              gl.RGBA,
-              gl.UNSIGNED_BYTE,
-              pixel
-            );
-            samples.set(pixel, offset);
-            offset += 4;
-          }
-        }
-        return samples.reduce((sum, value) => sum + value, 0);
+        return new Promise<number>((resolve) => {
+          requestAnimationFrame(() => {
+            const canvas = document.querySelector<HTMLCanvasElement>("#fractal");
+            const gl = canvas?.getContext("webgl2", { alpha: false, antialias: false, preserveDrawingBuffer: true });
+            if (!canvas || !gl || gl.isContextLost() || canvas.width === 0 || canvas.height === 0) {
+              resolve(0);
+              return;
+            }
+            const samples = new Uint8Array(4 * 9);
+            let offset = 0;
+            for (const x of [0.25, 0.5, 0.75]) {
+              for (const y of [0.25, 0.5, 0.75]) {
+                const pixel = new Uint8Array(4);
+                gl.readPixels(
+                  Math.floor(canvas.width * x),
+                  Math.floor(canvas.height * y),
+                  1,
+                  1,
+                  gl.RGBA,
+                  gl.UNSIGNED_BYTE,
+                  pixel
+                );
+                samples.set(pixel, offset);
+                offset += 4;
+              }
+            }
+            resolve(samples.reduce((sum, value) => sum + value, 0));
+          });
+        });
       });
     })
     .toBeGreaterThan(100);
@@ -115,4 +145,11 @@ async function readCanvasPixel(page: import("@playwright/test").Page, x: number,
     },
     { x, y }
   );
+}
+
+async function readTileCounts(page: import("@playwright/test").Page): Promise<{ completed: number; total: number }> {
+  const text = await page.locator("#readTiles").textContent();
+  const match = /^(\d+)\/(\d+)$/.exec(text ?? "");
+  if (!match) return { completed: 0, total: Number.POSITIVE_INFINITY };
+  return { completed: Number(match[1]), total: Number(match[2]) };
 }

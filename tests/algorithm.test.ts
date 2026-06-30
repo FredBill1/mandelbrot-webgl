@@ -133,6 +133,46 @@ describe("perturbation renderer", () => {
     expect(resolved.stats.unresolvedCount).toBe(0);
     expect(resolved.stats.escapedPixels).toBe(direct < view.maxIter ? 1 : 0);
   });
+
+  it("uses adaptive unresolved clusters for the 1170x784 near-real performance regression", () => {
+    const view = {
+      re: "-1.5737407486227469252433174706063197673796016133716925506497393696303123079866005e0",
+      im: "2.3298749061632902966620424763943810032963152815290060660675502164545864497691752e-5",
+      scale: "5.166754427175971621093750355246036136162467976203352006225560442836867743195112e3",
+      maxIter: 750
+    };
+    const reference = makeReference(view.re, view.im, view.maxIter, 224, 1170 * 0.5, 784 * 0.5);
+    const tile: TileDescriptor = {
+      id: "near-real-stripe",
+      key: { level: 0, x: 0, y: 0, span: 128 },
+      rect: { x: 0, y: 256, width: 1170, height: 128 },
+      centerScreenX: 585,
+      centerScreenY: 320,
+      centerRe: view.re,
+      centerIm: view.im,
+      revision: 1
+    };
+
+    const result = renderPerturbationTile({
+      type: "renderTile",
+      tile,
+      canvasWidth: 1170,
+      canvasHeight: 784,
+      pixelSpan: pixelSpan(view.scale, 1170),
+      maxIter: view.maxIter,
+      references: [reference],
+      seriesDegree: 8,
+      paletteId: "cosine",
+      refined: false,
+      refinementLevel: 0
+    });
+
+    expect(reference.escapedAt).toBe(34);
+    expect(result.stats.unresolvedCount).toBeGreaterThan(0);
+    expect(result.stats.unresolvedClusters.length).toBeGreaterThan(4);
+    expect(result.stats.unresolvedClusters.length).toBeLessThanOrEqual(16);
+    expect(result.stats.unresolvedClusters.every((cluster) => cluster.bounds.width > 0 && cluster.bounds.height > 0)).toBe(true);
+  });
 });
 
 function makeReference(re: string, im: string, maxIter: number, precisionBits: number, screenX = 0.5, screenY = 0.5): ReferenceSnapshot {

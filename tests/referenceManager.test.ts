@@ -30,7 +30,7 @@ describe("ReferenceManager", () => {
 
     const selected = manager.selectBest(nearShort, maxIter, view.revision);
     expect(selected?.centerRe).toBe("complete");
-    expect(manager.selectCandidates(nearShort, maxIter, view.revision, 2).map((reference) => reference.centerRe)).toEqual(["complete", "short"]);
+    expect(manager.selectCandidates(nearShort, maxIter, view.revision, 2).map((reference) => reference.centerRe)).toEqual(["short", "complete"]);
   });
 
   it("does not evict references just because the count exceeds 128", async () => {

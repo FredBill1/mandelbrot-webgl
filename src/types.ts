@@ -77,6 +77,9 @@ export interface UnresolvedCluster {
   pixelCount: number;
   survivedIter: number;
   radiusPx: number;
+  binX: number;
+  binY: number;
+  bounds: Rect;
 }
 
 export interface TileStats {

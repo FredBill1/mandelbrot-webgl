@@ -69,16 +69,18 @@ export class ReferenceManager {
   }
 
   selectBest(tile: TileDescriptor, maxIter: number, revision: number): ReferenceSnapshot | undefined {
-    return this.selectCandidates(tile, maxIter, revision, 1)[0];
+    return this.referenceCandidatesWithDistance(tile, maxIter, revision)
+      .sort((a, b) => {
+        const completeDelta = Number(b.reference.escapedAt >= maxIter) - Number(a.reference.escapedAt >= maxIter);
+        if (completeDelta !== 0) return completeDelta;
+        const escapedDelta = b.reference.escapedAt - a.reference.escapedAt;
+        if (escapedDelta !== 0) return escapedDelta;
+        return a.distance - b.distance;
+      })[0]?.reference;
   }
 
   selectCandidates(tile: TileDescriptor, maxIter: number, revision: number, maxCount: number): ReferenceSnapshot[] {
-    const candidates = this.entries
-      .filter((reference) => reference.maxIter === maxIter && reference.revision === revision)
-      .map((reference) => ({
-        reference,
-        distance: Math.hypot(tile.centerScreenX - reference.screenX, tile.centerScreenY - reference.screenY)
-      }));
+    const candidates = this.referenceCandidatesWithDistance(tile, maxIter, revision);
     if (candidates.length === 0) {
       return this.currentViewReference?.revision === revision ? [this.currentViewReference] : [];
     }
@@ -93,7 +95,11 @@ export class ReferenceManager {
     const byDistance = [...candidates].sort((a, b) => a.distance - b.distance);
 
     const selected = new Map<string, ReferenceSnapshot>();
-    for (const entry of byOrbit.slice(0, Math.max(1, Math.ceil(maxCount * 0.75)))) selected.set(entry.reference.id, entry.reference);
+    for (const entry of byDistance.slice(0, Math.max(1, Math.ceil(maxCount * 0.6)))) selected.set(entry.reference.id, entry.reference);
+    for (const entry of byOrbit) {
+      selected.set(entry.reference.id, entry.reference);
+      if (selected.size >= maxCount) break;
+    }
     for (const entry of byDistance) {
       selected.set(entry.reference.id, entry.reference);
       if (selected.size >= maxCount) break;
@@ -154,6 +160,15 @@ export class ReferenceManager {
     );
     this.trim(input.revision);
     return snapshot;
+  }
+
+  private referenceCandidatesWithDistance(tile: TileDescriptor, maxIter: number, revision: number): Array<{ reference: ReferenceSnapshot; distance: number }> {
+    return this.entries
+      .filter((reference) => reference.maxIter === maxIter && reference.revision === revision)
+      .map((reference) => ({
+        reference,
+        distance: Math.hypot(tile.centerScreenX - reference.screenX, tile.centerScreenY - reference.screenY)
+      }));
   }
 
   private trim(currentRevision: number): void {

@@ -17,6 +17,9 @@ interface ReferenceContext {
 }
 
 interface ClusterAccumulator {
+  binX: number;
+  binY: number;
+  bounds: { x: number; y: number; width: number; height: number };
   count: number;
   sumX: number;
   sumY: number;
@@ -50,7 +53,8 @@ export function renderPerturbationTile(message: RenderTileMessage): TileDoneMess
   let unresolvedScreenYSum = 0;
   let seriesSkip = 0;
   const usedReferenceIds = new Set<string>();
-  const clusters = createClusterAccumulators();
+  const clusters = createClusterAccumulators(tile.rect);
+  const unresolvedMask = new Uint8Array(width * height);
 
   for (let py = 0; py < height; py += 1) {
     for (let px = 0; px < width; px += 1) {
@@ -66,11 +70,14 @@ export function renderPerturbationTile(message: RenderTileMessage): TileDoneMess
         unresolvedCount += 1;
         unresolvedScreenXSum += screenX;
         unresolvedScreenYSum += screenY;
+        unresolvedMask[py * width + px] = 1;
         recordUnresolvedCluster(clusters, tile.rect, screenX, screenY, result.survivedIter);
       }
       colorPixel(rgba, offset, result.iter, maxIter, result.mag2);
     }
   }
+
+  if (unresolvedCount > 0) fillUnresolvedPreview(rgba, unresolvedMask, width, height);
 
   const unresolvedScreenX = unresolvedCount > 0 ? unresolvedScreenXSum / unresolvedCount : undefined;
   const unresolvedScreenY = unresolvedCount > 0 ? unresolvedScreenYSum / unresolvedCount : undefined;
@@ -197,15 +204,31 @@ function perturb(
   return { iter: maxIter, mag2, glitch: false, unresolved: false, survivedIter: maxIter };
 }
 
-function createClusterAccumulators(): ClusterAccumulator[] {
-  return Array.from({ length: 4 }, () => ({
-    count: 0,
-    sumX: 0,
-    sumY: 0,
-    bestX: 0,
-    bestY: 0,
-    bestSurvivedIter: -1
-  }));
+function createClusterAccumulators(rect: { x: number; y: number; width: number; height: number }): ClusterAccumulator[] {
+  const cols = rect.width >= rect.height * 1.5 ? 8 : 4;
+  const rows = 4;
+  const clusters: ClusterAccumulator[] = [];
+  for (let binY = 0; binY < rows; binY += 1) {
+    for (let binX = 0; binX < cols; binX += 1) {
+      clusters.push({
+        binX,
+        binY,
+        bounds: {
+          x: rect.x + (rect.width * binX) / cols,
+          y: rect.y + (rect.height * binY) / rows,
+          width: rect.width / cols,
+          height: rect.height / rows
+        },
+        count: 0,
+        sumX: 0,
+        sumY: 0,
+        bestX: 0,
+        bestY: 0,
+        bestSurvivedIter: -1
+      });
+    }
+  }
+  return clusters;
 }
 
 function recordUnresolvedCluster(
@@ -215,9 +238,11 @@ function recordUnresolvedCluster(
   screenY: number,
   survivedIter: number
 ): void {
-  const midpointX = rect.x + rect.width * 0.5;
-  const midpointY = rect.y + rect.height * 0.5;
-  const index = (screenX >= midpointX ? 1 : 0) + (screenY >= midpointY ? 2 : 0);
+  const cols = rect.width >= rect.height * 1.5 ? 8 : 4;
+  const rows = 4;
+  const binX = Math.max(0, Math.min(cols - 1, Math.floor(((screenX - rect.x) / Math.max(1, rect.width)) * cols)));
+  const binY = Math.max(0, Math.min(rows - 1, Math.floor(((screenY - rect.y) / Math.max(1, rect.height)) * rows)));
+  const index = binY * cols + binX;
   const cluster = clusters[index];
   cluster.count += 1;
   cluster.sumX += screenX;
@@ -241,9 +266,59 @@ function buildUnresolvedClusters(
       screenY: cluster.bestY || cluster.sumY / cluster.count,
       pixelCount: cluster.count,
       survivedIter: Math.max(0, cluster.bestSurvivedIter),
-      radiusPx
+      radiusPx,
+      binX: cluster.binX,
+      binY: cluster.binY,
+      bounds: cluster.bounds
     }))
-    .sort((a, b) => b.pixelCount - a.pixelCount || b.survivedIter - a.survivedIter);
+    .sort((a, b) => b.pixelCount - a.pixelCount || b.survivedIter - a.survivedIter)
+    .slice(0, 16);
+}
+
+function fillUnresolvedPreview(buffer: Uint8ClampedArray, unresolvedMask: Uint8Array, width: number, height: number): void {
+  for (let pass = 0; pass < 3; pass += 1) {
+    let changed = false;
+    for (let y = 0; y < height; y += 1) {
+      for (let x = 0; x < width; x += 1) {
+        const pixelIndex = y * width + x;
+        if (unresolvedMask[pixelIndex] === 0) continue;
+        let red = 0;
+        let green = 0;
+        let blue = 0;
+        let count = 0;
+        for (let dy = -1; dy <= 1; dy += 1) {
+          for (let dx = -1; dx <= 1; dx += 1) {
+            if (dx === 0 && dy === 0) continue;
+            const nx = x + dx;
+            const ny = y + dy;
+            if (nx < 0 || ny < 0 || nx >= width || ny >= height) continue;
+            const neighborIndex = ny * width + nx;
+            if (unresolvedMask[neighborIndex] !== 0) continue;
+            const offset = neighborIndex * 4;
+            red += buffer[offset];
+            green += buffer[offset + 1];
+            blue += buffer[offset + 2];
+            count += 1;
+          }
+        }
+        const offset = pixelIndex * 4;
+        if (count > 0) {
+          buffer[offset] = Math.round(red / count);
+          buffer[offset + 1] = Math.round(green / count);
+          buffer[offset + 2] = Math.round(blue / count);
+          buffer[offset + 3] = 255;
+          unresolvedMask[pixelIndex] = 0;
+          changed = true;
+        } else if (pass === 2) {
+          buffer[offset] = 40;
+          buffer[offset + 1] = 162;
+          buffer[offset + 2] = 142;
+          buffer[offset + 3] = 255;
+        }
+      }
+    }
+    if (!changed && pass === 2) break;
+  }
 }
 
 function isCancellationGlitch(mag2: number, refMag2: number, dzMag2: number): boolean {

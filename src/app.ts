@@ -1,5 +1,14 @@
 import { ReferenceManager } from "./reference/referenceManager";
 import { WebglTileRenderer } from "./render/webglRenderer";
+import {
+  canSplitRect,
+  maxReferencesForRect,
+  MAX_CLUSTER_REFERENCES_PER_PASS,
+  MAX_NEW_SUBTILES_PER_FRAME,
+  nextStalledRefinementRounds,
+  shouldSplitTile,
+  splitAxis as splitTileAxis
+} from "./scheduler/tilePolicy";
 import { TileWorkerPool } from "./scheduler/workerPool";
 import { createVisibleTileShells, tileKeyToId } from "./tiles/tileKey";
 import {
@@ -41,12 +50,11 @@ interface TileWorkState {
   inFlight: boolean;
   completed: boolean;
   pendingReferences: number;
+  lastUnresolvedCount: number | undefined;
+  stalledRefinementRounds: number;
+  previewUploaded: boolean;
+  microtileAllowed: boolean;
 }
-
-const MAX_TILE_REFERENCES = 16;
-const MAX_CLUSTER_REFERENCES_PER_PASS = 4;
-const MIN_NORMAL_SUBTILE_SIZE = 8;
-const MICROTILE_SIZE = 1;
 
 export async function startApp(root: HTMLElement): Promise<void> {
   root.innerHTML = `
@@ -220,7 +228,11 @@ export async function startApp(root: HTMLElement): Promise<void> {
       splitLevel,
       inFlight: false,
       completed: false,
-      pendingReferences: 0
+      pendingReferences: 0,
+      lastUnresolvedCount: undefined,
+      stalledRefinementRounds: 0,
+      previewUploaded: false,
+      microtileAllowed: false
     };
     tileStates.set(tile.id, state);
     pendingTileIds.add(tile.id);
@@ -271,13 +283,36 @@ export async function startApp(root: HTMLElement): Promise<void> {
       stats.references = references.size;
 
       if (result.stats.unresolvedCount > 0) {
+        renderer.uploadTile(result);
+        state.previewUploaded = true;
+        state.stalledRefinementRounds = nextStalledRefinementRounds(
+          state.lastUnresolvedCount,
+          result.stats.unresolvedCount,
+          state.stalledRefinementRounds
+        );
+        state.lastUnresolvedCount = result.stats.unresolvedCount;
+
         const queued = queueClusterReferences(localRuntime, state, result.stats.unresolvedClusters);
         if (queued > 0 || state.pendingReferences > 0) {
           stats.pending = pendingTileIds.size;
           stats.status = "refining";
           return;
         }
-        if (canSplitTile(state.tile)) {
+        if (shouldSplitTile({
+          rect: state.tile.rect,
+          lastUnresolvedCount: state.lastUnresolvedCount,
+          unresolvedCount: result.stats.unresolvedCount,
+          stalledRefinementRounds: state.stalledRefinementRounds,
+          pendingReferences: state.pendingReferences,
+          referenceCount: state.referenceIds.size,
+          maxReferences: maxReferencesForRect(state.tile.rect),
+          microtileAllowed: state.microtileAllowed
+        })) {
+          await splitTile(localRuntime, state);
+          return;
+        }
+        if (canSplitTile(state.tile) && state.referenceIds.size >= maxReferencesForRect(state.tile.rect)) {
+          state.microtileAllowed = true;
           await splitTile(localRuntime, state);
           return;
         }
@@ -306,7 +341,7 @@ export async function startApp(root: HTMLElement): Promise<void> {
     const localRuntime = currentRuntimeView();
     const requestKey = referenceRequestKey(message.targetScreenX, message.targetScreenY, message.requiredPrecision);
     if (state.requestedReferenceKeys.has(requestKey)) return;
-    if (state.referenceIds.size + state.pendingReferences >= MAX_TILE_REFERENCES && canSplitTile(state.tile)) return;
+    if (state.referenceIds.size + state.pendingReferences >= maxReferencesForRect(state.tile.rect) && canSplitTile(state.tile)) return;
 
     state.requestedReferenceKeys.add(requestKey);
     state.pendingReferences += 1;
@@ -335,20 +370,22 @@ export async function startApp(root: HTMLElement): Promise<void> {
     const explicit = [...state.referenceIds]
       .map((id) => references.getById(id))
       .filter((reference): reference is NonNullable<typeof reference> => Boolean(reference));
-    const selected = references.selectCandidates(state.tile, localRuntime.maxIter, localRuntime.revision, MAX_TILE_REFERENCES);
+    const maxReferences = maxReferencesForRect(state.tile.rect);
+    const selected = references.selectCandidates(state.tile, localRuntime.maxIter, localRuntime.revision, maxReferences);
     const merged = new Map<string, (typeof selected)[number]>();
     for (const reference of explicit) merged.set(reference.id, reference);
     for (const reference of selected) merged.set(reference.id, reference);
-    return [...merged.values()].slice(0, MAX_TILE_REFERENCES);
+    return [...merged.values()].slice(0, maxReferences);
   }
 
   function queueClusterReferences(localRuntime: RuntimeView, state: TileWorkState, clusters: UnresolvedCluster[]): number {
     if (clusters.length === 0) return 0;
-    if (state.referenceIds.size + state.pendingReferences >= MAX_TILE_REFERENCES && canSplitTile(state.tile)) return 0;
+    const maxReferences = maxReferencesForRect(state.tile.rect);
+    if (state.referenceIds.size + state.pendingReferences >= maxReferences && canSplitTile(state.tile)) return 0;
     let queued = 0;
     const highestPrecision = buildReferenceCandidates(state, localRuntime).reduce((bits, reference) => Math.max(bits, reference.precisionBits), 128);
     for (const cluster of clusters.slice(0, MAX_CLUSTER_REFERENCES_PER_PASS)) {
-      if (state.referenceIds.size + state.pendingReferences + queued >= MAX_TILE_REFERENCES && canSplitTile(state.tile)) break;
+      if (state.referenceIds.size + state.pendingReferences + queued >= maxReferences && canSplitTile(state.tile)) break;
       const requestKey = referenceRequestKey(cluster.screenX, cluster.screenY, highestPrecision + 32);
       if (state.requestedReferenceKeys.has(requestKey)) continue;
       state.pendingReferences += 1;
@@ -403,30 +440,30 @@ export async function startApp(root: HTMLElement): Promise<void> {
   async function splitTile(localRuntime: RuntimeView, state: TileWorkState): Promise<void> {
     const tile = state.tile;
     if (tile.revision !== revision) return;
-    const subtiles = await createSubtiles(localRuntime, tile);
+    const subtiles = await createSubtiles(localRuntime, tile, state.microtileAllowed);
     if (tile.revision !== revision || subtiles.length === 0) return;
 
     pendingTileIds.delete(tile.id);
     tileStates.delete(tile.id);
-    for (const subtile of subtiles) pendingTileIds.add(subtile.id);
+    for (const subtile of subtiles.slice(0, MAX_NEW_SUBTILES_PER_FRAME)) pendingTileIds.add(subtile.id);
     stats.pending = pendingTileIds.size;
     stats.status = "splitting";
 
-    for (const subtile of subtiles) {
+    for (const subtile of subtiles.slice(0, MAX_NEW_SUBTILES_PER_FRAME)) {
       const seedReferences = references.selectCandidates(subtile, localRuntime.maxIter, localRuntime.revision, 4).map((reference) => reference.id);
       const child = createTileState(subtile, seedReferences, state.splitLevel + 1);
+      child.microtileAllowed = state.microtileAllowed;
       void submitTile(localRuntime, child);
     }
     syncPinnedReferences();
   }
 
-  async function createSubtiles(localRuntime: RuntimeView, tile: TileDescriptor): Promise<TileDescriptor[]> {
-    const splitX = tile.rect.width > MICROTILE_SIZE;
-    const splitY = tile.rect.height > MICROTILE_SIZE;
-    if (!splitX && !splitY) return [];
+  async function createSubtiles(localRuntime: RuntimeView, tile: TileDescriptor, allowMicrotile: boolean): Promise<TileDescriptor[]> {
+    if (!canSplitTile(tile)) return [];
 
-    const xCuts = splitAxis(tile.rect.width);
-    const yCuts = splitAxis(tile.rect.height);
+    const xCuts = splitTileAxis(tile.rect.width, allowMicrotile);
+    const yCuts = splitTileAxis(tile.rect.height, allowMicrotile);
+    if (xCuts.length <= 2 && yCuts.length <= 2) return [];
     const subtiles: TileDescriptor[] = [];
 
     for (let yi = 0; yi < yCuts.length - 1; yi += 1) {
@@ -438,7 +475,7 @@ export async function startApp(root: HTMLElement): Promise<void> {
           height: yCuts[yi + 1] - yCuts[yi]
         };
         if (rect.width <= 0 || rect.height <= 0) continue;
-        const span = Math.max(MICROTILE_SIZE, Math.floor(Math.max(rect.width, rect.height)));
+        const span = Math.max(1, Math.floor(Math.max(rect.width, rect.height)));
         const key = {
           level: tile.key.level + 1,
           x: tile.key.x * 16 + xi,
@@ -464,18 +501,7 @@ export async function startApp(root: HTMLElement): Promise<void> {
   }
 
   function canSplitTile(tile: TileDescriptor): boolean {
-    return tile.rect.width > MICROTILE_SIZE || tile.rect.height > MICROTILE_SIZE;
-  }
-
-  function splitAxis(length: number): number[] {
-    if (length <= MICROTILE_SIZE) return [0, length];
-    if (length <= MIN_NORMAL_SUBTILE_SIZE) {
-      const cuts = [0];
-      for (let value = 1; value < length; value += 1) cuts.push(value);
-      cuts.push(length);
-      return cuts;
-    }
-    return [0, Math.floor(length * 0.5), length];
+    return canSplitRect(tile.rect);
   }
 
   function referenceRequestKey(screenX: number, screenY: number, precisionBits: number): string {
