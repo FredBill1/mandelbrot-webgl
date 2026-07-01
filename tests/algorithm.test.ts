@@ -1,6 +1,7 @@
 import { beforeAll, describe, expect, it } from "vitest";
 import { readFileSync } from "node:fs";
 import init, { apply_view_transform, compute_reference, direct_escape } from "../src/wasm/pkg/mandelbrot_wasm";
+import { createVisibleTileShells } from "../src/tiles/tileKey";
 import { renderPerturbationTile } from "../src/workers/perturbation";
 import type { ReferenceSnapshot, RenderTileMessage, TileDescriptor } from "../src/types";
 
@@ -10,6 +11,29 @@ beforeAll(async () => {
 });
 
 describe("perturbation renderer", () => {
+  it("keeps e79 adjacent pixels and tile centers distinct after WASM decimal serialization", () => {
+    const view = {
+      re: "-7.4688394343169276054191953271440985923260663988633375070109254116564380822428781e-1",
+      im: "-1.0052598241121587675259369892011437164151107429135698306788524375078819321907888e-1",
+      scale: "3.1649373179255141123643235951764328734858585667107715296013629081580305459152227e79",
+      maxIter: 5601
+    };
+
+    const firstPixel = highPrecisionPointAtScreen(view, 956, 474, 1912, 948);
+    const nextPixel = highPrecisionPointAtScreen(view, 957, 474, 1912, 948);
+    expect(nextPixel.re).not.toBe(firstPixel.re);
+    expect(significantDigits(firstPixel.re)).toBeGreaterThanOrEqual(130);
+
+    const shells = createVisibleTileShells({ ...view, width: 1912, height: 948, pixelRatio: 1, revision: 1 }, 128);
+    const centers = shells.map((tile) => {
+      const point = highPrecisionPointAtScreen(view, tile.centerScreenX, tile.centerScreenY, 1912, 948);
+      return `${point.re}|${point.im}`;
+    });
+
+    expect(shells).toHaveLength(120);
+    expect(new Set(centers).size).toBe(centers.length);
+  });
+
   it.each([
     ["shallow", "3e-1", "5e-1", "1", 128],
     ["1e20", "-7.43643887037158704752191506114774e-1", "1.31825904205311970493132056385139e-1", "1e20", 256],
@@ -136,7 +160,7 @@ describe("perturbation renderer", () => {
     expect(resolved.stats.escapedPixels).toBe(direct < view.maxIter ? 1 : 0);
   });
 
-  it("uses BLA or adaptive unresolved clusters for the 1170x784 near-real performance regression", () => {
+  it("uses safe series or adaptive unresolved clusters for the 1170x784 near-real performance regression", () => {
     const view = {
       re: "-1.5737407486227469252433174706063197673796016133716925506497393696303123079866005e0",
       im: "2.3298749061632902966620424763943810032963152815290060660675502164545864497691752e-5",
@@ -177,8 +201,9 @@ describe("perturbation renderer", () => {
       expect(result.stats.unresolvedClusters.length).toBeLessThanOrEqual(16);
       expect(result.stats.unresolvedClusters.every((cluster) => cluster.bounds.width > 0 && cluster.bounds.height > 0)).toBe(true);
     } else {
-      expect(result.stats.blaStepCount).toBeGreaterThan(0);
+      expect(result.stats.seriesSkip).toBeGreaterThanOrEqual(0);
     }
+    expect(result.stats.blaStepCount).toBe(0);
   });
 
   it("resolves the 1912x948 deep interior sample without refinement", () => {
@@ -197,7 +222,8 @@ describe("perturbation renderer", () => {
 
     expect(result.stats.unresolvedCount).toBe(0);
     expect(result.stats.escapedPixels).toBe(0);
-    expect(result.stats.periodicInteriorCount + result.stats.blaStepCount).toBeGreaterThan(0);
+    expect(result.stats.periodicInteriorCount + result.stats.seriesSkip).toBeGreaterThan(0);
+    expect(result.stats.blaStepCount).toBe(0);
   });
 
   it.each([
@@ -308,6 +334,55 @@ describe("perturbation renderer", () => {
     expect(result.stats.unresolvedCount).toBe(0);
     expect(result.stats.escapedPixels).toBe(0);
   });
+
+  it.each([
+    [
+      "1e20",
+      { re: "-7.43643887037158704752191506114774e-1", im: "1.31825904205311970493132056385139e-1", scale: "1e20", maxIter: 256 },
+      1000,
+      500,
+      512
+    ],
+    [
+      "1e60",
+      { re: "-7.43643887037158704752191506114774e-1", im: "1.31825904205311970493132056385139e-1", scale: "1e60", maxIter: 384 },
+      1000,
+      500,
+      512
+    ],
+    [
+      "1e79",
+      {
+        re: "-7.4688394343169276054191953271440985923260663988633375070109254116564380822428781e-1",
+        im: "-1.0052598241121587675259369892011437164151107429135698306788524375078819321907888e-1",
+        scale: "3.1649373179255141123643235951764328734858585667107715296013629081580305459152227e79",
+        maxIter: 5601
+      },
+      960,
+      476,
+      768
+    ],
+    [
+      "1e100",
+      { re: "-7.43643887037158704752191506114774e-1", im: "1.31825904205311970493132056385139e-1", scale: "1e100", maxIter: 512 },
+      1000,
+      500,
+      768
+    ]
+  ])("matches direct classification with series enabled and disabled at %s", (_name, view, x, y, precisionBits) => {
+    const point = highPrecisionPointAtScreen(view, x, y, 1912, 948);
+    const direct = direct_escape(point.re, point.im, view.maxIter, precisionBits);
+    const reference = makeReference(point.re, point.im, view.maxIter, precisionBits, x, y);
+    const seriesEnabled = renderSinglePixelWithReferences(view, point, x, y, [reference], 1, 8);
+    const seriesDisabled = renderSinglePixelWithReferences(view, point, x, y, [reference], 1, 0);
+    const escaped = direct < view.maxIter ? 1 : 0;
+
+    expect(seriesEnabled.stats.unresolvedCount).toBe(0);
+    expect(seriesDisabled.stats.unresolvedCount).toBe(0);
+    expect(seriesEnabled.stats.escapedPixels).toBe(escaped);
+    expect(seriesDisabled.stats.escapedPixels).toBe(escaped);
+    expect(seriesEnabled.stats.blaStepCount).toBe(0);
+  });
 });
 
 function makeReference(re: string, im: string, maxIter: number, precisionBits: number, screenX = 0.5, screenY = 0.5): ReferenceSnapshot {
@@ -351,7 +426,8 @@ function renderSinglePixelWithReferences(
   screenX: number,
   screenY: number,
   references: ReferenceSnapshot[],
-  refinementLevel: number
+  refinementLevel: number,
+  seriesDegree = 8
 ) {
   const tile: TileDescriptor = {
     id: "sample-tile",
@@ -371,7 +447,7 @@ function renderSinglePixelWithReferences(
     pixelSpan: pixelSpan(view.scale, 1912),
     maxIter: view.maxIter,
     references,
-    seriesDegree: 8,
+    seriesDegree,
     paletteId: "cosine",
     refined: refinementLevel > 0,
     refinementLevel,
@@ -407,6 +483,11 @@ function highPrecisionPointAtScreen(
 
 function pixelSpan(scale: string, width: number): number {
   return 3.5 / (Number(scale) * width);
+}
+
+function significantDigits(value: string): number {
+  const mantissa = value.toLowerCase().split("e")[0] ?? value;
+  return mantissa.replace(/[-+.]/g, "").replace(/^0+/, "").length;
 }
 
 function makeCenterTile(re: string, im: string): TileDescriptor {

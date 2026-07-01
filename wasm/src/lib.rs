@@ -43,7 +43,11 @@ fn bf_from_f64(value: f64, bits: u32) -> BigFloat {
     BigFloat::from_f64(value, precision(bits))
 }
 
-fn bf_to_string(value: &BigFloat) -> String {
+fn decimal_digits(bits: u32) -> usize {
+    (((bits as f64) * 0.301_029_995_663_981_2).ceil() as usize + 12).clamp(90, 1300)
+}
+
+fn bf_to_string(value: &BigFloat, digits: usize) -> String {
     if value.is_zero() {
         return "0".to_string();
     };
@@ -74,13 +78,13 @@ fn bf_to_string(value: &BigFloat) -> String {
         exponent -= 1;
     }
 
-    let mut out = String::with_capacity(96);
+    let mut out = String::with_capacity(digits + 8);
     if negative {
         out.push('-');
     }
 
-    let mut digits = Vec::with_capacity(80);
-    for _ in 0..80 {
+    let mut emitted_digits = Vec::with_capacity(digits);
+    for _ in 0..digits {
         let mut digit = 0u8;
         for candidate in (0u8..=9).rev() {
             let candidate_bf = BigFloat::from_word(candidate as u64, p);
@@ -89,17 +93,17 @@ fn bf_to_string(value: &BigFloat) -> String {
                 break;
             }
         }
-        digits.push(digit);
+        emitted_digits.push(digit);
         normalized = normalized.sub(&BigFloat::from_word(digit as u64, p), p, RM).mul(&ten, p, RM);
         if normalized.is_zero() {
             break;
         }
     }
 
-    out.push((b'0' + digits[0]) as char);
-    if digits.len() > 1 {
+    out.push((b'0' + emitted_digits[0]) as char);
+    if emitted_digits.len() > 1 {
         out.push('.');
-        for digit in digits.iter().skip(1) {
+        for digit in emitted_digits.iter().skip(1) {
             out.push((b'0' + *digit) as char);
         }
     }
@@ -273,11 +277,12 @@ pub fn apply_view_transform(
 
     let next_re = after_zoom_re.sub(&new_pixel_span.mul(&bf_from_f64(pan_x, bits), precision(bits), RM), precision(bits), RM);
     let next_im = after_zoom_im.sub(&new_pixel_span.mul(&bf_from_f64(pan_y, bits), precision(bits), RM), precision(bits), RM);
+    let digits = decimal_digits(bits);
 
     serde_wasm_bindgen::to_value(&ViewOutput {
-        re: bf_to_string(&next_re),
-        im: bf_to_string(&next_im),
-        scale: bf_to_string(&next_scale),
+        re: bf_to_string(&next_re, digits),
+        im: bf_to_string(&next_im, digits),
+        scale: bf_to_string(&next_scale, digits),
     })
     .map_err(|err| JsValue::from_str(&err.to_string()))
 }

@@ -1,7 +1,5 @@
 import type {
   NeedReferenceMessage,
-  ReferenceHandle,
-  ReferenceSnapshot,
   RenderTileMessage,
   TileDoneMessage,
   TileWorkerInMessage,
@@ -21,7 +19,6 @@ export class TileWorkerPool {
   private readonly idle: Worker[] = [];
   private readonly queue: QueueItem[] = [];
   private readonly inFlight = new Map<Worker, QueueItem>();
-  private readonly workerCaches = new Map<Worker, WorkerReferenceCache>();
   private sequence = 0;
 
   constructor(
@@ -34,7 +31,6 @@ export class TileWorkerPool {
       worker.onerror = (event) => this.handleError(worker, new Error(event.message));
       this.workers.push(worker);
       this.idle.push(worker);
-      this.workerCaches.set(worker, { ids: new Map(), bytes: 0, sequence: 0 });
     }
   }
 
@@ -66,7 +62,6 @@ export class TileWorkerPool {
     this.queue.splice(0);
     this.inFlight.clear();
     this.idle.splice(0);
-    this.workerCaches.clear();
   }
 
   private pump(): void {
@@ -75,35 +70,8 @@ export class TileWorkerPool {
       const item = this.queue.shift();
       if (!worker || !item) break;
       this.inFlight.set(worker, item);
-      this.cacheReferences(worker, item.message);
-      worker.postMessage(toWorkerRenderMessage(item.message) satisfies TileWorkerInMessage);
+      worker.postMessage(item.message satisfies TileWorkerInMessage);
     }
-  }
-
-  private cacheReferences(worker: Worker, message: RenderTileMessage): void {
-    const cache = this.workerCaches.get(worker);
-    if (!cache) return;
-
-    const referencesToCache: ReferenceSnapshot[] = [];
-    const neededIds = new Set<string>();
-    for (const reference of message.references) {
-      neededIds.add(reference.id);
-      cache.sequence += 1;
-      const cached = cache.ids.get(reference.id);
-      if (cached) {
-        cached.lastUsed = cache.sequence;
-        continue;
-      }
-      if (!isReferenceSnapshot(reference)) continue;
-      const bytes = referenceBytes(reference);
-      cache.ids.set(reference.id, { bytes, lastUsed: cache.sequence });
-      cache.bytes += bytes;
-      referencesToCache.push(reference);
-    }
-
-    const dropped = trimWorkerCache(cache, neededIds);
-    if (dropped.length > 0) worker.postMessage({ type: "dropReferences", referenceIds: dropped } satisfies TileWorkerInMessage);
-    if (referencesToCache.length > 0) worker.postMessage({ type: "cacheReferences", references: referencesToCache } satisfies TileWorkerInMessage);
   }
 
   private handleMessage(worker: Worker, message: TileWorkerOutMessage): void {
@@ -131,14 +99,6 @@ export class TileWorkerPool {
   }
 }
 
-interface WorkerReferenceCache {
-  ids: Map<string, { bytes: number; lastUsed: number }>;
-  bytes: number;
-  sequence: number;
-}
-
-const WORKER_REFERENCE_CACHE_BYTES = 32 * 1024 * 1024;
-
 export function resolveWorkerCount(hardwareConcurrency = globalThis.navigator?.hardwareConcurrency ?? 4): number {
   return Math.max(1, Math.floor(hardwareConcurrency));
 }
@@ -146,45 +106,4 @@ export function resolveWorkerCount(hardwareConcurrency = globalThis.navigator?.h
 function defaultPriority(message: RenderTileMessage): number {
   if (message.renderMode === "preview") return 0;
   return message.refined ? 2 : 10;
-}
-
-function toWorkerRenderMessage(message: RenderTileMessage): RenderTileMessage {
-  return {
-    ...message,
-    references: message.references.map(toReferenceHandle)
-  };
-}
-
-function toReferenceHandle(reference: ReferenceHandle | ReferenceSnapshot): ReferenceHandle {
-  return {
-    id: reference.id,
-    screenX: reference.screenX,
-    screenY: reference.screenY,
-    escapedAt: reference.escapedAt,
-    precisionBits: reference.precisionBits,
-    maxIter: reference.maxIter
-  };
-}
-
-function trimWorkerCache(cache: WorkerReferenceCache, neededIds: Set<string>): string[] {
-  if (cache.bytes <= WORKER_REFERENCE_CACHE_BYTES) return [];
-  const dropped: string[] = [];
-  const candidates = [...cache.ids.entries()]
-    .filter(([id]) => !neededIds.has(id))
-    .sort((a, b) => a[1].lastUsed - b[1].lastUsed);
-  for (const [id, entry] of candidates) {
-    if (cache.bytes <= WORKER_REFERENCE_CACHE_BYTES) break;
-    cache.ids.delete(id);
-    cache.bytes -= entry.bytes;
-    dropped.push(id);
-  }
-  return dropped;
-}
-
-function referenceBytes(reference: ReferenceSnapshot): number {
-  return reference.orbitRe.byteLength + reference.orbitIm.byteLength;
-}
-
-function isReferenceSnapshot(reference: ReferenceHandle | ReferenceSnapshot): reference is ReferenceSnapshot {
-  return "orbitRe" in reference && "orbitIm" in reference;
 }

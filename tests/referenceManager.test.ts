@@ -103,8 +103,8 @@ describe("ReferenceManager", () => {
   it("caps reference worker count to a small CPU fraction", () => {
     expect(resolveReferenceWorkerCount(1)).toBe(1);
     expect(resolveReferenceWorkerCount(8)).toBe(2);
-    expect(resolveReferenceWorkerCount(16)).toBe(4);
-    expect(resolveReferenceWorkerCount(64)).toBe(4);
+    expect(resolveReferenceWorkerCount(16)).toBe(2);
+    expect(resolveReferenceWorkerCount(64)).toBe(2);
   });
 });
 

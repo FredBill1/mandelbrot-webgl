@@ -1,4 +1,4 @@
-import { buildSeriesPlan, evaluateSeries } from "../math/series";
+import { buildSeriesPlan, evaluateSeries, type Complex } from "../math/series";
 import type { ReferenceSnapshot, RenderTileMessage, TileDoneMessage, UnresolvedCluster } from "../types";
 
 interface PixelResult {
@@ -19,7 +19,6 @@ interface ReferenceContext {
   orbitRe: Float64Array;
   orbitIm: Float64Array;
   series: ReturnType<typeof buildSeriesPlan>;
-  bla: BlaTable | undefined;
 }
 
 interface PeriodicScratch {
@@ -27,18 +26,6 @@ interface PeriodicScratch {
   checkpointIm: Float64Array;
   checkpointIter: Int32Array;
 }
-
-interface BlaLevel {
-  skip: number;
-  ar: Float64Array;
-  ai: Float64Array;
-  br: Float64Array;
-  bi: Float64Array;
-  radius: Float64Array;
-  maxRefMag2: Float64Array;
-}
-
-type BlaTable = BlaLevel[];
 
 interface ClusterAccumulator {
   binX: number;
@@ -55,10 +42,7 @@ interface ClusterAccumulator {
 const MIN_PIXEL_SPAN_FOR_PERIODIC_INTERIOR = 1e-18;
 const REBASE_G = 1e-8;
 const MAX_REBASES_PER_PIXEL = 64;
-const MAX_BLA_TILE_RADIUS = 1e-3;
-const BLA_CACHE_LIMIT = 512;
-const BLA_EPSILON = 1e-5;
-const blaCache = new Map<string, BlaTable>();
+const SERIES_MAX_SKIP = 512;
 
 export function renderPerturbationTile(message: RenderTileMessage): TileDoneMessage {
   const started = performance.now();
@@ -67,16 +51,16 @@ export function renderPerturbationTile(message: RenderTileMessage): TileDoneMess
   const width = Math.max(1, Math.ceil(tile.rect.width / sampleStep));
   const height = Math.max(1, Math.ceil(tile.rect.height / sampleStep));
   const rgba = new Uint8ClampedArray(width * height * 4);
-  const contexts = message.references.filter(isReferenceSnapshot).map((reference) => {
+  const contexts = message.references.map((reference) => {
     const orbitRe = asFloat64(reference.orbitRe);
     const orbitIm = asFloat64(reference.orbitIm);
     const radius = tileRadius(tile.rect, reference, pixelSpan);
+    const probes = tileProbeOffsets(tile.rect, reference, pixelSpan);
     return {
       reference,
       orbitRe,
       orbitIm,
-      series: buildSeriesPlan(orbitRe, orbitIm, seriesDegree, 64, radius),
-      bla: getBlaTable(reference.id, orbitRe, orbitIm, radius)
+      series: buildSeriesPlan(orbitRe, orbitIm, seriesDegree, SERIES_MAX_SKIP, radius, probes)
     } satisfies ReferenceContext;
   });
   const scratch: PeriodicScratch = {
@@ -187,7 +171,6 @@ function renderPixelWithReferences(
       context.orbitIm,
       maxIter,
       context.series,
-      context.bla,
       pixelSpan >= MIN_PIXEL_SPAN_FOR_PERIODIC_INTERIOR,
       scratch
     );
@@ -224,7 +207,6 @@ function perturb(
   orbitIm: Float64Array,
   maxIter: number,
   series: ReturnType<typeof buildSeriesPlan>,
-  bla: BlaTable | undefined,
   allowPeriodicInterior: boolean,
   scratch: PeriodicScratch
 ): PixelResult {
@@ -314,17 +296,6 @@ function perturb(
 
     if (refIndex === limit) break;
 
-    const blaStep = tryBlaStep(bla, refIndex, dzRe, dzIm, cRe, cIm, limit);
-    if (blaStep) {
-      dzRe = blaStep.dzRe;
-      dzIm = blaStep.dzIm;
-      iter += blaStep.skip;
-      refIndex += blaStep.skip;
-      blaSkipCount += Math.max(0, blaStep.skip - 1);
-      blaStepCount += 1;
-      continue;
-    }
-
     const dz2Re = dzRe * dzRe - dzIm * dzIm;
     const dz2Im = 2 * dzRe * dzIm;
     const twoRefDzRe = 2 * (stepRefRe * dzRe - stepRefIm * dzIm);
@@ -371,113 +342,6 @@ function failureResult(
   blaStepCount: number
 ): PixelResult {
   return { iter, mag2, glitch, unresolved: true, survivedIter, periodicInterior: false, rebaseCount, rebaseLimit, blaSkipCount, blaStepCount };
-}
-
-function getBlaTable(referenceId: string, orbitRe: Float64Array, orbitIm: Float64Array, tileRadiusValue: number): BlaTable | undefined {
-  if (!Number.isFinite(tileRadiusValue) || tileRadiusValue <= 0 || tileRadiusValue > MAX_BLA_TILE_RADIUS || orbitRe.length < 3) {
-    return undefined;
-  }
-  const radiusBucket = Math.ceil(Math.log2(1 / Math.max(tileRadiusValue, 1e-300)));
-  const key = `${referenceId}:${radiusBucket}`;
-  const cached = blaCache.get(key);
-  if (cached) return cached;
-
-  const baseLength = Math.max(0, Math.min(orbitRe.length, orbitIm.length) - 1);
-  const base = createBlaLevel(1, baseLength);
-  const cBudget = Math.max(tileRadiusValue, 1e-300);
-  for (let index = 0; index < baseLength; index += 1) {
-    const zr = orbitRe[index] ?? 0;
-    const zi = orbitIm[index] ?? 0;
-    const absZ = Math.hypot(zr, zi);
-    const absA = 2 * absZ;
-    base.ar[index] = 2 * zr;
-    base.ai[index] = 2 * zi;
-    base.br[index] = 1;
-    base.bi[index] = 0;
-    base.radius[index] = Math.max(0, (BLA_EPSILON * Math.max(0, absZ * 0.5 - cBudget)) / (absA + 1));
-    base.maxRefMag2[index] = zr * zr + zi * zi;
-  }
-
-  const table: BlaTable = [base];
-  while (table.length < 10) {
-    const previous = table[table.length - 1];
-    const length = previous.ar.length - previous.skip;
-    if (length <= 0) break;
-    const next = createBlaLevel(previous.skip * 2, length);
-    for (let index = 0; index < length; index += 1) {
-      const secondIndex = index + previous.skip;
-      const a1r = previous.ar[index];
-      const a1i = previous.ai[index];
-      const b1r = previous.br[index];
-      const b1i = previous.bi[index];
-      const a2r = previous.ar[secondIndex];
-      const a2i = previous.ai[secondIndex];
-      const b2r = previous.br[secondIndex];
-      const b2i = previous.bi[secondIndex];
-
-      next.ar[index] = a2r * a1r - a2i * a1i;
-      next.ai[index] = a2r * a1i + a2i * a1r;
-      next.br[index] = a2r * b1r - a2i * b1i + b2r;
-      next.bi[index] = a2r * b1i + a2i * b1r + b2i;
-      const absAx = Math.hypot(a1r, a1i);
-      const absBx = Math.hypot(b1r, b1i);
-      const transportedRadius = (previous.radius[secondIndex] - absBx * cBudget) / Math.max(absAx, 1e-300);
-      next.radius[index] = Math.max(0, Math.min(previous.radius[index], transportedRadius));
-      next.maxRefMag2[index] = Math.max(previous.maxRefMag2[index], previous.maxRefMag2[secondIndex]);
-    }
-    table.push(next);
-  }
-
-  blaCache.set(key, table);
-  while (blaCache.size > BLA_CACHE_LIMIT) {
-    const first = blaCache.keys().next().value;
-    if (!first) break;
-    blaCache.delete(first);
-  }
-  return table;
-}
-
-function createBlaLevel(skip: number, length: number): BlaLevel {
-  return {
-    skip,
-    ar: new Float64Array(length),
-    ai: new Float64Array(length),
-    br: new Float64Array(length),
-    bi: new Float64Array(length),
-    radius: new Float64Array(length),
-    maxRefMag2: new Float64Array(length)
-  };
-}
-
-function tryBlaStep(
-  table: BlaTable | undefined,
-  refIndex: number,
-  dzRe: number,
-  dzIm: number,
-  cRe: number,
-  cIm: number,
-  limit: number
-): { dzRe: number; dzIm: number; skip: number } | undefined {
-  if (!table) return undefined;
-  const dzMag2 = dzRe * dzRe + dzIm * dzIm;
-  for (let levelIndex = table.length - 1; levelIndex >= 0; levelIndex -= 1) {
-    const level = table[levelIndex];
-    if (level.skip <= 1) continue;
-    if (refIndex + level.skip > limit || refIndex >= level.ar.length) continue;
-    const radius = level.radius[refIndex];
-    if (radius <= 0 || dzMag2 > radius * radius) continue;
-    if (level.maxRefMag2[refIndex] > 3.25) continue;
-    const ar = level.ar[refIndex];
-    const ai = level.ai[refIndex];
-    const br = level.br[refIndex];
-    const bi = level.bi[refIndex];
-    return {
-      dzRe: ar * dzRe - ai * dzIm + br * cRe - bi * cIm,
-      dzIm: ar * dzIm + ai * dzRe + br * cIm + bi * cRe,
-      skip: level.skip
-    };
-  }
-  return undefined;
 }
 
 function createClusterAccumulators(rect: { x: number; y: number; width: number; height: number }): ClusterAccumulator[] {
@@ -623,6 +487,29 @@ function tileRadius(rect: { x: number; y: number; width: number; height: number 
   return radius;
 }
 
+function tileProbeOffsets(rect: { x: number; y: number; width: number; height: number }, reference: ReferenceSnapshot, pixelSpan: number): Complex[] {
+  const minX = rect.x + 0.5;
+  const maxX = rect.x + Math.max(0.5, rect.width - 0.5);
+  const minY = rect.y + 0.5;
+  const maxY = rect.y + Math.max(0.5, rect.height - 0.5);
+  const midX = rect.x + rect.width * 0.5;
+  const midY = rect.y + rect.height * 0.5;
+  return [
+    [midX, midY],
+    [minX, minY],
+    [maxX, minY],
+    [minX, maxY],
+    [maxX, maxY],
+    [midX, minY],
+    [midX, maxY],
+    [minX, midY],
+    [maxX, midY]
+  ].map(([screenX, screenY]) => ({
+    re: (screenX - reference.screenX) * pixelSpan,
+    im: (screenY - reference.screenY) * pixelSpan
+  }));
+}
+
 function colorPixel(buffer: Uint8ClampedArray, offset: number, iter: number, maxIter: number, mag2: number): void {
   if (iter >= maxIter) {
     buffer[offset] = 2;
@@ -643,13 +530,4 @@ function colorPixel(buffer: Uint8ClampedArray, offset: number, iter: number, max
 
 function asFloat64(value: Float64Array | ArrayLike<number>): Float64Array {
   return value instanceof Float64Array ? value : Float64Array.from(value);
-}
-
-function isReferenceSnapshot(reference: unknown): reference is ReferenceSnapshot {
-  return (
-    typeof reference === "object" &&
-    reference !== null &&
-    "orbitRe" in reference &&
-    "orbitIm" in reference
-  );
 }

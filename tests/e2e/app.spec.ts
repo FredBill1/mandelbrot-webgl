@@ -37,7 +37,11 @@ const REFERENCE_EXPLOSION_REGRESSION_URL =
   "/?re=-1.4844984007770583397190828833694392678094050320358041080022085134265597136975238e0&im=-1.1888756927003972876725424636547540252174013462943168696052865147067734469300689e-5&scale=5.4036493724669001296700958127360151018828249203074393236865719904836523640593173e5&iter=879";
 const SHALLOW_REFERENCE_PRESSURE_URL =
   "/?re=-7.555285830155848864404330289173214045991921102938369079173868192729048678452592e-1&im=-1.1299255326048044095654679100367577109576335059729038978640756697388655423467892e-1&scale=4.2521082000062727600593870163935622685108740541205488909679304242435828818426798e1&iter=617";
-const UNSAFE_BLA_TILE_REGRESSIONS = [
+const DEEP_PRECISION_TILE_ALIGNMENT_URL =
+  "/?re=-7.4688394343169276054191953271440985923260663988633375070109254116564380822428781e-1&im=-1.0052598241121587675259369892011437164151107429135698306788524375078819321907888e-1&scale=3.1649373179255141123643235951764328734858585667107715296013629081580305459152227e79&iter=5601";
+const DEEP_MEMORY_REGRESSION_URL =
+  "/?re=-7.4688394343169276054191953271440985923260663988633375070109254116564380822428796e-1&im=-1.0052598241121587675259369892011437164151107429135698306788524375078819321907893e-1&scale=2.1270123524035260478728648392445123424166443778810410355510198092432642054827677e78&iter=5525";
+const UNSAFE_ACCELERATION_TILE_REGRESSIONS = [
   {
     url:
       "/?re=-7.4966934496787838098731959297327082792276256276453894183802736415249648212435748e-1&im=-3.6835970065942988109940808475490090964316091450085844904438388017995897542104474e-2&scale=6.3270229281225222636256752583925066391594865119590585837604607679616921758554968e2&iter=692",
@@ -182,11 +186,11 @@ test("keeps early-escape reference pressure bounded on the shallow 120-tile view
   expect(stableMs).toBeLessThan(20_000);
 });
 
-test("does not render unsafe BLA tiles on the reported medium-zoom views", async ({ page }) => {
+test("does not render unsafe accelerated tiles on the reported medium-zoom views", async ({ page }) => {
   test.setTimeout(140_000);
   await page.setViewportSize({ width: 1912, height: 948 });
 
-  for (const view of UNSAFE_BLA_TILE_REGRESSIONS) {
+  for (const view of UNSAFE_ACCELERATION_TILE_REGRESSIONS) {
     await page.goto(view.url);
     await waitForNonBlankCanvas(page, 75_000);
     const tileCounts = await readTileCounts(page);
@@ -196,6 +200,38 @@ test("does not render unsafe BLA tiles on the reported medium-zoom views", async
     expect(pixel[3]).toBe(255);
     expect(pixel[0] + pixel[1] + pixel[2]).toBeLessThan(30);
   }
+});
+
+test("keeps e79 deep zoom tiles aligned and avoids ArrayBuffer allocation failures", async ({ page }) => {
+  test.setTimeout(180_000);
+  await page.setViewportSize({ width: 1912, height: 948 });
+  const pageErrors: string[] = [];
+  page.on("pageerror", (error) => pageErrors.push(error.message));
+
+  await page.goto(DEEP_PRECISION_TILE_ALIGNMENT_URL);
+  await waitForNonBlankCanvas(page, 90_000);
+  let tileCounts = await readTileCounts(page);
+  expect(tileCounts.completed).toBe(tileCounts.total);
+  expect(await page.locator("#readStatus").textContent()).not.toContain("Array buffer allocation failed");
+  expect(pageErrors.join("\n")).not.toMatch(/Array buffer allocation failed/i);
+
+  const seamSamples = [
+    await readCanvasPixel(page, 1536 / 1912, 320 / 948),
+    await readCanvasPixel(page, 1537 / 1912, 320 / 948),
+    await readCanvasPixel(page, 1536 / 1912, 448 / 948),
+    await readCanvasPixel(page, 1537 / 1912, 448 / 948)
+  ];
+  for (const pixel of seamSamples) {
+    expect(pixel[3]).toBe(255);
+    expect(pixel[0] + pixel[1] + pixel[2]).toBeGreaterThan(30);
+  }
+
+  await page.goto(DEEP_MEMORY_REGRESSION_URL);
+  await waitForNonBlankCanvas(page, 90_000);
+  tileCounts = await readTileCounts(page);
+  expect(tileCounts.completed).toBe(tileCounts.total);
+  expect(await page.locator("#readStatus").textContent()).not.toContain("Array buffer allocation failed");
+  expect(pageErrors.join("\n")).not.toMatch(/Array buffer allocation failed/i);
 });
 
 async function waitForNonBlankCanvas(page: import("@playwright/test").Page, timeout = 15_000): Promise<void> {
