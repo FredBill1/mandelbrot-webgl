@@ -9,6 +9,8 @@
     "dev": "vite --host 127.0.0.1",
     "prebuild": "npm run build:wasm",
     "build": "tsc -b && vite build",
+    "prebench:reference": "npm run build:wasm",
+    "bench:reference": "node scripts/bench-reference.mjs",
     "preview": "vite preview --host 127.0.0.1",
     "pretest": "npm run build:wasm",
     "test": "vitest run",

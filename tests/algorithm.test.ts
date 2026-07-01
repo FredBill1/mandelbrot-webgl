@@ -1,6 +1,6 @@
 import { beforeAll, describe, expect, it } from "vitest";
 import { readFileSync } from "node:fs";
-import init, { apply_view_transform, compute_reference, direct_escape } from "../src/wasm/pkg/mandelbrot_wasm";
+import init, { apply_view_transform, compute_reference, compute_reference_3mul, compute_reference_sparse, direct_escape } from "../src/wasm/pkg/mandelbrot_wasm";
 import { createVisibleTileShells } from "../src/tiles/tileKey";
 import { renderPerturbationTile } from "../src/workers/perturbation";
 import type { ReferenceSnapshot, RenderTileMessage, TileDescriptor } from "../src/types";
@@ -11,6 +11,40 @@ beforeAll(async () => {
 });
 
 describe("perturbation renderer", () => {
+  it.each([
+    ["shallow", "3e-1", "5e-1", 128, 128],
+    ["1e100", "-7.43643887037158704752191506114774e-1", "1.31825904205311970493132056385139e-1", 512, 512],
+    [
+      "e79",
+      "-7.4688394343169276054191953271440985923260663988633375070109254116564380822428781e-1",
+      "-1.0052598241121587675259369892011437164151107429135698306788524375078819321907888e-1",
+      5601,
+      768
+    ],
+    [
+      "false disk",
+      "4.3792424135946285718646361930043170565329095266291420488816260206742136590487596e-1",
+      "3.4189208433811610894511184773165189135789717878674952119590075744029026125433273e-1",
+      2243,
+      4096
+    ]
+  ])("2-mul sparse reference matches 3-mul escape for %s", (_name, re, im, maxIter, precisionBits) => {
+    const baseline = compute_reference_3mul(re, im, maxIter, precisionBits) as RawReference;
+    for (const interval of [8, 16, 32]) {
+      const sparse = compute_reference_sparse(re, im, maxIter, precisionBits, interval) as RawReference;
+      expect(sparse.escaped_at).toBe(baseline.escaped_at);
+      expect(sparse.orbit_re.length).toBe(Math.min(maxIter, sparse.escaped_at) + 1);
+      expect(sparse.orbit_im.length).toBe(sparse.orbit_re.length);
+    }
+  });
+
+  it("returns reference orbit arrays as Float64Array", () => {
+    const raw = compute_reference("3e-1", "5e-1", 64, 128) as RawReference;
+    expect(raw.orbit_re).toBeInstanceOf(Float64Array);
+    expect(raw.orbit_im).toBeInstanceOf(Float64Array);
+    expect(raw.orbit_re.length).toBe(raw.escaped_at + 1);
+  });
+
   it("keeps e79 adjacent pixels and tile centers distinct after WASM decimal serialization", () => {
     const view = {
       re: "-7.4688394343169276054191953271440985923260663988633375070109254116564380822428781e-1",
@@ -434,14 +468,7 @@ describe("perturbation renderer", () => {
 });
 
 function makeReference(re: string, im: string, maxIter: number, precisionBits: number, screenX = 0.5, screenY = 0.5): ReferenceSnapshot {
-  const raw = compute_reference(re, im, maxIter, precisionBits) as {
-    center_re: string;
-    center_im: string;
-    precision_bits: number;
-    escaped_at: number;
-    orbit_re: number[];
-    orbit_im: number[];
-  };
+  const raw = compute_reference(re, im, maxIter, precisionBits) as RawReference;
   return {
     id: "test-ref",
     centerRe: raw.center_re,
@@ -452,9 +479,18 @@ function makeReference(re: string, im: string, maxIter: number, precisionBits: n
     escapedAt: raw.escaped_at,
     maxIter,
     revision: 1,
-    orbitRe: new Float64Array(raw.orbit_re),
-    orbitIm: new Float64Array(raw.orbit_im)
+    orbitRe: raw.orbit_re instanceof Float64Array ? raw.orbit_re : new Float64Array(raw.orbit_re),
+    orbitIm: raw.orbit_im instanceof Float64Array ? raw.orbit_im : new Float64Array(raw.orbit_im)
   };
+}
+
+interface RawReference {
+  center_re: string;
+  center_im: string;
+  precision_bits: number;
+  escaped_at: number;
+  orbit_re: Float64Array | number[];
+  orbit_im: Float64Array | number[];
 }
 
 function renderSinglePixel(

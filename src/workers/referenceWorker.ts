@@ -23,11 +23,11 @@ self.onmessage = async (event: MessageEvent<ComputeReferenceIn>) => {
       center_im: string;
       precision_bits: number;
       escaped_at: number;
-      orbit_re: number[];
-      orbit_im: number[];
+      orbit_re: Float64Array | number[];
+      orbit_im: Float64Array | number[];
     };
-    const orbitRe = new Float64Array(raw.orbit_re);
-    const orbitIm = new Float64Array(raw.orbit_im);
+    const orbitRe = raw.orbit_re instanceof Float64Array ? raw.orbit_re : new Float64Array(raw.orbit_re);
+    const orbitIm = raw.orbit_im instanceof Float64Array ? raw.orbit_im : new Float64Array(raw.orbit_im);
     self.postMessage(
       {
         type: "referenceDone",
