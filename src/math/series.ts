@@ -137,11 +137,20 @@ function probesValidateSeriesStep(
     const dzMag2 = exactRe * exactRe + exactIm * exactIm;
     if (isCancellationGlitch(mag2, refMag2, dzMag2)) return false;
 
-    const estimate = evaluateSeries({ skip: n + 1, degree: coeffRe.length - 1, coeffRe, coeffIm }, cRe, cIm);
-    if (!Number.isFinite(estimate.re) || !Number.isFinite(estimate.im)) return false;
-    const error = Math.hypot(exactRe - estimate.re, exactIm - estimate.im);
+    let estimateZr = 0;
+    let estimateZi = 0;
+    for (let k = coeffRe.length - 1; k >= 1; k -= 1) {
+      const pr = estimateZr * cRe - estimateZi * cIm + coeffRe[k];
+      const pi = estimateZr * cIm + estimateZi * cRe + coeffIm[k];
+      estimateZr = pr;
+      estimateZi = pi;
+    }
+    const estimateRe = estimateZr * cRe - estimateZi * cIm;
+    const estimateIm = estimateZr * cIm + estimateZi * cRe;
+    if (!Number.isFinite(estimateRe) || !Number.isFinite(estimateIm)) return false;
+    const error = Math.hypot(exactRe - estimateRe, exactIm - estimateIm);
     const exactMag = Math.hypot(exactRe, exactIm);
-    const estimateMag = Math.hypot(estimate.re, estimate.im);
+    const estimateMag = Math.hypot(estimateRe, estimateIm);
     const allowed = SERIES_ERROR_SCALE * Math.max(tileRadius, exactMag, estimateMag, Number.MIN_VALUE);
     if (!Number.isFinite(error) || error > allowed) return false;
 

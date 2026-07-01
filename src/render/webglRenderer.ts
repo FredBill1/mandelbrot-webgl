@@ -146,7 +146,9 @@ export class WebglTileRenderer {
     const retained = this.tiles()
       .filter((tile) => tile.revision < this.activeRevision)
       .sort((a, b) => a.revision - b.revision);
-    const active = this.tiles().filter((tile) => tile.revision === this.activeRevision);
+    const active = this.tiles()
+      .filter((tile) => tile.revision === this.activeRevision)
+      .sort((a, b) => tileArea(b) - tileArea(a));
     for (const tile of retained) this.drawTile(tile, this.retainedTransforms.get(tile.revision) ?? identityTransform());
     for (const tile of active) this.drawTile(tile, identityTransform());
   }
@@ -232,6 +234,10 @@ function transformRect(rect: Rect, transform: Transform): Rect {
     width: rect.width * transform.scale,
     height: rect.height * transform.scale
   };
+}
+
+function tileArea(tile: RenderTexture): number {
+  return tile.rect.width * tile.rect.height;
 }
 
 const vertexSource = `#version 300 es

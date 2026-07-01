@@ -11,6 +11,8 @@
     "build": "tsc -b && vite build",
     "prebench:reference": "npm run build:wasm",
     "bench:reference": "node scripts/bench-reference.mjs",
+    "prebench:deep-view": "npm run build",
+    "bench:deep-view": "node scripts/bench-deep-view.mjs",
     "preview": "vite preview --host 127.0.0.1",
     "pretest": "npm run build:wasm",
     "test": "vitest run",

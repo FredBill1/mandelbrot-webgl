@@ -14,17 +14,30 @@ interface PixelResult {
   blaStepCount: number;
 }
 
+interface PixelSelection {
+  result: PixelResult;
+  referenceIndex: number;
+  skip: number;
+}
+
 interface ReferenceContext {
   reference: ReferenceSnapshot;
+  screenX: number;
+  screenY: number;
   orbitRe: Float64Array;
   orbitIm: Float64Array;
-  series: ReturnType<typeof buildSeriesPlan>;
+  radius: number;
+  probes: Complex[];
+  series: ReturnType<typeof buildSeriesPlan> | undefined;
 }
 
 interface PeriodicScratch {
   checkpointRe: Float64Array;
   checkpointIm: Float64Array;
   checkpointIter: Int32Array;
+  pixelResult: PixelResult;
+  bestResult: PixelResult;
+  selection: PixelSelection;
 }
 
 interface ClusterAccumulator {
@@ -60,16 +73,20 @@ interface BoundaryStats {
 const MIN_PIXEL_SPAN_FOR_PERIODIC_INTERIOR = 1e-18;
 const REBASE_G = 1e-8;
 const MAX_REBASES_PER_PIXEL = 64;
-const SERIES_MAX_SKIP = 512;
+const SERIES_MAX_SKIP = 4096;
 const SMOOTH_DELTA_LOW = 6;
 const SMOOTH_DELTA_HIGH = 24;
 const CLASSIFICATION_EDGE_BOOST = 0.35;
 const AA_EDGE_THRESHOLD = 0.45;
-const AA_PIXEL_CAP = 1024;
-const AA_PIXEL_FRACTION = 0.08;
-const AA_FOUR_SAMPLE_CAP = 256;
-const AA_FOUR_SAMPLE_FRACTION = 0.02;
+const AA_PIXEL_CAP = 128;
+const AA_PIXEL_FRACTION = 0.01;
+const AA_FOUR_SAMPLE_CAP = 32;
+const AA_FOUR_SAMPLE_FRACTION = 0.0025;
 const MIN_EDGE_CHROMA_SCALE = 0.35;
+const PALETTE_SIZE = 2048;
+const COSINE_PALETTE = createCosinePalette(PALETTE_SIZE);
+const INV_LN2 = 1 / Math.LN2;
+const SMOOTH_LOG_SCALE = 0.5 * INV_LN2;
 const TWO_SAMPLE_OFFSETS = [
   [-0.25, -0.25],
   [0.25, 0.25]
@@ -95,15 +112,22 @@ export function renderPerturbationTile(message: RenderTileMessage): TileDoneMess
     const probes = tileProbeOffsets(tile.rect, reference, pixelSpan);
     return {
       reference,
+      screenX: reference.screenX,
+      screenY: reference.screenY,
       orbitRe,
       orbitIm,
-      series: buildSeriesPlan(orbitRe, orbitIm, seriesDegree, SERIES_MAX_SKIP, radius, probes)
+      radius,
+      probes,
+      series: undefined
     } satisfies ReferenceContext;
   });
   const scratch: PeriodicScratch = {
     checkpointRe: new Float64Array(32),
     checkpointIm: new Float64Array(32),
-    checkpointIter: new Int32Array(32)
+    checkpointIter: new Int32Array(32),
+    pixelResult: createPixelResult(),
+    bestResult: createPixelResult(),
+    selection: { result: createPixelResult(), referenceIndex: -1, skip: 0 }
   };
 
   let glitchCount = 0;
@@ -117,18 +141,26 @@ export function renderPerturbationTile(message: RenderTileMessage): TileDoneMess
   let unresolvedScreenXSum = 0;
   let unresolvedScreenYSum = 0;
   let seriesSkip = 0;
-  const usedReferenceIds = new Set<string>();
+  const usedReferenceIndices = new Uint8Array(contexts.length);
   const clusters = createClusterAccumulators(tile.rect);
   const unresolvedMask = new Uint8Array(width * height);
-  const escapedMask = new Uint8Array(width * height);
-  const smoothValues = new Float32Array(width * height);
+  const escapedMask = message.renderMode === "final" ? new Uint8Array(width * height) : undefined;
+  const smoothValues = message.renderMode === "final" ? new Float32Array(width * height) : undefined;
+  const screenXs = new Float64Array(width);
+  const screenYs = new Float64Array(height);
+  for (let px = 0; px < width; px += 1) {
+    screenXs[px] = Math.min(tile.rect.x + tile.rect.width - 0.5, tile.rect.x + (px + 0.5) * sampleStep);
+  }
+  for (let py = 0; py < height; py += 1) {
+    screenYs[py] = Math.min(tile.rect.y + tile.rect.height - 0.5, tile.rect.y + (py + 0.5) * sampleStep);
+  }
 
   for (let py = 0; py < height; py += 1) {
+    const screenY = screenYs[py];
     for (let px = 0; px < width; px += 1) {
       const pixelIndex = py * width + px;
-      const screenX = Math.min(tile.rect.x + tile.rect.width - 0.5, tile.rect.x + (px + 0.5) * sampleStep);
-      const screenY = Math.min(tile.rect.y + tile.rect.height - 0.5, tile.rect.y + (py + 0.5) * sampleStep);
-      const { result, referenceId, skip } = renderPixelWithReferences(screenX, screenY, pixelSpan, maxIter, contexts, scratch);
+      const screenX = screenXs[px];
+      const { result, referenceIndex, skip } = renderPixelWithReferences(screenX, screenY, pixelSpan, maxIter, seriesDegree, contexts, scratch);
       const offset = pixelIndex * 4;
       if (result.iter < maxIter) escapedPixels += 1;
       if (result.periodicInterior) periodicInteriorCount += 1;
@@ -137,7 +169,7 @@ export function renderPerturbationTile(message: RenderTileMessage): TileDoneMess
       blaSkipCount += result.blaSkipCount;
       blaStepCount += result.blaStepCount;
       if (result.glitch) glitchCount += 1;
-      if (referenceId) usedReferenceIds.add(referenceId);
+      if (referenceIndex >= 0) usedReferenceIndices[referenceIndex] = 1;
       seriesSkip = Math.max(seriesSkip, skip);
       if (result.unresolved) {
         unresolvedCount += 1;
@@ -146,15 +178,16 @@ export function renderPerturbationTile(message: RenderTileMessage): TileDoneMess
         unresolvedMask[pixelIndex] = 1;
         recordUnresolvedCluster(clusters, tile.rect, screenX, screenY, result.survivedIter);
       } else if (result.iter < maxIter) {
-        escapedMask[pixelIndex] = 1;
+        if (escapedMask) escapedMask[pixelIndex] = 1;
       }
-      smoothValues[pixelIndex] = smoothIteration(result.iter, maxIter, result.mag2);
-      writeColor(rgba, offset, colorForResult(result.iter, maxIter, result.mag2));
+      const smooth = smoothIteration(result.iter, maxIter, result.mag2);
+      if (smoothValues) smoothValues[pixelIndex] = smooth;
+      writeColorForSmooth(rgba, offset, result.iter >= maxIter, smooth);
     }
   }
 
-  const boundaryStats = message.renderMode === "final"
-    ? applyBoundarySmoothing(rgba, smoothValues, escapedMask, unresolvedMask, width, height, tile.rect, pixelSpan, maxIter, contexts, scratch)
+  const boundaryStats = message.renderMode === "final" && unresolvedCount === 0
+    ? applyBoundarySmoothing(rgba, smoothValues!, escapedMask!, unresolvedMask, width, height, tile.rect, pixelSpan, maxIter, seriesDegree, contexts, scratch)
     : emptyBoundaryStats();
 
   if (unresolvedCount > 0) fillUnresolvedPreview(rgba, unresolvedMask, width, height);
@@ -162,7 +195,10 @@ export function renderPerturbationTile(message: RenderTileMessage): TileDoneMess
   const unresolvedScreenX = unresolvedCount > 0 ? unresolvedScreenXSum / unresolvedCount : undefined;
   const unresolvedScreenY = unresolvedCount > 0 ? unresolvedScreenYSum / unresolvedCount : undefined;
   const unresolvedClusters = buildUnresolvedClusters(clusters, tile.rect);
-  const referenceIdsUsed = [...usedReferenceIds];
+  const referenceIdsUsed: string[] = [];
+  for (let index = 0; index < usedReferenceIndices.length; index += 1) {
+    if (usedReferenceIndices[index] !== 0) referenceIdsUsed.push(contexts[index].reference.id);
+  }
 
   return {
     type: "tileDone",
@@ -205,50 +241,89 @@ function renderPixelWithReferences(
   screenY: number,
   pixelSpan: number,
   maxIter: number,
+  seriesDegree: number,
   contexts: ReferenceContext[],
   scratch: PeriodicScratch
-): { result: PixelResult; referenceId: string | undefined; skip: number } {
-  let bestUnresolved: PixelResult | undefined;
-  let bestUnresolvedReferenceId: string | undefined;
+): PixelSelection {
+  const selection = scratch.selection;
+  selection.referenceIndex = -1;
+  selection.skip = 0;
+  selection.result = scratch.pixelResult;
+  let hasBestUnresolved = false;
+  let bestUnresolvedReferenceIndex = -1;
   let maxSkip = 0;
+  const allowPeriodicInterior = pixelSpan >= MIN_PIXEL_SPAN_FOR_PERIODIC_INTERIOR;
 
-  for (const context of contexts) {
-    const cRe = (screenX - context.reference.screenX) * pixelSpan;
-    const cIm = (screenY - context.reference.screenY) * pixelSpan;
+  for (let index = 0; index < contexts.length; index += 1) {
+    const context = contexts[index];
+    const cRe = (screenX - context.screenX) * pixelSpan;
+    const cIm = (screenY - context.screenY) * pixelSpan;
+    const series = seriesForContext(context, seriesDegree);
     const result = perturb(
       cRe,
       cIm,
       context.orbitRe,
       context.orbitIm,
       maxIter,
-      context.series,
-      pixelSpan >= MIN_PIXEL_SPAN_FOR_PERIODIC_INTERIOR,
-      scratch
+      series,
+      allowPeriodicInterior,
+      scratch,
+      scratch.pixelResult
     );
-    maxSkip = Math.max(maxSkip, context.series.skip);
-    if (!result.unresolved) return { result, referenceId: context.reference.id, skip: maxSkip };
-    if (!bestUnresolved || result.survivedIter > bestUnresolved.survivedIter) {
-      bestUnresolved = result;
-      bestUnresolvedReferenceId = context.reference.id;
+    maxSkip = Math.max(maxSkip, series.skip);
+    if (!result.unresolved) {
+      selection.result = result;
+      selection.referenceIndex = index;
+      selection.skip = maxSkip;
+      return selection;
+    }
+    if (!hasBestUnresolved || result.survivedIter > scratch.bestResult.survivedIter) {
+      copyPixelResult(result, scratch.bestResult);
+      hasBestUnresolved = true;
+      bestUnresolvedReferenceIndex = index;
     }
   }
 
+  if (!hasBestUnresolved) failureResult(scratch.bestResult, maxIter, 0, true, 0, 0, false, 0, 0);
+  selection.result = scratch.bestResult;
+  selection.referenceIndex = bestUnresolvedReferenceIndex;
+  selection.skip = maxSkip;
+  return selection;
+}
+
+function createPixelResult(): PixelResult {
   return {
-    result: bestUnresolved ?? {
-      iter: maxIter,
-      mag2: 0,
-      glitch: true,
-      unresolved: true,
-      survivedIter: 0,
-      periodicInterior: false,
-      rebaseCount: 0,
-      rebaseLimit: false,
-      blaSkipCount: 0,
-      blaStepCount: 0
-    },
-    referenceId: bestUnresolvedReferenceId,
-    skip: maxSkip
+    iter: 0,
+    mag2: 0,
+    glitch: false,
+    unresolved: false,
+    survivedIter: 0,
+    periodicInterior: false,
+    rebaseCount: 0,
+    rebaseLimit: false,
+    blaSkipCount: 0,
+    blaStepCount: 0
   };
+}
+
+function copyPixelResult(source: PixelResult, target: PixelResult): void {
+  target.iter = source.iter;
+  target.mag2 = source.mag2;
+  target.glitch = source.glitch;
+  target.unresolved = source.unresolved;
+  target.survivedIter = source.survivedIter;
+  target.periodicInterior = source.periodicInterior;
+  target.rebaseCount = source.rebaseCount;
+  target.rebaseLimit = source.rebaseLimit;
+  target.blaSkipCount = source.blaSkipCount;
+  target.blaStepCount = source.blaStepCount;
+}
+
+function seriesForContext(context: ReferenceContext, seriesDegree: number): ReturnType<typeof buildSeriesPlan> {
+  if (!context.series) {
+    context.series = buildSeriesPlan(context.orbitRe, context.orbitIm, seriesDegree, SERIES_MAX_SKIP, context.radius, context.probes);
+  }
+  return context.series;
 }
 
 function perturb(
@@ -259,7 +334,8 @@ function perturb(
   maxIter: number,
   series: ReturnType<typeof buildSeriesPlan>,
   allowPeriodicInterior: boolean,
-  scratch: PeriodicScratch
+  scratch: PeriodicScratch,
+  output: PixelResult
 ): PixelResult {
   let dzRe = 0;
   let dzIm = 0;
@@ -287,7 +363,7 @@ function perturb(
 
   const limit = Math.min(maxIter, orbitRe.length - 1);
   if (limit < 0 || refIndex > limit) {
-    return failureResult(maxIter, mag2, true, Math.max(0, limit), rebaseCount, rebaseLimit, blaSkipCount, blaStepCount);
+    return failureResult(output, maxIter, mag2, true, Math.max(0, limit), rebaseCount, rebaseLimit, blaSkipCount, blaStepCount);
   }
 
   while (iter <= maxIter && refIndex <= limit) {
@@ -301,8 +377,8 @@ function perturb(
     const zRe = refRe + dzRe;
     const zIm = refIm + dzIm;
     mag2 = zRe * zRe + zIm * zIm;
-    if (mag2 > 4) return successResult(iter, mag2, glitch, false, rebaseCount, rebaseLimit, blaSkipCount, blaStepCount);
-    if (iter >= maxIter) return successResult(maxIter, mag2, false, false, rebaseCount, rebaseLimit, blaSkipCount, blaStepCount);
+    if (mag2 > 4) return successResult(output, iter, mag2, glitch, false, rebaseCount, rebaseLimit, blaSkipCount, blaStepCount);
+    if (iter >= maxIter) return successResult(output, maxIter, mag2, false, false, rebaseCount, rebaseLimit, blaSkipCount, blaStepCount);
 
     if (checkpointRe && checkpointIm && checkpointIter && iter > 32 && iter % 8 === 0) {
       const cycleTolerance = 1e-20 * Math.max(1, mag2);
@@ -312,7 +388,7 @@ function perturb(
         const cycleDeltaIm = zIm - checkpointIm[checkpoint];
         const cycleDelta2 = cycleDeltaRe * cycleDeltaRe + cycleDeltaIm * cycleDeltaIm;
         if (Number.isFinite(cycleDelta2) && cycleDelta2 < cycleTolerance) {
-          return successResult(maxIter, mag2, false, true, rebaseCount, rebaseLimit, blaSkipCount, blaStepCount);
+          return successResult(output, maxIter, mag2, false, true, rebaseCount, rebaseLimit, blaSkipCount, blaStepCount);
         }
       }
       checkpointRe[checkpointIndex] = zRe;
@@ -327,7 +403,13 @@ function perturb(
     let stepRefRe = refRe;
     let stepRefIm = refIm;
     let stepRefMag2 = refMag2;
-    if (shouldRebase(mag2, refMag2, refIndex)) {
+    if (
+      refIndex > 0 &&
+      Number.isFinite(mag2) &&
+      Number.isFinite(refMag2) &&
+      refMag2 > 1e-30 &&
+      mag2 < refMag2 * REBASE_G
+    ) {
       if (rebaseCount >= MAX_REBASES_PER_PIXEL) {
         glitch = true;
         rebaseLimit = true;
@@ -340,7 +422,12 @@ function perturb(
       stepRefIm = orbitIm[0] ?? 0;
       stepRefMag2 = stepRefRe * stepRefRe + stepRefIm * stepRefIm;
       rebaseCount += 1;
-    } else if (isCancellationGlitch(mag2, refMag2, dzMag2BeforeStep)) {
+    } else if (
+      !Number.isFinite(mag2) ||
+      !Number.isFinite(refMag2) ||
+      !Number.isFinite(dzMag2BeforeStep) ||
+      (refMag2 > 1e-30 && dzMag2BeforeStep > 1e-30 && dzMag2BeforeStep > refMag2 * 1e-4 && mag2 < refMag2 * 1e-20)
+    ) {
       glitch = true;
       break;
     }
@@ -364,12 +451,13 @@ function perturb(
   }
 
   if (glitch || iter < maxIter) {
-    return failureResult(maxIter, mag2, true, Math.min(iter, maxIter), rebaseCount, rebaseLimit, blaSkipCount, blaStepCount);
+    return failureResult(output, maxIter, mag2, true, Math.min(iter, maxIter), rebaseCount, rebaseLimit, blaSkipCount, blaStepCount);
   }
-  return successResult(maxIter, mag2, false, false, rebaseCount, rebaseLimit, blaSkipCount, blaStepCount);
+  return successResult(output, maxIter, mag2, false, false, rebaseCount, rebaseLimit, blaSkipCount, blaStepCount);
 }
 
 function successResult(
+  output: PixelResult,
   iter: number,
   mag2: number,
   glitch: boolean,
@@ -379,10 +467,21 @@ function successResult(
   blaSkipCount: number,
   blaStepCount: number
 ): PixelResult {
-  return { iter, mag2, glitch, unresolved: false, survivedIter: iter, periodicInterior, rebaseCount, rebaseLimit, blaSkipCount, blaStepCount };
+  output.iter = iter;
+  output.mag2 = mag2;
+  output.glitch = glitch;
+  output.unresolved = false;
+  output.survivedIter = iter;
+  output.periodicInterior = periodicInterior;
+  output.rebaseCount = rebaseCount;
+  output.rebaseLimit = rebaseLimit;
+  output.blaSkipCount = blaSkipCount;
+  output.blaStepCount = blaStepCount;
+  return output;
 }
 
 function failureResult(
+  output: PixelResult,
   iter: number,
   mag2: number,
   glitch: boolean,
@@ -392,7 +491,17 @@ function failureResult(
   blaSkipCount: number,
   blaStepCount: number
 ): PixelResult {
-  return { iter, mag2, glitch, unresolved: true, survivedIter, periodicInterior: false, rebaseCount, rebaseLimit, blaSkipCount, blaStepCount };
+  output.iter = iter;
+  output.mag2 = mag2;
+  output.glitch = glitch;
+  output.unresolved = true;
+  output.survivedIter = survivedIter;
+  output.periodicInterior = false;
+  output.rebaseCount = rebaseCount;
+  output.rebaseLimit = rebaseLimit;
+  output.blaSkipCount = blaSkipCount;
+  output.blaStepCount = blaStepCount;
+  return output;
 }
 
 function createClusterAccumulators(rect: { x: number; y: number; width: number; height: number }): ClusterAccumulator[] {
@@ -476,6 +585,7 @@ function applyBoundarySmoothing(
   rect: { x: number; y: number; width: number; height: number },
   pixelSpan: number,
   maxIter: number,
+  seriesDegree: number,
   contexts: ReferenceContext[],
   scratch: PeriodicScratch
 ): BoundaryStats {
@@ -512,7 +622,20 @@ function applyBoundarySmoothing(
       const screenX = Math.min(rect.x + rect.width - 0.5 * pixelStepX, rect.x + (x + 0.5) * pixelStepX);
       const screenY = Math.min(rect.y + rect.height - 0.5 * pixelStepY, rect.y + (y + 0.5) * pixelStepY);
       const offsets = candidateIndex < fourSampleLimit ? FOUR_SAMPLE_OFFSETS : TWO_SAMPLE_OFFSETS;
-      const sampleStats = supersamplePixel(buffer, candidate.index, screenX, screenY, pixelStepX, pixelStepY, offsets, pixelSpan, maxIter, contexts, scratch);
+      const sampleStats = supersamplePixel(
+        buffer,
+        candidate.index,
+        screenX,
+        screenY,
+        pixelStepX,
+        pixelStepY,
+        offsets,
+        pixelSpan,
+        maxIter,
+        seriesDegree,
+        contexts,
+        scratch
+      );
       aaPixelCount += 1;
       aaSampleCount += offsets.length;
       aaFallbackCount += sampleStats.fallbacks;
@@ -581,6 +704,7 @@ function supersamplePixel(
   offsets: readonly (readonly [number, number])[],
   pixelSpan: number,
   maxIter: number,
+  seriesDegree: number,
   contexts: ReferenceContext[],
   scratch: PeriodicScratch
 ): { fallbacks: number } {
@@ -596,6 +720,7 @@ function supersamplePixel(
       screenY + offsetY * pixelStepY,
       pixelSpan,
       maxIter,
+      seriesDegree,
       contexts,
       scratch
     );
@@ -667,18 +792,6 @@ function fillUnresolvedPreview(buffer: Uint8ClampedArray, unresolvedMask: Uint8A
   }
 }
 
-function isCancellationGlitch(mag2: number, refMag2: number, dzMag2: number): boolean {
-  if (!Number.isFinite(mag2) || !Number.isFinite(refMag2) || !Number.isFinite(dzMag2)) return true;
-  if (refMag2 <= 1e-30 || dzMag2 <= 1e-30) return false;
-  return dzMag2 > refMag2 * 1e-4 && mag2 < refMag2 * 1e-20;
-}
-
-function shouldRebase(mag2: number, refMag2: number, refIndex: number): boolean {
-  if (refIndex <= 0) return false;
-  if (!Number.isFinite(mag2) || !Number.isFinite(refMag2) || refMag2 <= 1e-30) return false;
-  return mag2 < refMag2 * REBASE_G;
-}
-
 function tileRadius(rect: { x: number; y: number; width: number; height: number }, reference: ReferenceSnapshot, pixelSpan: number): number {
   const corners = [
     [rect.x, rect.y],
@@ -718,22 +831,57 @@ function tileProbeOffsets(rect: { x: number; y: number; width: number; height: n
 
 function colorForResult(iter: number, maxIter: number, mag2: number): Color {
   if (iter >= maxIter) {
-    return { r: 2, g: 4, b: 8 };
+    return { r: 4, g: 8, b: 16 };
   }
 
   const smooth = smoothIteration(iter, maxIter, mag2);
-  const t = (smooth * 0.018) % 1;
-  const wave = (phase: number) => 0.5 + 0.5 * Math.cos(6.283185307179586 * (t + phase));
+  const index = paletteIndex(smooth);
+  const offset = index * 3;
   return {
-    r: Math.round(255 * Math.pow(wave(0.95), 1.4)),
-    g: Math.round(255 * Math.pow(wave(0.58), 1.1)),
-    b: Math.round(255 * Math.pow(wave(0.22), 0.9))
+    r: COSINE_PALETTE[offset],
+    g: COSINE_PALETTE[offset + 1],
+    b: COSINE_PALETTE[offset + 2]
   };
+}
+
+function writeColorForSmooth(buffer: Uint8ClampedArray, offset: number, interior: boolean, smooth: number): void {
+  if (interior) {
+    buffer[offset] = 4;
+    buffer[offset + 1] = 8;
+    buffer[offset + 2] = 16;
+    buffer[offset + 3] = 255;
+    return;
+  }
+
+  const paletteOffset = paletteIndex(smooth) * 3;
+  buffer[offset] = COSINE_PALETTE[paletteOffset];
+  buffer[offset + 1] = COSINE_PALETTE[paletteOffset + 1];
+  buffer[offset + 2] = COSINE_PALETTE[paletteOffset + 2];
+  buffer[offset + 3] = 255;
+}
+
+function createCosinePalette(size: number): Uint8Array {
+  const palette = new Uint8Array(size * 3);
+  for (let index = 0; index < size; index += 1) {
+    const t = index / size;
+    const wave = (phase: number) => 0.5 + 0.5 * Math.cos(6.283185307179586 * (t + phase));
+    const offset = index * 3;
+    palette[offset] = clampByte(Math.round(255 * Math.pow(wave(0.95), 1.4)));
+    palette[offset + 1] = clampByte(Math.round(255 * Math.pow(wave(0.58), 1.1)));
+    palette[offset + 2] = clampByte(Math.round(255 * Math.pow(wave(0.22), 0.9)));
+  }
+  return palette;
+}
+
+function paletteIndex(smooth: number): number {
+  const value = smooth * 0.018;
+  const fraction = value - Math.floor(value);
+  return Math.min(PALETTE_SIZE - 1, Math.max(0, Math.floor(fraction * PALETTE_SIZE)));
 }
 
 function smoothIteration(iter: number, maxIter: number, mag2: number): number {
   if (iter >= maxIter) return maxIter;
-  return iter + 1 - Math.log2(Math.max(1e-12, Math.log2(Math.max(2, Math.sqrt(mag2)))));
+  return iter + 1 - Math.log(Math.max(1e-12, Math.log(Math.max(4, mag2)) * SMOOTH_LOG_SCALE)) * INV_LN2;
 }
 
 function dampenChroma(color: Color, edgeStrength: number): Color {

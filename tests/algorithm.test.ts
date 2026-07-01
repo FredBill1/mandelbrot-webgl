@@ -3,7 +3,7 @@ import { readFileSync } from "node:fs";
 import init, { apply_view_transform, compute_reference, compute_reference_3mul, compute_reference_sparse, direct_escape } from "../src/wasm/pkg/mandelbrot_wasm";
 import { createVisibleTileShells } from "../src/tiles/tileKey";
 import { renderPerturbationTile } from "../src/workers/perturbation";
-import type { ReferenceSnapshot, RenderTileMessage, TileDescriptor } from "../src/types";
+import { SERIES_DEGREE, type ReferenceSnapshot, type RenderTileMessage, type TileDescriptor } from "../src/types";
 
 beforeAll(async () => {
   const wasm = readFileSync(new URL("../src/wasm/pkg/mandelbrot_wasm_bg.wasm", import.meta.url));
@@ -86,7 +86,7 @@ describe("perturbation renderer", () => {
       pixelSpan: 3.5 / Number(scale) || 3.5e-100,
       maxIter,
       references: [reference],
-      seriesDegree: 8,
+      seriesDegree: SERIES_DEGREE,
       paletteId: "cosine",
       refined: true,
       refinementLevel: 1,
@@ -136,6 +136,48 @@ describe("perturbation renderer", () => {
     expect(result.stats.unresolvedCount).toBe(1);
     expect(result.needsReference).toBe(true);
     expect(result.stats.escapedPixels).toBe(0);
+  });
+
+  it("skips final AA while a tile is still an unresolved refinement candidate", () => {
+    const view = {
+      re: "-7.549229970244027197908742917925261755751044636618703913223906199716382497449534e-1",
+      im: "5.320534885440088329282320858070240068704121711152834282354886837408395062921113e-2",
+      scale: "1.3394307643944097352319707599505029862713399693759721188427992474105938471591505e3",
+      maxIter: 713
+    };
+    const screen = { x: 1912 * 0.5, y: 948 * 0.15 };
+    const point = pointAtScreen(view, screen.x, screen.y);
+    const reference = makeReference(view.re, view.im, view.maxIter, 224, 1912 * 0.5, 948 * 0.5);
+    const tile: TileDescriptor = {
+      id: "unresolved-aa-skip",
+      key: { level: 0, x: 0, y: 0, span: 16 },
+      rect: { x: screen.x - 8, y: screen.y - 8, width: 16, height: 16 },
+      centerScreenX: screen.x,
+      centerScreenY: screen.y,
+      centerRe: point.re,
+      centerIm: point.im,
+      revision: 1
+    };
+
+    const result = renderPerturbationTile({
+      type: "renderTile",
+      tile,
+      canvasWidth: 1912,
+      canvasHeight: 948,
+      pixelSpan: pixelSpan(view.scale, 1912),
+      maxIter: view.maxIter,
+      references: [reference],
+      seriesDegree: SERIES_DEGREE,
+      paletteId: "cosine",
+      refined: false,
+      refinementLevel: 0,
+      renderMode: "final",
+      sampleStep: 1
+    });
+
+    expect(result.stats.unresolvedCount).toBeGreaterThan(0);
+    expect(result.stats.aaPixelCount).toBe(0);
+    expect(result.stats.aaSampleCount).toBe(0);
   });
 
   it("resolves the early-reference regression pixel after rebasing to that location", () => {
@@ -221,7 +263,7 @@ describe("perturbation renderer", () => {
       pixelSpan: pixelSpan(view.scale, 1170),
       maxIter: view.maxIter,
       references: [reference],
-      seriesDegree: 8,
+      seriesDegree: SERIES_DEGREE,
       paletteId: "cosine",
       refined: false,
       refinementLevel: 0,
@@ -267,7 +309,7 @@ describe("perturbation renderer", () => {
       pixelSpan: pixelSpan(view.scale, 1912),
       maxIter: view.maxIter,
       references: [reference],
-      seriesDegree: 8,
+      seriesDegree: SERIES_DEGREE,
       paletteId: "cosine",
       refined: true,
       refinementLevel: 1,
@@ -282,10 +324,59 @@ describe("perturbation renderer", () => {
     expect(final.stats.unresolvedCount).toBe(preview.stats.unresolvedCount);
     expect(preview.stats.boundaryDampenedCount).toBe(0);
     expect(preview.stats.aaPixelCount).toBe(0);
-    expect(final.stats.boundaryDampenedCount).toBeGreaterThan(0);
-    expect(final.stats.aaPixelCount).toBeGreaterThan(0);
-    expect(final.stats.aaPixelCount).toBeLessThanOrEqual(1024);
-    expect(final.stats.aaSampleCount).toBeLessThanOrEqual(2560);
+    if (final.stats.unresolvedCount > 0) {
+      expect(final.stats.boundaryDampenedCount).toBe(0);
+      expect(final.stats.aaPixelCount).toBe(0);
+      expect(final.stats.aaSampleCount).toBe(0);
+    } else {
+      expect(final.stats.boundaryDampenedCount).toBeGreaterThan(0);
+      expect(final.stats.aaPixelCount).toBeGreaterThan(0);
+      expect(final.stats.aaPixelCount).toBeLessThanOrEqual(1024);
+      expect(final.stats.aaSampleCount).toBeLessThanOrEqual(2560);
+    }
+  });
+
+  it("keeps boundary smoothing and AA for completed final tiles", () => {
+    const view = {
+      re: "-7.5e-1",
+      im: "1e-1",
+      scale: "1",
+      maxIter: 128
+    };
+    const tile: TileDescriptor = {
+      id: "completed-boundary",
+      key: { level: 0, x: 0, y: 0, span: 128 },
+      rect: { x: 896, y: 384, width: 128, height: 128 },
+      centerScreenX: 960,
+      centerScreenY: 448,
+      centerRe: view.re,
+      centerIm: view.im,
+      revision: 1
+    };
+    const tileCenter = highPrecisionPointAtScreen(view, tile.centerScreenX, tile.centerScreenY, 1912, 948);
+    const reference = makeReference(tileCenter.re, tileCenter.im, view.maxIter, 128, tile.centerScreenX, tile.centerScreenY);
+    const result = renderPerturbationTile({
+      type: "renderTile",
+      tile,
+      canvasWidth: 1912,
+      canvasHeight: 948,
+      pixelSpan: pixelSpan(view.scale, 1912),
+      maxIter: view.maxIter,
+      references: [reference],
+      seriesDegree: SERIES_DEGREE,
+      paletteId: "cosine",
+      refined: true,
+      refinementLevel: 1,
+      renderMode: "final",
+      sampleStep: 1
+    });
+
+    expect(result.stats.unresolvedCount).toBe(0);
+    expect(result.stats.escapedPixels).toBeGreaterThan(0);
+    expect(result.stats.escapedPixels).toBeLessThan(result.width * result.height);
+    expect(result.stats.boundaryDampenedCount).toBeGreaterThan(0);
+    expect(result.stats.aaPixelCount).toBeGreaterThan(0);
+    expect(result.stats.aaSampleCount).toBeLessThanOrEqual(2560);
   });
 
   it("resolves the 1912x948 deep interior sample without refinement", () => {
@@ -455,7 +546,7 @@ describe("perturbation renderer", () => {
     const point = highPrecisionPointAtScreen(view, x, y, 1912, 948);
     const direct = direct_escape(point.re, point.im, view.maxIter, precisionBits);
     const reference = makeReference(point.re, point.im, view.maxIter, precisionBits, x, y);
-    const seriesEnabled = renderSinglePixelWithReferences(view, point, x, y, [reference], 1, 8);
+    const seriesEnabled = renderSinglePixelWithReferences(view, point, x, y, [reference], 1, SERIES_DEGREE);
     const seriesDisabled = renderSinglePixelWithReferences(view, point, x, y, [reference], 1, 0);
     const escaped = direct < view.maxIter ? 1 : 0;
 
@@ -511,7 +602,7 @@ function renderSinglePixelWithReferences(
   screenY: number,
   references: ReferenceSnapshot[],
   refinementLevel: number,
-  seriesDegree = 8
+  seriesDegree = SERIES_DEGREE
 ) {
   const tile: TileDescriptor = {
     id: "sample-tile",

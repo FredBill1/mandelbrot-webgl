@@ -81,6 +81,10 @@ interface ReferenceBrokerEntry {
 }
 
 const MAX_RENDER_REFERENCES = 16;
+const PREVIEW_REFERENCE_LIMIT = 2;
+const PREVIEW_REFERENCE_GLOBAL_BUDGET = 96;
+const PREVIEW_REFERENCE_CELL_SIZE = 128;
+const VIEWPORT_PREVIEW_SAMPLE_STEP = 16;
 const HIGH_REFERENCE_PRESSURE = 0.12;
 const LOW_REFERENCE_PRESSURE = 0.01;
 const BROKER_FLUSH_DELAY_MS = 12;
@@ -136,6 +140,7 @@ export async function startApp(root: HTMLElement): Promise<void> {
   const tileStates = new Map<string, TileWorkState>();
   const referenceBroker = new Map<string, ReferenceBrokerEntry>();
   let referenceBrokerFlush = 0;
+  let previewReferenceBudget = 0;
 
   let runtime = currentRuntimeView();
   resize();
@@ -231,9 +236,11 @@ export async function startApp(root: HTMLElement): Promise<void> {
     referenceBroker.clear();
     window.clearTimeout(referenceBrokerFlush);
     referenceBrokerFlush = 0;
+    previewReferenceBudget = 0;
 
     await references.ensureViewReference(localRuntime);
     if (token !== renderToken) return;
+    void submitViewportPreview(localRuntime, token);
 
     const shells = createVisibleTileShells(localRuntime, TILE_SIZE);
     const tiles = await Promise.all(
@@ -246,12 +253,12 @@ export async function startApp(root: HTMLElement): Promise<void> {
 
     for (const tile of tiles) createTileState(tile, [], 0);
     syncPinnedReferences();
+    previewReferenceBudget = Math.min(PREVIEW_REFERENCE_GLOBAL_BUDGET, Math.max(16, tiles.length));
     stats.pending = pendingTileIds.size;
     stats.references = references.size;
     stats.status = `rendering ${tiles.length} tiles`;
 
     for (const tile of tiles) void submitPreview(localRuntime, mustTileState(tile.id));
-    for (const tile of tiles) void submitTile(localRuntime, mustTileState(tile.id));
   }
 
   function createTileState(tile: TileDescriptor, referenceIds: Iterable<string>, splitLevel: number): TileWorkState {
@@ -289,7 +296,15 @@ export async function startApp(root: HTMLElement): Promise<void> {
   async function submitPreview(localRuntime: RuntimeView, state: TileWorkState): Promise<void> {
     if (state.previewInFlight || state.previewUploaded || state.completed || state.tile.revision !== revision) return;
     const candidates = buildReferenceCandidates(state, localRuntime);
-    if (candidates.length === 0) return;
+    if (candidates.length === 0) {
+      const reference = await references.ensureTileReference(localRuntime, state.tile, 128);
+      if (state.tile.revision !== revision || state.completed) return;
+      state.referenceIds.add(reference.id);
+      state.localReferenceRequests += 1;
+      syncPinnedReferences();
+      void submitPreview(localRuntime, state);
+      return;
+    }
     state.previewInFlight = true;
     try {
       const result = await pool.render(
@@ -320,7 +335,20 @@ export async function startApp(root: HTMLElement): Promise<void> {
       state.previewUploaded = true;
       stats.activeWorkers = pool.active;
       stats.references = references.size;
+      if (result.stats.unresolvedCount > 0) {
+        state.lastReferencePressure = previewUnresolvedPressure(result.stats.unresolvedCount, result.width, result.height);
+        if (state.lastReferencePressure < HIGH_REFERENCE_PRESSURE) {
+          const queued = queuePreviewReferences(localRuntime, state, result.stats.unresolvedClusters);
+          if (queued > 0 || state.pendingReferences > 0) {
+            stats.pending = pendingTileIds.size;
+            stats.status = "refining";
+            updateWorkStatus("refining");
+            return;
+          }
+        }
+      }
       updateWorkStatus("rendering");
+      void submitTile(localRuntime, state);
     } catch (error) {
       state.previewInFlight = false;
       stats.status = error instanceof Error ? error.message : String(error);
@@ -329,6 +357,7 @@ export async function startApp(root: HTMLElement): Promise<void> {
 
   async function submitTile(localRuntime: RuntimeView, state: TileWorkState): Promise<void> {
     if (state.inFlight || state.completed || state.tile.revision !== revision) return;
+    if (!state.previewUploaded || state.pendingReferences > 0) return;
     const candidates = buildReferenceCandidates(state, localRuntime);
     if (candidates.length === 0) {
       const reference = await references.ensureTileReference(localRuntime, state.tile, 128);
@@ -359,7 +388,7 @@ export async function startApp(root: HTMLElement): Promise<void> {
           renderMode: "final",
           sampleStep: 1
         },
-        state.refinementLevel > 0 ? 2 + state.splitLevel : 10 + state.splitLevel
+        -1
       );
       state.inFlight = false;
       if (result.revision !== revision || state.completed || state.tile.revision !== revision) return;
@@ -462,9 +491,7 @@ export async function startApp(root: HTMLElement): Promise<void> {
       .map((id) => references.getById(id))
       .filter((reference): reference is NonNullable<typeof reference> => Boolean(reference));
     explicit.sort((a, b) => referenceDistance(state.tile, a) - referenceDistance(state.tile, b));
-    const maxReferences = state.lastReferencePressure >= HIGH_REFERENCE_PRESSURE
-      ? Math.min(MAX_RENDER_REFERENCES, maxReferencesForRect(state.tile.rect))
-      : maxReferencesForRect(state.tile.rect);
+    const maxReferences = maxRenderReferencesForState(state);
     const localReferenceLimit = Math.max(1, Math.ceil(maxReferences * 0.75));
     const selected = references.selectCandidates(state.tile, localRuntime.maxIter, localRuntime.revision, maxReferences);
     const merged = new Map<string, (typeof selected)[number]>();
@@ -472,6 +499,41 @@ export async function startApp(root: HTMLElement): Promise<void> {
     for (const reference of selected) merged.set(reference.id, reference);
     for (const reference of explicit.slice(localReferenceLimit)) merged.set(reference.id, reference);
     return [...merged.values()].slice(0, maxReferences);
+  }
+
+  function queuePreviewReferences(localRuntime: RuntimeView, state: TileWorkState, clusters: UnresolvedCluster[]): number {
+    if (clusters.length === 0) return 0;
+    if (previewReferenceBudget <= 0) return 0;
+    const maxReferences = maxReferencesForRect(state.tile.rect);
+    if (state.referenceIds.size + state.pendingReferences >= maxReferences && canSplitTile(state.tile)) return 0;
+    let queued = 0;
+    const highestPrecision = highestPrecisionForState(state, localRuntime);
+    for (const cluster of clusters.slice(0, PREVIEW_REFERENCE_LIMIT)) {
+      if (previewReferenceBudget <= 0) break;
+      if (state.referenceIds.size + state.pendingReferences >= maxReferences && canSplitTile(state.tile)) break;
+      const request = referenceRequestKey(localRuntime, cluster.screenX, cluster.screenY, highestPrecision + 32, PREVIEW_REFERENCE_CELL_SIZE);
+      const requestKey = request.key;
+      if (state.requestedReferenceKeys.has(requestKey)) continue;
+      state.pendingReferences += 1;
+      state.localReferenceRequests += 1;
+      state.requestedReferenceKeys.add(requestKey);
+      queued += 1;
+      previewReferenceBudget -= 1;
+      enqueueBrokerReference(localRuntime, state, {
+        ...request,
+        refinementLevel: state.refinementLevel + 1,
+        survivedIter: cluster.survivedIter,
+        pixelCount: cluster.pixelCount
+      });
+    }
+    if (queued > 0) state.referenceWaveLevel += 1;
+    return queued;
+  }
+
+  function maxRenderReferencesForState(state: TileWorkState): number {
+    const policyLimit = maxReferencesForRect(state.tile.rect);
+    if (state.refinementLevel >= 2 || state.stalledRefinementRounds > 0) return policyLimit;
+    return Math.min(MAX_RENDER_REFERENCES, policyLimit);
   }
 
   function queueClusterReferences(localRuntime: RuntimeView, state: TileWorkState, clusters: UnresolvedCluster[]): number {
@@ -577,7 +639,9 @@ export async function startApp(root: HTMLElement): Promise<void> {
     } catch (error) {
       for (const waiter of entry.waiters) {
         const waiterState = tileStates.get(waiter.tileId);
-        if (waiterState) waiterState.pendingReferences = Math.max(0, waiterState.pendingReferences - 1);
+        if (!waiterState) continue;
+        waiterState.pendingReferences = Math.max(0, waiterState.pendingReferences - 1);
+        submitReadyTile(localRuntime, waiterState);
       }
       stats.status = error instanceof Error ? error.message : String(error);
     } finally {
@@ -614,7 +678,6 @@ export async function startApp(root: HTMLElement): Promise<void> {
       child.centerReferenceAttempted = state.centerReferenceAttempted;
       child.referenceWaveLevel = state.referenceWaveLevel;
       void submitPreview(localRuntime, child);
-      void submitTile(localRuntime, child);
     }
     syncPinnedReferences();
   }
@@ -672,6 +735,56 @@ export async function startApp(root: HTMLElement): Promise<void> {
     return 1;
   }
 
+  async function submitViewportPreview(localRuntime: RuntimeView, token: number): Promise<void> {
+    const tile = createViewportPreviewTile(localRuntime);
+    const candidates = references.selectCandidates(tile, localRuntime.maxIter, localRuntime.revision, MAX_RENDER_REFERENCES);
+    if (candidates.length === 0) return;
+
+    try {
+      const result = await pool.render(
+        {
+          type: "renderTile",
+          tile,
+          canvasWidth: localRuntime.width,
+          canvasHeight: localRuntime.height,
+          pixelSpan: pixelSpanForView(localRuntime, localRuntime.width),
+          maxIter: localRuntime.maxIter,
+          references: candidates,
+          seriesDegree: SERIES_DEGREE,
+          paletteId: "cosine",
+          refined: false,
+          refinementLevel: 0,
+          renderMode: "preview",
+          sampleStep: VIEWPORT_PREVIEW_SAMPLE_STEP
+        },
+        -2
+      );
+      if (token !== renderToken || result.revision !== revision) return;
+      renderer.uploadTile(result);
+      updateWorkStatus("rendering");
+    } catch (error) {
+      if (token === renderToken) stats.status = error instanceof Error ? error.message : String(error);
+    }
+  }
+
+  function createViewportPreviewTile(localRuntime: RuntimeView): TileDescriptor {
+    return {
+      id: `${localRuntime.revision}:viewport-preview`,
+      key: {
+        level: -1,
+        x: 0,
+        y: 0,
+        span: Math.max(localRuntime.width, localRuntime.height)
+      },
+      rect: { x: 0, y: 0, width: localRuntime.width, height: localRuntime.height },
+      centerScreenX: localRuntime.width * 0.5,
+      centerScreenY: localRuntime.height * 0.5,
+      centerRe: localRuntime.re,
+      centerIm: localRuntime.im,
+      revision: localRuntime.revision
+    };
+  }
+
   function hasOutstandingWork(): boolean {
     if (pendingTileIds.size > 0 || pool.pending > 0 || pool.active > 0) return true;
     for (const state of tileStates.values()) {
@@ -695,11 +808,16 @@ export async function startApp(root: HTMLElement): Promise<void> {
       if (waiterState.completed || waiterState.tile.revision !== revision) continue;
       waiterState.referenceIds.add(referenceId);
       waiterState.refinementLevel = Math.max(waiterState.refinementLevel, waiter.refinementLevel);
-      if (!waiterState.inFlight) void submitTile(localRuntime, waiterState);
+      submitReadyTile(localRuntime, waiterState);
     }
     syncPinnedReferences();
     stats.references = references.size;
     updateWorkStatus("refining");
+  }
+
+  function submitReadyTile(localRuntime: RuntimeView, state: TileWorkState): void {
+    if (state.inFlight || state.pendingReferences > 0 || !state.previewUploaded || state.completed || state.tile.revision !== revision) return;
+    void submitTile(localRuntime, state);
   }
 
   function clusterReferenceLimitForState(_localRuntime: RuntimeView, state: TileWorkState): number {
@@ -737,11 +855,20 @@ export async function startApp(root: HTMLElement): Promise<void> {
   }
 
   function highestPrecisionForState(state: TileWorkState, localRuntime: RuntimeView): number {
-    return buildReferenceCandidates(state, localRuntime).reduce((bits, reference) => Math.max(bits, reference.precisionBits), 128);
+    let highest = buildReferenceCandidates(state, localRuntime).reduce((bits, reference) => Math.max(bits, reference.precisionBits), 128);
+    for (const id of state.referenceIds) {
+      const reference = references.getById(id);
+      if (reference) highest = Math.max(highest, reference.precisionBits);
+    }
+    return highest;
   }
 
   function unresolvedPressure(state: TileWorkState, unresolvedCount: number): number {
     return unresolvedCount / Math.max(1, Math.ceil(state.tile.rect.width) * Math.ceil(state.tile.rect.height));
+  }
+
+  function previewUnresolvedPressure(unresolvedCount: number, width: number, height: number): number {
+    return unresolvedCount / Math.max(1, width * height);
   }
 
   function shouldRequestCenterReferenceFirst(localRuntime: RuntimeView, state: TileWorkState, referenceIdsUsed: string[]): boolean {
@@ -773,9 +900,10 @@ export async function startApp(root: HTMLElement): Promise<void> {
       state.refinementLevel = Math.max(state.refinementLevel, 1);
       syncPinnedReferences();
       stats.references = references.size;
-      if (!state.inFlight) void submitTile(localRuntime, state);
+      submitReadyTile(localRuntime, state);
     } catch (error) {
       state.pendingReferences = Math.max(0, state.pendingReferences - 1);
+      submitReadyTile(localRuntime, state);
       stats.status = error instanceof Error ? error.message : String(error);
     }
   }
