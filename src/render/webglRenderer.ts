@@ -85,6 +85,16 @@ export class WebglTileRenderer {
   }
 
   uploadTile(result: TileDoneMessage): void {
+    const uploadStartedAt = performance.now();
+    recordDeepBench({
+      type: "tileUploadStarted",
+      tileId: result.tileId,
+      revision: result.revision,
+      renderMode: result.stats.renderMode,
+      width: result.width,
+      height: result.height,
+      uploadStartedAt
+    });
     const gl = this.gl;
     const texture = must(gl.createTexture(), "tile texture");
     gl.bindTexture(gl.TEXTURE_2D, texture);
@@ -118,6 +128,14 @@ export class WebglTileRenderer {
       },
       result.width * result.height * 4
     );
+    recordDeepBench({
+      type: "tileUploadDone",
+      tileId: result.tileId,
+      revision: result.revision,
+      renderMode: result.stats.renderMode,
+      uploadStartedAt,
+      uploadDoneAt: performance.now()
+    });
   }
 
   pruneRetainedWhenActiveCoverage(minActiveTiles: number): void {
@@ -238,6 +256,10 @@ function transformRect(rect: Rect, transform: Transform): Rect {
 
 function tileArea(tile: RenderTexture): number {
   return tile.rect.width * tile.rect.height;
+}
+
+function recordDeepBench(event: Record<string, unknown>): void {
+  (globalThis as unknown as { __deepBenchRecord?: (event: Record<string, unknown>) => void }).__deepBenchRecord?.(event);
 }
 
 const vertexSource = `#version 300 es

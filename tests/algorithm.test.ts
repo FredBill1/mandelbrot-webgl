@@ -3,6 +3,7 @@ import { readFileSync } from "node:fs";
 import init, { apply_view_transform, compute_reference, compute_reference_3mul, compute_reference_sparse, direct_escape } from "../src/wasm/pkg/mandelbrot_wasm";
 import { createVisibleTileShells } from "../src/tiles/tileKey";
 import { renderPerturbationTile } from "../src/workers/perturbation";
+import { renderPerturbationTileWasm, resetWasmPerturbationCacheForTests } from "../src/workers/wasmPerturbation";
 import { SERIES_DEGREE, type ReferenceSnapshot, type RenderTileMessage, type TileDescriptor } from "../src/types";
 
 beforeAll(async () => {
@@ -44,6 +45,91 @@ describe("perturbation renderer", () => {
     expect(raw.orbit_im).toBeInstanceOf(Float64Array);
     expect(raw.orbit_re.length).toBe(raw.escaped_at + 1);
   });
+
+  it.each([
+    [
+      "shallow completed final AA",
+      { re: "-7.5e-1", im: "1e-1", scale: "1", maxIter: 128 },
+      { x: 960, y: 448 },
+      { x: 960, y: 448 },
+      32,
+      32,
+      128,
+      "final" as const,
+      1
+    ],
+    [
+      "early escape unresolved",
+      {
+        re: "-7.549229970244027197908742917925261755751044636618703913223906199716382497449534e-1",
+        im: "5.320534885440088329282320858070240068704121711152834282354886837408395062921113e-2",
+        scale: "1.3394307643944097352319707599505029862713399693759721188427992474105938471591505e3",
+        maxIter: 713
+      },
+      { x: 1912 * 0.5, y: 948 * 0.15 },
+      { x: 1912 * 0.5, y: 948 * 0.5 },
+      16,
+      16,
+      224,
+      "final" as const,
+      1
+    ],
+    [
+      "1e100 preview",
+      { re: "-7.43643887037158704752191506114774e-1", im: "1.31825904205311970493132056385139e-1", scale: "1e100", maxIter: 512 },
+      { x: 1000, y: 500 },
+      { x: 1000, y: 500 },
+      32,
+      32,
+      768,
+      "preview" as const,
+      4
+    ],
+    [
+      "rainbow boundary final",
+      {
+        re: "-7.44743856455867584502971474051977658103817187893185200400939609851583632432852598231790469e-1",
+        im: "-1.35593942108114561959508453803647827165860206496504860209432696505792919260554145799490801e-1",
+        scale: "2.5723755590577444907048627502998122776921365543852726093737771835857766320092045519877944e2",
+        maxIter: 667
+      },
+      { x: 960, y: 448 },
+      { x: 960, y: 448 },
+      32,
+      32,
+      256,
+      "final" as const,
+      1
+    ]
+  ])(
+    "WASM cached tile renderer matches TypeScript renderer for %s",
+    async (_name, view, screen, referenceScreen, width, height, precisionBits, renderMode, sampleStep) => {
+      const point = highPrecisionPointAtScreen(view, screen.x, screen.y, 1912, 948);
+      const referencePoint = highPrecisionPointAtScreen(view, referenceScreen.x, referenceScreen.y, 1912, 948);
+      const reference = makeReference(referencePoint.re, referencePoint.im, view.maxIter, precisionBits, referenceScreen.x, referenceScreen.y);
+      const message = makeTileMessage(view, point, screen.x, screen.y, width, height, [reference], renderMode, sampleStep);
+
+      const tsResult = renderPerturbationTile(message);
+      resetWasmPerturbationCacheForTests();
+      const wasmResult = await renderPerturbationTileWasm(message);
+
+      expect(wasmResult.width).toBe(tsResult.width);
+      expect(wasmResult.height).toBe(tsResult.height);
+      expect(wasmResult.needsReference).toBe(tsResult.needsReference);
+      expect(wasmResult.stats.unresolvedCount).toBe(tsResult.stats.unresolvedCount);
+      expect(wasmResult.stats.escapedPixels).toBe(tsResult.stats.escapedPixels);
+      expect(wasmResult.stats.periodicInteriorCount).toBe(tsResult.stats.periodicInteriorCount);
+      expect(wasmResult.stats.rebaseCount).toBe(tsResult.stats.rebaseCount);
+      expect(wasmResult.stats.rebaseLimitCount).toBe(tsResult.stats.rebaseLimitCount);
+      expect(wasmResult.stats.seriesSkip).toBe(tsResult.stats.seriesSkip);
+      expect(wasmResult.stats.boundaryDampenedCount).toBe(tsResult.stats.boundaryDampenedCount);
+      expect(wasmResult.stats.aaPixelCount).toBe(tsResult.stats.aaPixelCount);
+      expect(wasmResult.stats.aaSampleCount).toBe(tsResult.stats.aaSampleCount);
+      expect(wasmResult.stats.referenceIdsUsed).toEqual(tsResult.stats.referenceIdsUsed);
+      expect(wasmResult.stats.unresolvedClusters).toEqual(tsResult.stats.unresolvedClusters);
+      expectSampledPixelsClose(wasmResult.rgba, tsResult.rgba, wasmResult.width * wasmResult.height, 200);
+    }
+  );
 
   it("keeps e79 adjacent pixels and tile centers distinct after WASM decimal serialization", () => {
     const view = {
@@ -630,6 +716,59 @@ function renderSinglePixelWithReferences(
     sampleStep: 1
   };
   return renderPerturbationTile(message);
+}
+
+function makeTileMessage(
+  view: { re: string; im: string; scale: string; maxIter: number },
+  point: { re: string; im: string },
+  screenX: number,
+  screenY: number,
+  width: number,
+  height: number,
+  references: ReferenceSnapshot[],
+  renderMode: "preview" | "final",
+  sampleStep: number
+): RenderTileMessage {
+  const tile: TileDescriptor = {
+    id: `parity-${renderMode}-${width}x${height}`,
+    key: { level: 0, x: 0, y: 0, span: Math.max(width, height) },
+    rect: { x: screenX - width * 0.5, y: screenY - height * 0.5, width, height },
+    centerScreenX: screenX,
+    centerScreenY: screenY,
+    centerRe: point.re,
+    centerIm: point.im,
+    revision: 1
+  };
+  return {
+    type: "renderTile",
+    tile,
+    canvasWidth: 1912,
+    canvasHeight: 948,
+    pixelSpan: pixelSpan(view.scale, 1912),
+    maxIter: view.maxIter,
+    references,
+    seriesDegree: SERIES_DEGREE,
+    paletteId: "cosine",
+    refined: true,
+    refinementLevel: 1,
+    renderMode,
+    sampleStep
+  };
+}
+
+function expectSampledPixelsClose(actual: ArrayBuffer, expected: ArrayBuffer, pixelCount: number, sampleCount: number): void {
+  const actualBytes = new Uint8Array(actual);
+  const expectedBytes = new Uint8Array(expected);
+  expect(actualBytes.byteLength).toBe(expectedBytes.byteLength);
+  let seed = 0x12345678;
+  for (let sample = 0; sample < Math.min(sampleCount, pixelCount); sample += 1) {
+    seed = (seed * 1664525 + 1013904223) >>> 0;
+    const pixelIndex = seed % pixelCount;
+    const offset = pixelIndex * 4;
+    for (let channel = 0; channel < 4; channel += 1) {
+      expect(Math.abs(actualBytes[offset + channel] - expectedBytes[offset + channel])).toBeLessThanOrEqual(1);
+    }
+  }
 }
 
 function pointAtScreen(view: { re: string; im: string; scale: string }, x: number, y: number): { re: string; im: string } {

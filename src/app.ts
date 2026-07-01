@@ -351,6 +351,7 @@ export async function startApp(root: HTMLElement): Promise<void> {
       void submitTile(localRuntime, state);
     } catch (error) {
       state.previewInFlight = false;
+      if (state.tile.revision !== revision) return;
       stats.status = error instanceof Error ? error.message : String(error);
     }
   }
@@ -459,6 +460,7 @@ export async function startApp(root: HTMLElement): Promise<void> {
       updateWorkStatus("rendering");
     } catch (error) {
       state.inFlight = false;
+      if (state.tile.revision !== revision) return;
       stats.status = error instanceof Error ? error.message : String(error);
     }
   }
