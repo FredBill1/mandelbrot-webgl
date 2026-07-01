@@ -311,20 +311,24 @@ pub fn compute_reference(
     for i in 0..max_iter {
         let zr2 = zr.mul(&zr, p, RM);
         let zi2 = zi.mul(&zi, p, RM);
+
+        if i > 0 {
+            let mag2 = zr2.add(&zi2, p, RM);
+            if mag2.cmp(&four).is_some_and(|v| v > 0) {
+                escaped_at = i;
+                break;
+            }
+        }
+
         let zrzi = zr.mul(&zi, p, RM);
         let next_re = zr2.sub(&zi2, p, RM).add(&cr, p, RM);
-        let next_im = zrzi.mul(&BigFloat::from_word(2, p), p, RM).add(&ci, p, RM);
+        let next_im = zrzi.add(&zrzi, p, RM).add(&ci, p, RM);
+
         zr = next_re;
         zi = next_im;
 
         orbit_re.push(bf_to_f64(&zr));
         orbit_im.push(bf_to_f64(&zi));
-
-        let mag2 = zr.mul(&zr, p, RM).add(&zi.mul(&zi, p, RM), p, RM);
-        if mag2.cmp(&four).is_some_and(|v| v > 0) {
-            escaped_at = i + 1;
-            break;
-        }
     }
 
     serde_wasm_bindgen::to_value(&ReferenceOutput {
@@ -351,13 +355,16 @@ pub fn direct_escape(re: &str, im: &str, max_iter: u32, precision_bits: u32) -> 
     for i in 0..max_iter {
         let zr2 = zr.mul(&zr, p, RM);
         let zi2 = zi.mul(&zi, p, RM);
-        let zrzi = zr.mul(&zi, p, RM);
-        zr = zr2.sub(&zi2, p, RM).add(&cr, p, RM);
-        zi = zrzi.mul(&BigFloat::from_word(2, p), p, RM).add(&ci, p, RM);
-        let mag2 = zr.mul(&zr, p, RM).add(&zi.mul(&zi, p, RM), p, RM);
+        let mag2 = zr2.add(&zi2, p, RM);
         if mag2.cmp(&four).is_some_and(|v| v > 0) {
-            return Ok(i + 1);
+            return Ok(i);
         }
+        // z_{i+1} = z_i^2 + c
+        let zrzi = zr.mul(&zi, p, RM);
+        let next_re = zr2.sub(&zi2, p, RM).add(&cr, p, RM);
+        let next_im = zrzi.add(&zrzi, p, RM).add(&ci, p, RM);
+        zr = next_re;
+        zi = next_im;
     }
     Ok(max_iter)
 }
