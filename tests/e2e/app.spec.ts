@@ -41,6 +41,8 @@ const DEEP_PRECISION_TILE_ALIGNMENT_URL =
   "/?re=-7.4688394343169276054191953271440985923260663988633375070109254116564380822428781e-1&im=-1.0052598241121587675259369892011437164151107429135698306788524375078819321907888e-1&scale=3.1649373179255141123643235951764328734858585667107715296013629081580305459152227e79&iter=5601";
 const DEEP_MEMORY_REGRESSION_URL =
   "/?re=-7.4688394343169276054191953271440985923260663988633375070109254116564380822428796e-1&im=-1.0052598241121587675259369892011437164151107429135698306788524375078819321907893e-1&scale=2.1270123524035260478728648392445123424166443778810410355510198092432642054827677e78&iter=5525";
+const RAINBOW_NOISE_REGRESSION_URL =
+  "/?re=-7.44743856455867584502971474051977658103817187893185200400939609851583632432852598231790469e-1&im=-1.35593942108114561959508453803647827165860206496504860209432696505792919260554145799490801e-1&scale=2.5723755590577444907048627502998122776921365543852726093737771835857766320092045519877944e2&iter=667";
 const UNSAFE_ACCELERATION_TILE_REGRESSIONS = [
   {
     url:
@@ -61,6 +63,13 @@ const UNSAFE_ACCELERATION_TILE_REGRESSIONS = [
     sampleY: 546 / 948
   }
 ] as const;
+
+test.beforeAll(async ({ browser }) => {
+  const page = await browser.newPage({ viewport: { width: 320, height: 240 } });
+  await page.goto("/");
+  await page.waitForTimeout(300);
+  await page.close();
+});
 
 test("renders, pans, zooms, and restores URL state", async ({ page }) => {
   await page.goto("/");
@@ -234,6 +243,20 @@ test("keeps e79 deep zoom tiles aligned and avoids ArrayBuffer allocation failur
   expect(pageErrors.join("\n")).not.toMatch(/Array buffer allocation failed/i);
 });
 
+test("reduces rainbow speckle on the reported boundary view", async ({ page }) => {
+  test.setTimeout(90_000);
+  await page.setViewportSize({ width: 1912, height: 948 });
+  await page.goto(RAINBOW_NOISE_REGRESSION_URL);
+  await waitForNonBlankCanvas(page, 75_000);
+
+  const tileCounts = await readTileCounts(page);
+  expect(tileCounts.completed).toBe(tileCounts.total);
+  expect(await readReferenceCount(page)).toBeLessThanOrEqual(180);
+
+  const speckleRatio = await readCanvasSpeckleRatio(page, { left: 420, top: 40, right: 1680, bottom: 880 });
+  expect(speckleRatio).toBeLessThanOrEqual(0.05);
+});
+
 async function waitForNonBlankCanvas(page: import("@playwright/test").Page, timeout = 15_000): Promise<void> {
   await expect(page.locator("#readStatus")).toHaveText("stable", { timeout });
   await expect
@@ -242,7 +265,7 @@ async function waitForNonBlankCanvas(page: import("@playwright/test").Page, time
       for (const x of [0.1, 0.25, 0.5, 0.75, 0.9]) {
         for (const y of [0.1, 0.25, 0.5, 0.75, 0.9]) {
           const pixel = await readCanvasPixel(page, x, y);
-          sum += pixel[0] + pixel[1] + pixel[2] + pixel[3];
+          sum += pixel[0] + pixel[1] + pixel[2];
         }
       }
       return sum;
@@ -282,4 +305,47 @@ async function readTileCounts(page: import("@playwright/test").Page): Promise<{ 
 async function readReferenceCount(page: import("@playwright/test").Page): Promise<number> {
   const text = await page.locator("#readRefs").textContent();
   return Number(text ?? Number.POSITIVE_INFINITY);
+}
+
+async function readCanvasSpeckleRatio(
+  page: import("@playwright/test").Page,
+  roi: { left: number; top: number; right: number; bottom: number }
+): Promise<number> {
+  return page.evaluate((roi) => {
+    const canvas = document.querySelector<HTMLCanvasElement>("#fractal");
+    const gl = canvas?.getContext("webgl2", { alpha: false, antialias: false, preserveDrawingBuffer: true });
+    if (!canvas || !gl) return Number.POSITIVE_INFINITY;
+    const left = Math.max(0, Math.floor(roi.left));
+    const top = Math.max(0, Math.floor(roi.top));
+    const right = Math.min(canvas.width, Math.floor(roi.right));
+    const bottom = Math.min(canvas.height, Math.floor(roi.bottom));
+    const width = Math.max(1, right - left);
+    const height = Math.max(1, bottom - top);
+    const pixels = new Uint8Array(width * height * 4);
+    gl.readPixels(left, canvas.height - bottom, width, height, gl.RGBA, gl.UNSIGNED_BYTE, pixels);
+    let total = 0;
+    let speckles = 0;
+    const pixelOffset = (x: number, y: number) => (y * width + x) * 4;
+    for (let y = 1; y < height - 1; y += 1) {
+      for (let x = 1; x < width - 1; x += 1) {
+        const offset = pixelOffset(x, y);
+        const red = pixels[offset];
+        const green = pixels[offset + 1];
+        const blue = pixels[offset + 2];
+        const chroma = Math.max(red, green, blue) - Math.min(red, green, blue);
+        let maxDelta = 0;
+        for (const [dx, dy] of [[1, 0], [-1, 0], [0, 1], [0, -1]] as const) {
+          const neighbor = pixelOffset(x + dx, y + dy);
+          const delta =
+            Math.abs(red - pixels[neighbor]) +
+            Math.abs(green - pixels[neighbor + 1]) +
+            Math.abs(blue - pixels[neighbor + 2]);
+          maxDelta = Math.max(maxDelta, delta);
+        }
+        total += 1;
+        if (chroma > 170 && maxDelta > 300) speckles += 1;
+      }
+    }
+    return speckles / Math.max(1, total);
+  }, roi);
 }

@@ -39,10 +39,47 @@ interface ClusterAccumulator {
   bestSurvivedIter: number;
 }
 
+interface Color {
+  r: number;
+  g: number;
+  b: number;
+}
+
+interface BoundaryCandidate {
+  index: number;
+  edgeStrength: number;
+}
+
+interface BoundaryStats {
+  boundaryDampenedCount: number;
+  aaPixelCount: number;
+  aaSampleCount: number;
+  aaFallbackCount: number;
+}
+
 const MIN_PIXEL_SPAN_FOR_PERIODIC_INTERIOR = 1e-18;
 const REBASE_G = 1e-8;
 const MAX_REBASES_PER_PIXEL = 64;
 const SERIES_MAX_SKIP = 512;
+const SMOOTH_DELTA_LOW = 6;
+const SMOOTH_DELTA_HIGH = 24;
+const CLASSIFICATION_EDGE_BOOST = 0.35;
+const AA_EDGE_THRESHOLD = 0.45;
+const AA_PIXEL_CAP = 1024;
+const AA_PIXEL_FRACTION = 0.08;
+const AA_FOUR_SAMPLE_CAP = 256;
+const AA_FOUR_SAMPLE_FRACTION = 0.02;
+const MIN_EDGE_CHROMA_SCALE = 0.35;
+const TWO_SAMPLE_OFFSETS = [
+  [-0.25, -0.25],
+  [0.25, 0.25]
+] as const;
+const FOUR_SAMPLE_OFFSETS = [
+  [-0.375, -0.125],
+  [0.125, -0.375],
+  [-0.125, 0.375],
+  [0.375, 0.125]
+] as const;
 
 export function renderPerturbationTile(message: RenderTileMessage): TileDoneMessage {
   const started = performance.now();
@@ -83,13 +120,16 @@ export function renderPerturbationTile(message: RenderTileMessage): TileDoneMess
   const usedReferenceIds = new Set<string>();
   const clusters = createClusterAccumulators(tile.rect);
   const unresolvedMask = new Uint8Array(width * height);
+  const escapedMask = new Uint8Array(width * height);
+  const smoothValues = new Float32Array(width * height);
 
   for (let py = 0; py < height; py += 1) {
     for (let px = 0; px < width; px += 1) {
+      const pixelIndex = py * width + px;
       const screenX = Math.min(tile.rect.x + tile.rect.width - 0.5, tile.rect.x + (px + 0.5) * sampleStep);
       const screenY = Math.min(tile.rect.y + tile.rect.height - 0.5, tile.rect.y + (py + 0.5) * sampleStep);
       const { result, referenceId, skip } = renderPixelWithReferences(screenX, screenY, pixelSpan, maxIter, contexts, scratch);
-      const offset = (py * width + px) * 4;
+      const offset = pixelIndex * 4;
       if (result.iter < maxIter) escapedPixels += 1;
       if (result.periodicInterior) periodicInteriorCount += 1;
       rebaseCount += result.rebaseCount;
@@ -103,12 +143,19 @@ export function renderPerturbationTile(message: RenderTileMessage): TileDoneMess
         unresolvedCount += 1;
         unresolvedScreenXSum += screenX;
         unresolvedScreenYSum += screenY;
-        unresolvedMask[py * width + px] = 1;
+        unresolvedMask[pixelIndex] = 1;
         recordUnresolvedCluster(clusters, tile.rect, screenX, screenY, result.survivedIter);
+      } else if (result.iter < maxIter) {
+        escapedMask[pixelIndex] = 1;
       }
-      colorPixel(rgba, offset, result.iter, maxIter, result.mag2);
+      smoothValues[pixelIndex] = smoothIteration(result.iter, maxIter, result.mag2);
+      writeColor(rgba, offset, colorForResult(result.iter, maxIter, result.mag2));
     }
   }
+
+  const boundaryStats = message.renderMode === "final"
+    ? applyBoundarySmoothing(rgba, smoothValues, escapedMask, unresolvedMask, width, height, tile.rect, pixelSpan, maxIter, contexts, scratch)
+    : emptyBoundaryStats();
 
   if (unresolvedCount > 0) fillUnresolvedPreview(rgba, unresolvedMask, width, height);
 
@@ -138,6 +185,10 @@ export function renderPerturbationTile(message: RenderTileMessage): TileDoneMess
       blaStepCount,
       referenceCacheMissCount: 0,
       seriesSkip,
+      boundaryDampenedCount: boundaryStats.boundaryDampenedCount,
+      aaPixelCount: boundaryStats.aaPixelCount,
+      aaSampleCount: boundaryStats.aaSampleCount,
+      aaFallbackCount: boundaryStats.aaFallbackCount,
       referenceId: referenceIdsUsed[0] ?? contexts[0]?.reference.id ?? "",
       referenceIdsUsed,
       unresolvedScreenX,
@@ -415,6 +466,161 @@ function buildUnresolvedClusters(
     .slice(0, 16);
 }
 
+function applyBoundarySmoothing(
+  buffer: Uint8ClampedArray,
+  smoothValues: Float32Array,
+  escapedMask: Uint8Array,
+  unresolvedMask: Uint8Array,
+  width: number,
+  height: number,
+  rect: { x: number; y: number; width: number; height: number },
+  pixelSpan: number,
+  maxIter: number,
+  contexts: ReferenceContext[],
+  scratch: PeriodicScratch
+): BoundaryStats {
+  if (width <= 1 || height <= 1) return emptyBoundaryStats();
+  const edgeStrengths = new Float32Array(width * height);
+  const candidates: BoundaryCandidate[] = [];
+  let boundaryDampenedCount = 0;
+
+  for (let y = 0; y < height; y += 1) {
+    for (let x = 0; x < width; x += 1) {
+      const index = y * width + x;
+      if (unresolvedMask[index] !== 0 || escapedMask[index] === 0) continue;
+      const edgeStrength = edgeStrengthAt(index, x, y, width, height, smoothValues, escapedMask, unresolvedMask);
+      edgeStrengths[index] = edgeStrength;
+      if (edgeStrength <= 0) continue;
+      if (edgeStrength >= AA_EDGE_THRESHOLD) candidates.push({ index, edgeStrength });
+    }
+  }
+
+  candidates.sort((a, b) => b.edgeStrength - a.edgeStrength);
+  const aaLimit = Math.min(candidates.length, AA_PIXEL_CAP, Math.ceil(width * height * AA_PIXEL_FRACTION));
+  const fourSampleLimit = Math.min(aaLimit, AA_FOUR_SAMPLE_CAP, Math.ceil(width * height * AA_FOUR_SAMPLE_FRACTION));
+  let aaPixelCount = 0;
+  let aaSampleCount = 0;
+  let aaFallbackCount = 0;
+
+  if (contexts.length > 0) {
+    const pixelStepX = rect.width / width;
+    const pixelStepY = rect.height / height;
+    for (let candidateIndex = 0; candidateIndex < aaLimit; candidateIndex += 1) {
+      const candidate = candidates[candidateIndex];
+      const x = candidate.index % width;
+      const y = Math.floor(candidate.index / width);
+      const screenX = Math.min(rect.x + rect.width - 0.5 * pixelStepX, rect.x + (x + 0.5) * pixelStepX);
+      const screenY = Math.min(rect.y + rect.height - 0.5 * pixelStepY, rect.y + (y + 0.5) * pixelStepY);
+      const offsets = candidateIndex < fourSampleLimit ? FOUR_SAMPLE_OFFSETS : TWO_SAMPLE_OFFSETS;
+      const sampleStats = supersamplePixel(buffer, candidate.index, screenX, screenY, pixelStepX, pixelStepY, offsets, pixelSpan, maxIter, contexts, scratch);
+      aaPixelCount += 1;
+      aaSampleCount += offsets.length;
+      aaFallbackCount += sampleStats.fallbacks;
+    }
+  }
+
+  for (let index = 0; index < edgeStrengths.length; index += 1) {
+    const edgeStrength = edgeStrengths[index];
+    if (edgeStrength <= 0 || escapedMask[index] === 0 || unresolvedMask[index] !== 0) continue;
+    const offset = index * 4;
+    const color = {
+      r: buffer[offset],
+      g: buffer[offset + 1],
+      b: buffer[offset + 2]
+    };
+    writeColor(buffer, offset, dampenChroma(color, edgeStrength));
+    boundaryDampenedCount += 1;
+  }
+
+  return { boundaryDampenedCount, aaPixelCount, aaSampleCount, aaFallbackCount };
+}
+
+function emptyBoundaryStats(): BoundaryStats {
+  return { boundaryDampenedCount: 0, aaPixelCount: 0, aaSampleCount: 0, aaFallbackCount: 0 };
+}
+
+function edgeStrengthAt(
+  index: number,
+  x: number,
+  y: number,
+  width: number,
+  height: number,
+  smoothValues: Float32Array,
+  escapedMask: Uint8Array,
+  unresolvedMask: Uint8Array
+): number {
+  const escaped = escapedMask[index] !== 0;
+  const smooth = smoothValues[index];
+  let maxSmoothDelta = 0;
+  let classificationChange = false;
+  for (const [dx, dy] of [[1, 0], [-1, 0], [0, 1], [0, -1]] as const) {
+    const nx = x + dx;
+    const ny = y + dy;
+    if (nx < 0 || ny < 0 || nx >= width || ny >= height) continue;
+    const neighborIndex = ny * width + nx;
+    if (unresolvedMask[neighborIndex] !== 0) continue;
+    const neighborEscaped = escapedMask[neighborIndex] !== 0;
+    if (neighborEscaped !== escaped) classificationChange = true;
+    if (neighborEscaped && escaped) {
+      maxSmoothDelta = Math.max(maxSmoothDelta, Math.abs(smooth - smoothValues[neighborIndex]));
+    } else if (neighborEscaped || escaped) {
+      maxSmoothDelta = Math.max(maxSmoothDelta, SMOOTH_DELTA_HIGH);
+    }
+  }
+  const smoothEdge = clamp01((maxSmoothDelta - SMOOTH_DELTA_LOW) / (SMOOTH_DELTA_HIGH - SMOOTH_DELTA_LOW));
+  return clamp01(smoothEdge + (classificationChange ? CLASSIFICATION_EDGE_BOOST : 0));
+}
+
+function supersamplePixel(
+  buffer: Uint8ClampedArray,
+  pixelIndex: number,
+  screenX: number,
+  screenY: number,
+  pixelStepX: number,
+  pixelStepY: number,
+  offsets: readonly (readonly [number, number])[],
+  pixelSpan: number,
+  maxIter: number,
+  contexts: ReferenceContext[],
+  scratch: PeriodicScratch
+): { fallbacks: number } {
+  const baseOffset = pixelIndex * 4;
+  let linearR = srgbToLinear(buffer[baseOffset] / 255);
+  let linearG = srgbToLinear(buffer[baseOffset + 1] / 255);
+  let linearB = srgbToLinear(buffer[baseOffset + 2] / 255);
+  let fallbacks = 0;
+
+  for (const [offsetX, offsetY] of offsets) {
+    const { result } = renderPixelWithReferences(
+      screenX + offsetX * pixelStepX,
+      screenY + offsetY * pixelStepY,
+      pixelSpan,
+      maxIter,
+      contexts,
+      scratch
+    );
+    const color = result.unresolved
+      ? {
+          r: buffer[baseOffset],
+          g: buffer[baseOffset + 1],
+          b: buffer[baseOffset + 2]
+        }
+      : colorForResult(result.iter, maxIter, result.mag2);
+    if (result.unresolved) fallbacks += 1;
+    linearR += srgbToLinear(color.r / 255);
+    linearG += srgbToLinear(color.g / 255);
+    linearB += srgbToLinear(color.b / 255);
+  }
+
+  const divisor = offsets.length + 1;
+  writeColor(buffer, baseOffset, {
+    r: Math.round(linearToSrgb(linearR / divisor) * 255),
+    g: Math.round(linearToSrgb(linearG / divisor) * 255),
+    b: Math.round(linearToSrgb(linearB / divisor) * 255)
+  });
+  return { fallbacks };
+}
+
 function fillUnresolvedPreview(buffer: Uint8ClampedArray, unresolvedMask: Uint8Array, width: number, height: number): void {
   for (let pass = 0; pass < 3; pass += 1) {
     let changed = false;
@@ -510,22 +716,63 @@ function tileProbeOffsets(rect: { x: number; y: number; width: number; height: n
   }));
 }
 
-function colorPixel(buffer: Uint8ClampedArray, offset: number, iter: number, maxIter: number, mag2: number): void {
+function colorForResult(iter: number, maxIter: number, mag2: number): Color {
   if (iter >= maxIter) {
-    buffer[offset] = 2;
-    buffer[offset + 1] = 4;
-    buffer[offset + 2] = 8;
-    buffer[offset + 3] = 255;
-    return;
+    return { r: 2, g: 4, b: 8 };
   }
 
-  const smooth = iter + 1 - Math.log2(Math.max(1e-12, Math.log2(Math.max(2, Math.sqrt(mag2)))));
+  const smooth = smoothIteration(iter, maxIter, mag2);
   const t = (smooth * 0.018) % 1;
   const wave = (phase: number) => 0.5 + 0.5 * Math.cos(6.283185307179586 * (t + phase));
-  buffer[offset] = Math.round(255 * Math.pow(wave(0.95), 1.4));
-  buffer[offset + 1] = Math.round(255 * Math.pow(wave(0.58), 1.1));
-  buffer[offset + 2] = Math.round(255 * Math.pow(wave(0.22), 0.9));
+  return {
+    r: Math.round(255 * Math.pow(wave(0.95), 1.4)),
+    g: Math.round(255 * Math.pow(wave(0.58), 1.1)),
+    b: Math.round(255 * Math.pow(wave(0.22), 0.9))
+  };
+}
+
+function smoothIteration(iter: number, maxIter: number, mag2: number): number {
+  if (iter >= maxIter) return maxIter;
+  return iter + 1 - Math.log2(Math.max(1e-12, Math.log2(Math.max(2, Math.sqrt(mag2)))));
+}
+
+function dampenChroma(color: Color, edgeStrength: number): Color {
+  const chromaScale = 1 - (1 - MIN_EDGE_CHROMA_SCALE) * clamp01(edgeStrength);
+  const linearR = srgbToLinear(color.r / 255);
+  const linearG = srgbToLinear(color.g / 255);
+  const linearB = srgbToLinear(color.b / 255);
+  const luma = 0.2126 * linearR + 0.7152 * linearG + 0.0722 * linearB;
+  return {
+    r: Math.round(linearToSrgb(luma + (linearR - luma) * chromaScale) * 255),
+    g: Math.round(linearToSrgb(luma + (linearG - luma) * chromaScale) * 255),
+    b: Math.round(linearToSrgb(luma + (linearB - luma) * chromaScale) * 255)
+  };
+}
+
+function writeColor(buffer: Uint8ClampedArray, offset: number, color: Color): void {
+  buffer[offset] = clampByte(color.r);
+  buffer[offset + 1] = clampByte(color.g);
+  buffer[offset + 2] = clampByte(color.b);
   buffer[offset + 3] = 255;
+}
+
+function srgbToLinear(value: number): number {
+  return value <= 0.04045 ? value / 12.92 : ((value + 0.055) / 1.055) ** 2.4;
+}
+
+function linearToSrgb(value: number): number {
+  const clamped = clamp01(value);
+  return clamped <= 0.0031308 ? clamped * 12.92 : 1.055 * clamped ** (1 / 2.4) - 0.055;
+}
+
+function clamp01(value: number): number {
+  if (!Number.isFinite(value)) return 0;
+  return Math.max(0, Math.min(1, value));
+}
+
+function clampByte(value: number): number {
+  if (!Number.isFinite(value)) return 0;
+  return Math.max(0, Math.min(255, Math.round(value)));
 }
 
 function asFloat64(value: Float64Array | ArrayLike<number>): Float64Array {

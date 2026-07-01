@@ -28,6 +28,7 @@ export class LruCache<K, V> {
     if (existing) {
       this.usedBytes -= existing.bytes;
       this.entries.delete(key);
+      this.onEvict?.(key, existing.value);
     }
 
     this.entries.set(key, { value, bytes });

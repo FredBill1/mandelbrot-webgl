@@ -206,6 +206,54 @@ describe("perturbation renderer", () => {
     expect(result.stats.blaStepCount).toBe(0);
   });
 
+  it("dampens noisy escaped boundary color without changing center-sample classification", () => {
+    const view = {
+      re: "-7.44743856455867584502971474051977658103817187893185200400939609851583632432852598231790469e-1",
+      im: "-1.35593942108114561959508453803647827165860206496504860209432696505792919260554145799490801e-1",
+      scale: "2.5723755590577444907048627502998122776921365543852726093737771835857766320092045519877944e2",
+      maxIter: 667
+    };
+    const tile: TileDescriptor = {
+      id: "rainbow-boundary",
+      key: { level: 0, x: 7, y: 3, span: 128 },
+      rect: { x: 896, y: 384, width: 128, height: 128 },
+      centerScreenX: 960,
+      centerScreenY: 448,
+      centerRe: view.re,
+      centerIm: view.im,
+      revision: 1
+    };
+    const tileCenter = highPrecisionPointAtScreen(view, tile.centerScreenX, tile.centerScreenY, 1912, 948);
+    const reference = makeReference(tileCenter.re, tileCenter.im, view.maxIter, 256, tile.centerScreenX, tile.centerScreenY);
+    const baseMessage: RenderTileMessage = {
+      type: "renderTile",
+      tile,
+      canvasWidth: 1912,
+      canvasHeight: 948,
+      pixelSpan: pixelSpan(view.scale, 1912),
+      maxIter: view.maxIter,
+      references: [reference],
+      seriesDegree: 8,
+      paletteId: "cosine",
+      refined: true,
+      refinementLevel: 1,
+      renderMode: "preview",
+      sampleStep: 1
+    };
+
+    const preview = renderPerturbationTile(baseMessage);
+    const final = renderPerturbationTile({ ...baseMessage, renderMode: "final" });
+
+    expect(final.stats.escapedPixels).toBe(preview.stats.escapedPixels);
+    expect(final.stats.unresolvedCount).toBe(preview.stats.unresolvedCount);
+    expect(preview.stats.boundaryDampenedCount).toBe(0);
+    expect(preview.stats.aaPixelCount).toBe(0);
+    expect(final.stats.boundaryDampenedCount).toBeGreaterThan(0);
+    expect(final.stats.aaPixelCount).toBeGreaterThan(0);
+    expect(final.stats.aaPixelCount).toBeLessThanOrEqual(1024);
+    expect(final.stats.aaSampleCount).toBeLessThanOrEqual(2560);
+  });
+
   it("resolves the 1912x948 deep interior sample without refinement", () => {
     const view = {
       re: "-1.5738375605512487151154265653948631632264711132220526532084658732407373266127815e0",

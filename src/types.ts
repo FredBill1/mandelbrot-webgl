@@ -96,6 +96,10 @@ export interface TileStats {
   blaStepCount: number;
   referenceCacheMissCount: number;
   seriesSkip: number;
+  boundaryDampenedCount: number;
+  aaPixelCount: number;
+  aaSampleCount: number;
+  aaFallbackCount: number;
   referenceId: string;
   referenceIdsUsed: string[];
   unresolvedScreenX: number | undefined;
