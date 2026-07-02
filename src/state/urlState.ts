@@ -17,13 +17,23 @@ export const DEEP_TEST_VIEW: ViewState = {
 
 const DECIMAL_RE = /^[+-]?(?:\d+\.?\d*|\.\d+)(?:e[+-]?\d+)?$/i;
 
+export interface ParsedViewState {
+  view: ViewState;
+  explicitIter: boolean;
+}
+
 export function parseViewFromUrl(url: URL = new URL(window.location.href)): ViewState {
+  return parseViewStateFromUrl(url).view;
+}
+
+export function parseViewStateFromUrl(url: URL = new URL(window.location.href)): ParsedViewState {
   const re = validDecimal(url.searchParams.get("re")) ?? DEFAULT_VIEW.re;
   const im = validDecimal(url.searchParams.get("im")) ?? DEFAULT_VIEW.im;
   const scale = positiveDecimal(url.searchParams.get("scale")) ?? DEFAULT_VIEW.scale;
   const iter = Number.parseInt(url.searchParams.get("iter") ?? "", 10);
-  const maxIter = Number.isFinite(iter) && iter >= 32 ? Math.min(50_000, iter) : defaultMaxIter(scale);
-  return { re, im, scale, maxIter };
+  const explicitIter = Number.isFinite(iter) && iter >= 32;
+  const maxIter = explicitIter ? Math.min(50_000, iter) : defaultMaxIter(scale);
+  return { view: { re, im, scale, maxIter }, explicitIter };
 }
 
 export function viewToSearchParams(view: ViewState): URLSearchParams {

@@ -62,6 +62,7 @@ export interface RenderTileMessage {
   tile: TileDescriptor;
   canvasWidth: number;
   canvasHeight: number;
+  viewScale?: string;
   pixelSpan: number;
   maxIter: number;
   references: ReferenceSnapshot[];
@@ -69,9 +70,15 @@ export interface RenderTileMessage {
   paletteId: string;
   refined: boolean;
   refinementLevel: number;
-  renderMode: "preview" | "final";
+  renderMode: "preview" | "final" | "exact";
   sampleStep: number;
+  exactBaseRgba?: ArrayBuffer;
+  exactUnresolvedMask?: ArrayBuffer;
 }
+
+export type FailureKind = "earlyReferenceEscape" | "cancellationGlitch" | "deltaOverflow" | "rebaseLimit" | "seriesUnsafe";
+
+export type FailureKindCounts = Record<FailureKind, number>;
 
 export interface UnresolvedCluster {
   screenX: number;
@@ -82,6 +89,10 @@ export interface UnresolvedCluster {
   binX: number;
   binY: number;
   bounds: Rect;
+  bestSurvivedIter?: number;
+  sourceReferenceId?: string;
+  failureKindCounts?: FailureKindCounts;
+  suggestedPrecisionBits?: number;
 }
 
 export interface TileStats {
@@ -106,7 +117,8 @@ export interface TileStats {
   unresolvedScreenY: number | undefined;
   unresolvedClusters: UnresolvedCluster[];
   preview: boolean;
-  renderMode: "preview" | "final";
+  renderMode: "preview" | "final" | "exact";
+  exactFallbackPixels: number;
 }
 
 export interface TileDoneMessage {
@@ -117,6 +129,7 @@ export interface TileDoneMessage {
   width: number;
   height: number;
   rgba: ArrayBuffer;
+  unresolvedMask?: ArrayBuffer;
   stats: TileStats;
   needsReference: boolean;
 }

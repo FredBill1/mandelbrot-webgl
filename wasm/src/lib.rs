@@ -1,5 +1,5 @@
 use astro_float::{BigFloat, RoundingMode, Sign};
-use js_sys::{Array, Float64Array, Int32Array, Object, Reflect, Uint8ClampedArray};
+use js_sys::{Array, Float64Array, Int32Array, Object, Reflect, Uint8Array, Uint8ClampedArray};
 use serde::{Deserialize, Serialize};
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -600,12 +600,23 @@ struct PixelResult64 {
     mag2: f64,
     glitch: bool,
     unresolved: bool,
+    failure_kind: FailureKind64,
     survived_iter: u32,
     periodic_interior: bool,
     rebase_count: u32,
     rebase_limit: bool,
     bla_skip_count: u32,
     bla_step_count: u32,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum FailureKind64 {
+    None,
+    EarlyReferenceEscape,
+    CancellationGlitch,
+    DeltaOverflow,
+    RebaseLimit,
+    SeriesUnsafe,
 }
 
 #[derive(Clone, Copy)]
@@ -629,9 +640,15 @@ struct ClusterAccumulator64 {
     count: u32,
     sum_x: f64,
     sum_y: f64,
+    min_x: f64,
+    min_y: f64,
+    max_x: f64,
+    max_y: f64,
     best_x: f64,
     best_y: f64,
     best_survived_iter: i32,
+    best_source_reference_id: Option<String>,
+    failure_kind_counts: [u32; 5],
 }
 
 #[derive(Clone)]
@@ -644,6 +661,9 @@ struct UnresolvedCluster64 {
     bin_x: u32,
     bin_y: u32,
     bounds: Rect64,
+    source_reference_id: String,
+    failure_kind_counts: [u32; 5],
+    suggested_precision_bits: u32,
 }
 
 #[derive(Clone, Copy)]
@@ -845,12 +865,22 @@ pub fn render_tile_cached(
                 unresolved_screen_x_sum += screen_x;
                 unresolved_screen_y_sum += screen_y;
                 unresolved_mask[pixel_index] = 1;
+                let source_reference_id = if selection.reference_index >= 0 {
+                    contexts[selection.reference_index as usize]
+                        .reference
+                        .external_id
+                        .as_str()
+                } else {
+                    ""
+                };
                 record_render_unresolved_cluster(
                     &mut clusters,
                     rect,
                     screen_x,
                     screen_y,
                     result.survived_iter,
+                    result.failure_kind,
+                    source_reference_id,
                 );
             } else if result.iter < max_iter {
                 if let Some(mask) = escaped_mask.as_mut() {
@@ -891,6 +921,12 @@ pub fn render_tile_cached(
         empty_render_boundary_stats()
     };
 
+    let unresolved_mask_output = if render_mode == "final" && unresolved_count > 0 {
+        Some(unresolved_mask.clone())
+    } else {
+        None
+    };
+
     if unresolved_count > 0 {
         fill_render_unresolved_preview(&mut rgba, &mut unresolved_mask, width, height);
     }
@@ -915,6 +951,7 @@ pub fn render_tile_cached(
         width,
         height,
         rgba,
+        unresolved_mask_output,
         unresolved_clusters,
         elapsed_ms,
         glitch_count,
@@ -939,7 +976,295 @@ pub fn render_tile_cached(
             None
         },
         render_mode,
+        0,
     )
+}
+
+#[wasm_bindgen]
+#[allow(clippy::too_many_arguments)]
+pub fn render_tile_exact(
+    tile_id: &str,
+    revision: u32,
+    rect_x: f64,
+    rect_y: f64,
+    rect_width: f64,
+    rect_height: f64,
+    center_re: &str,
+    center_im: &str,
+    center_screen_x: f64,
+    center_screen_y: f64,
+    scale: &str,
+    canvas_width: f64,
+    max_iter: u32,
+    precision_bits: u32,
+    base_rgba: Uint8Array,
+    exact_mask: Uint8Array,
+) -> Result<JsValue, JsValue> {
+    let started = js_sys::Date::now();
+    let rect = Rect64 {
+        x: rect_x,
+        y: rect_y,
+        width: rect_width,
+        height: rect_height,
+    };
+    let width = rect.width.ceil().max(1.0) as usize;
+    let height = rect.height.ceil().max(1.0) as usize;
+    if let (Ok(scale_f64), Ok(center_re_f64), Ok(center_im_f64)) = (
+        scale.parse::<f64>(),
+        center_re.parse::<f64>(),
+        center_im.parse::<f64>(),
+    ) {
+        if scale_f64.is_finite() && scale_f64 > 0.0 && scale_f64 <= 1e12 {
+            return render_tile_exact_f64(
+                tile_id,
+                revision,
+                rect,
+                width,
+                height,
+                center_re_f64,
+                center_im_f64,
+                center_screen_x,
+                center_screen_y,
+                scale_f64,
+                canvas_width,
+                max_iter,
+                started,
+                base_rgba,
+                exact_mask,
+            );
+        }
+    }
+    let bits = precision_bits
+        .max(estimate_precision_bits(scale, max_iter))
+        .max(128);
+    let p = precision(bits);
+    let center_re = parse_float(center_re, bits)?;
+    let center_im = parse_float(center_im, bits)?;
+    let scale = parse_float(scale, bits)?;
+    let pixel_span = bf_from_f64(BASE_VIEW_WIDTH, bits)
+        .div(&scale, p, RM)
+        .div(&bf_from_f64(canvas_width.max(1.0), bits), p, RM);
+    let palette = create_render_palette();
+    let exact_input = prepare_exact_input(width, height, base_rgba, exact_mask);
+    let mut rgba = exact_input.rgba;
+    let mask = exact_input.mask;
+    let mut escaped_pixels = 0u32;
+    let mut exact_pixels = 0u32;
+
+    for py in 0..height {
+        let screen_y = (rect.y + rect.height - 0.5).min(rect.y + py as f64 + 0.5);
+        let dy = bf_from_f64(screen_y - center_screen_y, bits);
+        let ci = center_im.add(&pixel_span.mul(&dy, p, RM), p, RM);
+        for px in 0..width {
+            let pixel_index = py * width + px;
+            if !should_render_exact_pixel(mask.as_deref(), pixel_index) {
+                continue;
+            }
+            exact_pixels += 1;
+            let screen_x = (rect.x + rect.width - 0.5).min(rect.x + px as f64 + 0.5);
+            let dx = bf_from_f64(screen_x - center_screen_x, bits);
+            let cr = center_re.add(&pixel_span.mul(&dx, p, RM), p, RM);
+            let exact = run_exact_escape_with_mag2(&cr, &ci, max_iter, p);
+            if exact.iter < max_iter {
+                escaped_pixels += 1;
+            }
+            let smooth = render_smooth_iteration(exact.iter, max_iter, exact.mag2);
+            write_render_color_for_smooth(
+                &mut rgba,
+                pixel_index * 4,
+                exact.iter >= max_iter,
+                smooth,
+                &palette,
+            );
+        }
+    }
+
+    build_render_tile_value(
+        tile_id,
+        revision,
+        rect,
+        width,
+        height,
+        rgba,
+        None,
+        Vec::new(),
+        js_sys::Date::now() - started,
+        0,
+        0,
+        escaped_pixels,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        empty_render_boundary_stats(),
+        Vec::new(),
+        None,
+        None,
+        "exact",
+        exact_pixels,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn render_tile_exact_f64(
+    tile_id: &str,
+    revision: u32,
+    rect: Rect64,
+    width: usize,
+    height: usize,
+    center_re: f64,
+    center_im: f64,
+    center_screen_x: f64,
+    center_screen_y: f64,
+    scale: f64,
+    canvas_width: f64,
+    max_iter: u32,
+    started: f64,
+    base_rgba: Uint8Array,
+    exact_mask: Uint8Array,
+) -> Result<JsValue, JsValue> {
+    let pixel_span = BASE_VIEW_WIDTH / scale / canvas_width.max(1.0);
+    let palette = create_render_palette();
+    let exact_input = prepare_exact_input(width, height, base_rgba, exact_mask);
+    let mut rgba = exact_input.rgba;
+    let mask = exact_input.mask;
+    let mut escaped_pixels = 0u32;
+    let mut exact_pixels = 0u32;
+
+    for py in 0..height {
+        let screen_y = (rect.y + rect.height - 0.5).min(rect.y + py as f64 + 0.5);
+        let ci = center_im + (screen_y - center_screen_y) * pixel_span;
+        for px in 0..width {
+            let pixel_index = py * width + px;
+            if !should_render_exact_pixel(mask.as_deref(), pixel_index) {
+                continue;
+            }
+            exact_pixels += 1;
+            let screen_x = (rect.x + rect.width - 0.5).min(rect.x + px as f64 + 0.5);
+            let cr = center_re + (screen_x - center_screen_x) * pixel_span;
+            let exact = run_exact_escape_f64(cr, ci, max_iter);
+            if exact.iter < max_iter {
+                escaped_pixels += 1;
+            }
+            let smooth = render_smooth_iteration(exact.iter, max_iter, exact.mag2);
+            write_render_color_for_smooth(
+                &mut rgba,
+                pixel_index * 4,
+                exact.iter >= max_iter,
+                smooth,
+                &palette,
+            );
+        }
+    }
+
+    build_render_tile_value(
+        tile_id,
+        revision,
+        rect,
+        width,
+        height,
+        rgba,
+        None,
+        Vec::new(),
+        js_sys::Date::now() - started,
+        0,
+        0,
+        escaped_pixels,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        empty_render_boundary_stats(),
+        Vec::new(),
+        None,
+        None,
+        "exact",
+        exact_pixels,
+    )
+}
+
+struct ExactInput {
+    rgba: Vec<u8>,
+    mask: Option<Vec<u8>>,
+}
+
+fn prepare_exact_input(width: usize, height: usize, base_rgba: Uint8Array, exact_mask: Uint8Array) -> ExactInput {
+    let pixel_count = width * height;
+    let rgba = if base_rgba.length() as usize == pixel_count * 4 {
+        base_rgba.to_vec()
+    } else {
+        vec![0u8; pixel_count * 4]
+    };
+    let mask = if exact_mask.length() as usize == pixel_count {
+        Some(exact_mask.to_vec())
+    } else {
+        None
+    };
+    ExactInput { rgba, mask }
+}
+
+fn should_render_exact_pixel(mask: Option<&[u8]>, pixel_index: usize) -> bool {
+    mask.map_or(true, |values| values.get(pixel_index).copied().unwrap_or(0) != 0)
+}
+
+struct ExactEscape64 {
+    iter: u32,
+    mag2: f64,
+}
+
+fn run_exact_escape_f64(cr: f64, ci: f64, max_iter: u32) -> ExactEscape64 {
+    let mut zr = 0.0;
+    let mut zi = 0.0;
+    for iter in 0..max_iter {
+        let mag2 = zr * zr + zi * zi;
+        if iter > 0 && mag2 > 4.0 {
+            return ExactEscape64 { iter, mag2 };
+        }
+        let next_re = zr * zr - zi * zi + cr;
+        let next_im = 2.0 * zr * zi + ci;
+        zr = next_re;
+        zi = next_im;
+    }
+    ExactEscape64 {
+        iter: max_iter,
+        mag2: zr * zr + zi * zi,
+    }
+}
+
+fn run_exact_escape_with_mag2(
+    cr: &BigFloat,
+    ci: &BigFloat,
+    max_iter: u32,
+    p: usize,
+) -> ExactEscape64 {
+    let mut zr = BigFloat::from_word(0, p);
+    let mut zi = BigFloat::from_word(0, p);
+    let four = BigFloat::from_word(4, p);
+
+    for iter in 0..max_iter {
+        if iter > 0 {
+            let mag2 = zr.mul(&zr, p, RM).add(&zi.mul(&zi, p, RM), p, RM);
+            if mag2.cmp(&four).is_some_and(|v| v > 0) {
+                return ExactEscape64 {
+                    iter,
+                    mag2: bf_to_f64(&mag2),
+                };
+            }
+        }
+        let (next_re, next_im) = step_two_mul(&zr, &zi, cr, ci, p);
+        zr = next_re;
+        zi = next_im;
+    }
+
+    let mag2 = zr.mul(&zr, p, RM).add(&zi.mul(&zi, p, RM), p, RM);
+    ExactEscape64 {
+        iter: max_iter,
+        mag2: bf_to_f64(&mag2),
+    }
 }
 
 fn build_render_contexts(
@@ -973,6 +1298,7 @@ fn build_render_tile_value(
     width: usize,
     height: usize,
     rgba: Vec<u8>,
+    unresolved_mask: Option<Vec<u8>>,
     unresolved_clusters: Vec<UnresolvedCluster64>,
     elapsed_ms: f64,
     glitch_count: u32,
@@ -989,6 +1315,7 @@ fn build_render_tile_value(
     unresolved_screen_x: Option<f64>,
     unresolved_screen_y: Option<f64>,
     render_mode: &str,
+    exact_fallback_pixels: u32,
 ) -> Result<JsValue, JsValue> {
     let object = Object::new();
     set_js_property(&object, "type", &JsValue::from_str("tileDone"))?;
@@ -999,6 +1326,10 @@ fn build_render_tile_value(
     set_js_property(&object, "height", &JsValue::from_f64(height as f64))?;
     let rgba_array = Uint8ClampedArray::from(rgba.as_slice());
     set_js_property(&object, "rgba", &rgba_array.buffer().into())?;
+    if let Some(mask) = unresolved_mask {
+        let mask_array = Uint8Array::from(mask.as_slice());
+        set_js_property(&object, "unresolvedMask", &mask_array.buffer().into())?;
+    }
     set_js_property(
         &object,
         "needsReference",
@@ -1081,6 +1412,11 @@ fn build_render_tile_value(
     set_js_property(&stats, "referenceIdsUsed", used_ids.as_ref())?;
     set_js_property(
         &stats,
+        "exactFallbackPixels",
+        &JsValue::from_f64(exact_fallback_pixels as f64),
+    )?;
+    set_js_property(
+        &stats,
         "unresolvedScreenX",
         &unresolved_screen_x.map_or(JsValue::UNDEFINED, JsValue::from_f64),
     )?;
@@ -1133,9 +1469,41 @@ fn unresolved_clusters_to_js(clusters: &[UnresolvedCluster64]) -> Result<Array, 
         set_js_property(&object, "binX", &JsValue::from_f64(cluster.bin_x as f64))?;
         set_js_property(&object, "binY", &JsValue::from_f64(cluster.bin_y as f64))?;
         set_js_property(&object, "bounds", &rect_to_js(cluster.bounds)?.into())?;
+        set_js_property(
+            &object,
+            "bestSurvivedIter",
+            &JsValue::from_f64(cluster.survived_iter as f64),
+        )?;
+        set_js_property(
+            &object,
+            "sourceReferenceId",
+            &JsValue::from_str(&cluster.source_reference_id),
+        )?;
+        set_js_property(
+            &object,
+            "failureKindCounts",
+            &failure_kind_counts_to_js(cluster.failure_kind_counts)?.into(),
+        )?;
+        set_js_property(
+            &object,
+            "suggestedPrecisionBits",
+            &JsValue::from_f64(cluster.suggested_precision_bits as f64),
+        )?;
         array.push(object.as_ref());
     }
     Ok(array)
+}
+
+fn failure_kind_counts_to_js(counts: [u32; 5]) -> Result<Object, JsValue> {
+    let object = Object::new();
+    for (index, count) in counts.iter().enumerate() {
+        set_js_property(
+            &object,
+            failure_kind_key(index),
+            &JsValue::from_f64(*count as f64),
+        )?;
+    }
+    Ok(object)
 }
 
 fn render_pixel_with_references64(
@@ -1148,7 +1516,17 @@ fn render_pixel_with_references64(
     scratch: &mut PeriodicScratch64,
 ) -> PixelSelection64 {
     let mut has_best_unresolved = false;
-    let mut best_unresolved = failure_result64(max_iter, 0.0, true, 0, 0, false, 0, 0);
+    let mut best_unresolved = failure_result64(
+        max_iter,
+        0.0,
+        true,
+        FailureKind64::EarlyReferenceEscape,
+        0,
+        0,
+        false,
+        0,
+        0,
+    );
     let mut best_unresolved_reference_index = -1;
     let mut max_skip = 0usize;
     let allow_periodic_interior = pixel_span >= RENDER_MIN_PIXEL_SPAN_FOR_PERIODIC_INTERIOR;
@@ -1219,6 +1597,7 @@ fn perturb64(
     let mut ref_index = 0usize;
     let mut mag2 = 0.0;
     let mut glitch = false;
+    let mut failure_kind = FailureKind64::EarlyReferenceEscape;
     let mut rebase_count = 0u32;
     let mut rebase_limit = false;
     let bla_skip_count = 0u32;
@@ -1240,6 +1619,11 @@ fn perturb64(
             max_iter,
             mag2,
             true,
+            if series.skip > 0 {
+                FailureKind64::SeriesUnsafe
+            } else {
+                FailureKind64::EarlyReferenceEscape
+            },
             limit as u32,
             rebase_count,
             rebase_limit,
@@ -1253,6 +1637,7 @@ fn perturb64(
         let ref_im = orbit_im[ref_index];
         if !ref_re.is_finite() || !ref_im.is_finite() {
             glitch = true;
+            failure_kind = FailureKind64::DeltaOverflow;
             break;
         }
 
@@ -1328,6 +1713,7 @@ fn perturb64(
             if rebase_count >= RENDER_MAX_REBASES_PER_PIXEL {
                 glitch = true;
                 rebase_limit = true;
+                failure_kind = FailureKind64::RebaseLimit;
                 break;
             }
             dz_re = z_re;
@@ -1346,6 +1732,14 @@ fn perturb64(
                 && mag2 < ref_mag2 * 1e-20)
         {
             glitch = true;
+            failure_kind = if !mag2.is_finite()
+                || !ref_mag2.is_finite()
+                || !dz_mag2_before_step.is_finite()
+            {
+                FailureKind64::DeltaOverflow
+            } else {
+                FailureKind64::CancellationGlitch
+            };
             break;
         }
 
@@ -1365,6 +1759,7 @@ fn perturb64(
         let dz_mag2 = dz_re * dz_re + dz_im * dz_im;
         if !dz_mag2.is_finite() || (step_ref_mag2 > 1e-24 && dz_mag2 > step_ref_mag2 * 1e8) {
             glitch = true;
+            failure_kind = FailureKind64::DeltaOverflow;
             break;
         }
     }
@@ -1374,6 +1769,11 @@ fn perturb64(
             max_iter,
             mag2,
             true,
+            if glitch {
+                failure_kind
+            } else {
+                FailureKind64::EarlyReferenceEscape
+            },
             iter.min(max_iter),
             rebase_count,
             rebase_limit,
@@ -1408,6 +1808,7 @@ fn success_result64(
         mag2,
         glitch,
         unresolved: false,
+        failure_kind: FailureKind64::None,
         survived_iter: iter,
         periodic_interior,
         rebase_count,
@@ -1421,6 +1822,7 @@ fn failure_result64(
     iter: u32,
     mag2: f64,
     glitch: bool,
+    failure_kind: FailureKind64,
     survived_iter: u32,
     rebase_count: u32,
     rebase_limit: bool,
@@ -1432,6 +1834,7 @@ fn failure_result64(
         mag2,
         glitch,
         unresolved: true,
+        failure_kind,
         survived_iter,
         periodic_interior: false,
         rebase_count,
@@ -1663,9 +2066,15 @@ fn create_render_cluster_accumulators(rect: Rect64) -> Vec<ClusterAccumulator64>
                 count: 0,
                 sum_x: 0.0,
                 sum_y: 0.0,
+                min_x: f64::INFINITY,
+                min_y: f64::INFINITY,
+                max_x: f64::NEG_INFINITY,
+                max_y: f64::NEG_INFINITY,
                 best_x: 0.0,
                 best_y: 0.0,
                 best_survived_iter: -1,
+                best_source_reference_id: None,
+                failure_kind_counts: [0; 5],
             });
         }
     }
@@ -1678,6 +2087,8 @@ fn record_render_unresolved_cluster(
     screen_x: f64,
     screen_y: f64,
     survived_iter: u32,
+    failure_kind: FailureKind64,
+    source_reference_id: &str,
 ) {
     let cols = if rect.width >= rect.height * 1.5 {
         8
@@ -1698,10 +2109,22 @@ fn record_render_unresolved_cluster(
     cluster.count += 1;
     cluster.sum_x += screen_x;
     cluster.sum_y += screen_y;
+    cluster.min_x = cluster.min_x.min(screen_x);
+    cluster.min_y = cluster.min_y.min(screen_y);
+    cluster.max_x = cluster.max_x.max(screen_x);
+    cluster.max_y = cluster.max_y.max(screen_y);
+    if let Some(failure_index) = failure_kind_index(failure_kind) {
+        cluster.failure_kind_counts[failure_index] += 1;
+    }
     if survived_iter as i32 > cluster.best_survived_iter {
         cluster.best_survived_iter = survived_iter as i32;
         cluster.best_x = screen_x;
         cluster.best_y = screen_y;
+        cluster.best_source_reference_id = if source_reference_id.is_empty() {
+            None
+        } else {
+            Some(source_reference_id.to_string())
+        };
     }
 }
 
@@ -1713,23 +2136,48 @@ fn build_render_unresolved_clusters(
     let mut result: Vec<UnresolvedCluster64> = clusters
         .iter()
         .filter(|cluster| cluster.count > 0)
-        .map(|cluster| UnresolvedCluster64 {
-            screen_x: if cluster.best_x != 0.0 {
-                cluster.best_x
+        .map(|cluster| {
+            let bounds = if cluster.min_x.is_finite()
+                && cluster.min_y.is_finite()
+                && cluster.max_x.is_finite()
+                && cluster.max_y.is_finite()
+            {
+                let left = cluster.min_x.floor();
+                let top = cluster.min_y.floor();
+                let right = cluster.max_x.ceil().max(left + 1.0);
+                let bottom = cluster.max_y.ceil().max(top + 1.0);
+                Rect64 {
+                    x: left,
+                    y: top,
+                    width: right - left,
+                    height: bottom - top,
+                }
             } else {
-                cluster.sum_x / cluster.count as f64
-            },
-            screen_y: if cluster.best_y != 0.0 {
-                cluster.best_y
-            } else {
-                cluster.sum_y / cluster.count as f64
-            },
-            pixel_count: cluster.count,
-            survived_iter: cluster.best_survived_iter.max(0) as u32,
-            radius_px,
-            bin_x: cluster.bin_x,
-            bin_y: cluster.bin_y,
-            bounds: cluster.bounds,
+                cluster.bounds
+            };
+            UnresolvedCluster64 {
+                screen_x: if cluster.best_x != 0.0 {
+                    cluster.best_x
+                } else {
+                    cluster.sum_x / cluster.count as f64
+                },
+                screen_y: if cluster.best_y != 0.0 {
+                    cluster.best_y
+                } else {
+                    cluster.sum_y / cluster.count as f64
+                },
+                pixel_count: cluster.count,
+                survived_iter: cluster.best_survived_iter.max(0) as u32,
+                radius_px,
+                bin_x: cluster.bin_x,
+                bin_y: cluster.bin_y,
+                bounds,
+                source_reference_id: cluster.best_source_reference_id.clone().unwrap_or_default(),
+                failure_kind_counts: cluster.failure_kind_counts,
+                suggested_precision_bits: suggested_precision_bits_for_cluster(
+                    cluster.best_survived_iter.max(0) as u32,
+                ),
+            }
         })
         .collect();
     result.sort_by(|a, b| {
@@ -1739,6 +2187,32 @@ fn build_render_unresolved_clusters(
     });
     result.truncate(16);
     result
+}
+
+fn failure_kind_index(kind: FailureKind64) -> Option<usize> {
+    match kind {
+        FailureKind64::None => None,
+        FailureKind64::EarlyReferenceEscape => Some(0),
+        FailureKind64::CancellationGlitch => Some(1),
+        FailureKind64::DeltaOverflow => Some(2),
+        FailureKind64::RebaseLimit => Some(3),
+        FailureKind64::SeriesUnsafe => Some(4),
+    }
+}
+
+fn failure_kind_key(index: usize) -> &'static str {
+    match index {
+        0 => "earlyReferenceEscape",
+        1 => "cancellationGlitch",
+        2 => "deltaOverflow",
+        3 => "rebaseLimit",
+        _ => "seriesUnsafe",
+    }
+}
+
+fn suggested_precision_bits_for_cluster(survived_iter: u32) -> u32 {
+    let orbit_margin = ((survived_iter.max(1) as f64).log2() * 4.0).ceil() as u32;
+    (128 + orbit_margin).clamp(128, 4096)
 }
 
 #[allow(clippy::too_many_arguments)]

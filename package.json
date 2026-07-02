@@ -13,6 +13,8 @@
     "bench:reference": "node scripts/bench-reference.mjs",
     "prebench:deep-view": "npm run build",
     "bench:deep-view": "node scripts/bench-deep-view.mjs",
+    "prebench:regressions": "npm run build",
+    "bench:regressions": "node scripts/bench-regressions.mjs",
     "preview": "vite preview --host 127.0.0.1",
     "pretest": "npm run build:wasm",
     "test": "vitest run",

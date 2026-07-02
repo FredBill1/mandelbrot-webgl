@@ -1,4 +1,5 @@
 interface PendingReference {
+  type: "computeReference";
   requestId: number;
   centerRe: string;
   centerIm: string;
@@ -8,6 +9,21 @@ interface PendingReference {
   resolve: (value: RawReferenceResult) => void;
   reject: (reason: Error) => void;
 }
+
+interface PendingDefaultIter {
+  type: "estimateDefaultIter";
+  requestId: number;
+  re: string;
+  im: string;
+  scale: string;
+  width: number;
+  height: number;
+  baseline: number;
+  resolve: (value: number) => void;
+  reject: (reason: Error) => void;
+}
+
+type PendingWork = PendingReference | PendingDefaultIter;
 
 export interface RawReferenceResult {
   centerRe: string;
@@ -21,8 +37,8 @@ export interface RawReferenceResult {
 export class ReferenceClient {
   private readonly workers: Worker[] = [];
   private readonly idle: Worker[] = [];
-  private readonly queue: PendingReference[] = [];
-  private readonly inFlight = new Map<Worker, PendingReference>();
+  private readonly queue: PendingWork[] = [];
+  private readonly inFlight = new Map<Worker, PendingWork>();
   private requestId = 0;
 
   constructor(size = resolveReferenceWorkerCount()) {
@@ -31,6 +47,7 @@ export class ReferenceClient {
       worker.onmessage = (event: MessageEvent) => {
         const data = event.data as
           | { type: "referenceDone"; requestId: number; reference: RawReferenceResult }
+          | { type: "defaultIterDone"; requestId: number; maxIter: number }
           | { type: "referenceError"; requestId: number; message: string };
         this.handleMessage(worker, data);
       };
@@ -47,7 +64,16 @@ export class ReferenceClient {
   compute(centerRe: string, centerIm: string, scale: string, maxIter: number, minPrecisionBits = 128): Promise<RawReferenceResult> {
     const requestId = ++this.requestId;
     const promise = new Promise<RawReferenceResult>((resolve, reject) => {
-      this.queue.push({ requestId, centerRe, centerIm, scale, maxIter, minPrecisionBits, resolve, reject });
+      this.queue.push({ type: "computeReference", requestId, centerRe, centerIm, scale, maxIter, minPrecisionBits, resolve, reject });
+    });
+    this.pump();
+    return promise;
+  }
+
+  estimateDefaultIter(input: { re: string; im: string; scale: string; width: number; height: number; baseline: number }): Promise<number> {
+    const requestId = ++this.requestId;
+    const promise = new Promise<number>((resolve, reject) => {
+      this.queue.push({ type: "estimateDefaultIter", requestId, ...input, resolve, reject });
     });
     this.pump();
     return promise;
@@ -66,20 +92,23 @@ export class ReferenceClient {
     worker: Worker,
     data:
       | { type: "referenceDone"; requestId: number; reference: RawReferenceResult }
+      | { type: "defaultIterDone"; requestId: number; maxIter: number }
       | { type: "referenceError"; requestId: number; message: string }
   ): void {
     const pending = this.inFlight.get(worker);
     if (!pending) return;
     this.inFlight.delete(worker);
     this.idle.push(worker);
-    if (data.type === "referenceDone") {
+    if (data.type === "referenceDone" && pending.type === "computeReference") {
       pending.resolve({
         ...data.reference,
         orbitRe: data.reference.orbitRe instanceof Float64Array ? data.reference.orbitRe : Float64Array.from(data.reference.orbitRe),
         orbitIm: data.reference.orbitIm instanceof Float64Array ? data.reference.orbitIm : Float64Array.from(data.reference.orbitIm)
       });
+    } else if (data.type === "defaultIterDone" && pending.type === "estimateDefaultIter") {
+      pending.resolve(data.maxIter);
     } else {
-      pending.reject(new Error(data.message));
+      pending.reject(new Error(data.type === "referenceError" ? data.message : "Reference worker returned mismatched response"));
     }
     this.pump();
   }
@@ -100,15 +129,28 @@ export class ReferenceClient {
       const pending = this.queue.shift();
       if (!worker || !pending) break;
       this.inFlight.set(worker, pending);
-      worker.postMessage({
-        type: "computeReference",
-        requestId: pending.requestId,
-        centerRe: pending.centerRe,
-        centerIm: pending.centerIm,
-        scale: pending.scale,
-        maxIter: pending.maxIter,
-        minPrecisionBits: pending.minPrecisionBits
-      });
+      if (pending.type === "computeReference") {
+        worker.postMessage({
+          type: "computeReference",
+          requestId: pending.requestId,
+          centerRe: pending.centerRe,
+          centerIm: pending.centerIm,
+          scale: pending.scale,
+          maxIter: pending.maxIter,
+          minPrecisionBits: pending.minPrecisionBits
+        });
+      } else {
+        worker.postMessage({
+          type: "estimateDefaultIter",
+          requestId: pending.requestId,
+          re: pending.re,
+          im: pending.im,
+          scale: pending.scale,
+          width: pending.width,
+          height: pending.height,
+          baseline: pending.baseline
+        });
+      }
     }
   }
 }

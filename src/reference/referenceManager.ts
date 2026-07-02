@@ -128,6 +128,10 @@ export class ReferenceManager {
     return best?.reference;
   }
 
+  estimateDefaultIter(input: { re: string; im: string; scale: string; width: number; height: number; baseline: number }): Promise<number> {
+    return this.client.estimateDefaultIter(input);
+  }
+
   dispose(): void {
     this.client.dispose();
   }

@@ -126,7 +126,11 @@ describe("perturbation renderer", () => {
       expect(wasmResult.stats.aaPixelCount).toBe(tsResult.stats.aaPixelCount);
       expect(wasmResult.stats.aaSampleCount).toBe(tsResult.stats.aaSampleCount);
       expect(wasmResult.stats.referenceIdsUsed).toEqual(tsResult.stats.referenceIdsUsed);
-      expect(wasmResult.stats.unresolvedClusters).toEqual(tsResult.stats.unresolvedClusters);
+      expect(wasmResult.stats.unresolvedClusters.map(legacyClusterFields)).toEqual(tsResult.stats.unresolvedClusters.map(legacyClusterFields));
+      if (wasmResult.stats.unresolvedClusters.length > 0) {
+        expect(wasmResult.stats.unresolvedClusters[0].failureKindCounts).toBeDefined();
+        expect(wasmResult.stats.unresolvedClusters[0].suggestedPrecisionBits).toBeGreaterThanOrEqual(128);
+      }
       expectSampledPixelsClose(wasmResult.rgba, tsResult.rgba, wasmResult.width * wasmResult.height, 200);
     }
   );
@@ -769,6 +773,28 @@ function expectSampledPixelsClose(actual: ArrayBuffer, expected: ArrayBuffer, pi
       expect(Math.abs(actualBytes[offset + channel] - expectedBytes[offset + channel])).toBeLessThanOrEqual(1);
     }
   }
+}
+
+function legacyClusterFields(cluster: {
+  screenX: number;
+  screenY: number;
+  pixelCount: number;
+  survivedIter: number;
+  radiusPx: number;
+  binX: number;
+  binY: number;
+  bounds: { x: number; y: number; width: number; height: number };
+}) {
+  return {
+    screenX: cluster.screenX,
+    screenY: cluster.screenY,
+    pixelCount: cluster.pixelCount,
+    survivedIter: cluster.survivedIter,
+    radiusPx: cluster.radiusPx,
+    binX: cluster.binX,
+    binY: cluster.binY,
+    bounds: cluster.bounds
+  };
 }
 
 function pointAtScreen(view: { re: string; im: string; scale: string }, x: number, y: number): { re: string; im: string } {

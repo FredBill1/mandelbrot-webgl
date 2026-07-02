@@ -1,11 +1,12 @@
 import { buildSeriesPlan, evaluateSeries, type Complex } from "../math/series";
-import type { ReferenceSnapshot, RenderTileMessage, TileDoneMessage, UnresolvedCluster } from "../types";
+import type { FailureKind, ReferenceSnapshot, RenderTileMessage, TileDoneMessage, UnresolvedCluster } from "../types";
 
 interface PixelResult {
   iter: number;
   mag2: number;
   glitch: boolean;
   unresolved: boolean;
+  failureKind: FailureKind;
   survivedIter: number;
   periodicInterior: boolean;
   rebaseCount: number;
@@ -47,6 +48,10 @@ interface ClusterAccumulator {
   count: number;
   sumX: number;
   sumY: number;
+  minX: number;
+  minY: number;
+  maxX: number;
+  maxY: number;
   bestX: number;
   bestY: number;
   bestSurvivedIter: number;
@@ -220,6 +225,8 @@ export function renderPerturbationTile(message: RenderTileMessage): TileDoneMess
       )
     : emptyBoundaryStats();
 
+  const unresolvedMaskOutput =
+    message.renderMode === "final" && unresolvedCount > 0 ? unresolvedMask.slice().buffer : undefined;
   if (unresolvedCount > 0) fillUnresolvedPreview(rgba, unresolvedMask, width, height);
 
   const unresolvedScreenX = unresolvedCount > 0 ? unresolvedScreenXSum / unresolvedCount : undefined;
@@ -238,6 +245,7 @@ export function renderPerturbationTile(message: RenderTileMessage): TileDoneMess
     width,
     height,
     rgba: rgba.buffer,
+    unresolvedMask: unresolvedMaskOutput,
     needsReference: unresolvedClusters.length > 0,
     stats: {
       elapsedMs: performance.now() - started,
@@ -261,7 +269,8 @@ export function renderPerturbationTile(message: RenderTileMessage): TileDoneMess
       unresolvedScreenY,
       unresolvedClusters,
       preview: message.renderMode === "preview",
-      renderMode: message.renderMode
+      renderMode: message.renderMode,
+      exactFallbackPixels: 0
     }
   };
 }
@@ -326,6 +335,7 @@ function createPixelResult(): PixelResult {
     mag2: 0,
     glitch: false,
     unresolved: false,
+    failureKind: "earlyReferenceEscape",
     survivedIter: 0,
     periodicInterior: false,
     rebaseCount: 0,
@@ -340,6 +350,7 @@ function copyPixelResult(source: PixelResult, target: PixelResult): void {
   target.mag2 = source.mag2;
   target.glitch = source.glitch;
   target.unresolved = source.unresolved;
+  target.failureKind = source.failureKind;
   target.survivedIter = source.survivedIter;
   target.periodicInterior = source.periodicInterior;
   target.rebaseCount = source.rebaseCount;
@@ -498,6 +509,7 @@ function successResult(
   output.mag2 = mag2;
   output.glitch = glitch;
   output.unresolved = false;
+  output.failureKind = "earlyReferenceEscape";
   output.survivedIter = iter;
   output.periodicInterior = periodicInterior;
   output.rebaseCount = rebaseCount;
@@ -522,6 +534,7 @@ function failureResult(
   output.mag2 = mag2;
   output.glitch = glitch;
   output.unresolved = true;
+  output.failureKind = "earlyReferenceEscape";
   output.survivedIter = survivedIter;
   output.periodicInterior = false;
   output.rebaseCount = rebaseCount;
@@ -549,6 +562,10 @@ function createClusterAccumulators(rect: { x: number; y: number; width: number; 
         count: 0,
         sumX: 0,
         sumY: 0,
+        minX: Number.POSITIVE_INFINITY,
+        minY: Number.POSITIVE_INFINITY,
+        maxX: Number.NEGATIVE_INFINITY,
+        maxY: Number.NEGATIVE_INFINITY,
         bestX: 0,
         bestY: 0,
         bestSurvivedIter: -1
@@ -574,6 +591,10 @@ function recordUnresolvedCluster(
   cluster.count += 1;
   cluster.sumX += screenX;
   cluster.sumY += screenY;
+  cluster.minX = Math.min(cluster.minX, screenX);
+  cluster.minY = Math.min(cluster.minY, screenY);
+  cluster.maxX = Math.max(cluster.maxX, screenX);
+  cluster.maxY = Math.max(cluster.maxY, screenY);
   if (survivedIter > cluster.bestSurvivedIter) {
     cluster.bestSurvivedIter = survivedIter;
     cluster.bestX = screenX;
@@ -596,10 +617,26 @@ function buildUnresolvedClusters(
       radiusPx,
       binX: cluster.binX,
       binY: cluster.binY,
-      bounds: cluster.bounds
+      bounds: clusterBounds(cluster)
     }))
     .sort((a, b) => b.pixelCount - a.pixelCount || b.survivedIter - a.survivedIter)
     .slice(0, 16);
+}
+
+function clusterBounds(cluster: ClusterAccumulator): { x: number; y: number; width: number; height: number } {
+  if (
+    !Number.isFinite(cluster.minX) ||
+    !Number.isFinite(cluster.minY) ||
+    !Number.isFinite(cluster.maxX) ||
+    !Number.isFinite(cluster.maxY)
+  ) {
+    return cluster.bounds;
+  }
+  const left = Math.floor(cluster.minX);
+  const top = Math.floor(cluster.minY);
+  const right = Math.max(left + 1, Math.ceil(cluster.maxX));
+  const bottom = Math.max(top + 1, Math.ceil(cluster.maxY));
+  return { x: left, y: top, width: right - left, height: bottom - top };
 }
 
 function applyBoundarySmoothing(

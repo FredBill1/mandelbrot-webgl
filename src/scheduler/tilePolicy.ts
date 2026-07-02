@@ -43,13 +43,8 @@ export function shouldSplitTile(input: {
   hasLocalRefinement: boolean;
   microtileAllowed: boolean;
 }): boolean {
-  if (!canSplitRect(input.rect)) return false;
-  if (input.unresolvedCount <= 0) return false;
-  if (input.pendingReferences > 0) return false;
-  if (!input.hasLocalRefinement) return false;
-  if (input.referenceCount < input.maxReferences && input.stalledRefinementRounds < STALLED_ROUNDS_BEFORE_SPLIT) return false;
-  if (Math.max(input.rect.width, input.rect.height) <= MIN_NORMAL_SUBTILE_SIZE && !input.microtileAllowed) return false;
-  return input.lastUnresolvedCount !== undefined;
+  void input;
+  return false;
 }
 
 export function canSplitRect(rect: Rect): boolean {

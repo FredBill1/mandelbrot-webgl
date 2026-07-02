@@ -32,8 +32,13 @@ try {
 
   const started = Date.now();
   let hud = await readHud(page);
+  let maxHudTotalTiles = 0;
+  let maxHudCompletedTiles = 0;
   while (Date.now() - started < options.timeoutMs) {
     hud = await readHud(page);
+    const hudTiles = parseTileProgress(hud.tiles);
+    maxHudCompletedTiles = Math.max(maxHudCompletedTiles, hudTiles.completed);
+    maxHudTotalTiles = Math.max(maxHudTotalTiles, hudTiles.total);
     if (hud.status === "stable") break;
     await page.waitForTimeout(500);
   }
@@ -41,9 +46,12 @@ try {
   const elapsedMs = Date.now() - started;
   const bench = await page.evaluate(() => globalThis.__deepBench);
   bench.stableAt = elapsedMs;
+  const hudTiles = parseTileProgress(hud.tiles);
+  const refs = Number(hud.refs) || 0;
   const summary = {
     elapsedMs,
     stable: hud.status === "stable",
+    stableMs: hud.status === "stable" ? elapsedMs : null,
     assertMs: options.assertMs,
     timeoutMs: options.timeoutMs,
     hud,
@@ -69,7 +77,25 @@ try {
       previewQueueMs: percentiles(bench.samples.previewQueueMs)
     },
     waves: bench.waves,
-    slowFinalTiles: bench.slowFinalTiles
+    slowFinalTiles: bench.slowFinalTiles,
+    regression: {
+      stableMs: hud.status === "stable" ? elapsedMs : null,
+      tileDone: bench.counts.tileDone,
+      finalCount: bench.counts.final,
+      exactCount: bench.counts.exact,
+      previewCount: bench.counts.preview,
+      referenceDone: bench.counts.referenceDone,
+      totalTiles: hudTiles.total || maxHudTotalTiles,
+      maxActiveTiles: maxHudTotalTiles,
+      refs,
+      p50WorkerMs: percentiles(bench.samples.finalWorkerMs).p50,
+      p95WorkerMs: percentiles(bench.samples.finalWorkerMs).p95,
+      exactFallbackPixels: bench.waves.exactFallbackPixels,
+      unresolvedFinals: bench.waves.unresolvedFinals,
+      onePixelTiles: bench.waves.onePixelTiles,
+      minTileArea: bench.waves.minTileArea === Infinity ? 0 : bench.waves.minTileArea,
+      maxCompletedTiles: maxHudCompletedTiles
+    }
   };
 
   console.log(JSON.stringify(summary, null, 2));
@@ -162,7 +188,8 @@ function installWorkerProbe() {
       finalUploaded: 0,
       previewUploaded: 0,
       referenceDone: 0,
-      referenceError: 0
+      referenceError: 0,
+      exact: 0
     },
     sums: {
       finalWorkerMs: 0,
@@ -193,7 +220,10 @@ function installWorkerProbe() {
       totalAaSamples: 0,
       totalGlitches: 0,
       totalRebases: 0,
-      totalPeriodicInterior: 0
+      totalPeriodicInterior: 0,
+      exactFallbackPixels: 0,
+      onePixelTiles: 0,
+      minTileArea: Infinity
     },
     slowFinalTiles: [],
     profile: {
@@ -288,8 +318,12 @@ function installWorkerProbe() {
       if (data?.type === "tileDone") {
         const wallMs = current?.type === "tile" ? performance.now() - current.started : data.stats.elapsedMs;
         bench.counts.tileDone += 1;
-        if (data.stats.renderMode === "final") {
+        const tileArea = Math.max(0, data.width) * Math.max(0, data.height);
+        bench.waves.minTileArea = Math.min(bench.waves.minTileArea, tileArea);
+        if (data.width <= 1 || data.height <= 1) bench.waves.onePixelTiles += 1;
+        if (data.stats.renderMode !== "preview") {
           bench.counts.final += 1;
+          if (data.stats.renderMode === "exact") bench.counts.exact += 1;
           bench.sums.finalWorkerMs += data.stats.elapsedMs;
           bench.sums.finalWallMs += wallMs;
           bench.samples.finalWorkerMs.push(data.stats.elapsedMs);
@@ -304,6 +338,7 @@ function installWorkerProbe() {
           bench.waves.totalGlitches += data.stats.glitchCount;
           bench.waves.totalRebases += data.stats.rebaseCount;
           bench.waves.totalPeriodicInterior += data.stats.periodicInteriorCount;
+          bench.waves.exactFallbackPixels += data.stats.exactFallbackPixels ?? 0;
           pushSlowFinal({
             workerMs: Math.round(data.stats.elapsedMs),
             wallMs: Math.round(wallMs),
@@ -433,6 +468,14 @@ function percentiles(values) {
 
 function round(value) {
   return Number(value.toFixed(2));
+}
+
+function parseTileProgress(value) {
+  const match = /^(\d+)\/(\d+)$/.exec(String(value).trim());
+  return {
+    completed: match ? Number(match[1]) : 0,
+    total: match ? Number(match[2]) : 0
+  };
 }
 
 async function writeProfile(path, payload) {

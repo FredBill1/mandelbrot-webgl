@@ -43,7 +43,7 @@ describe("tile refinement policy", () => {
     ).toBe(false);
   });
 
-  it("splits only after stalled refinement rounds", () => {
+  it("does not split after stalled refinement rounds; exact fallback owns termination", () => {
     const first = nextStalledRefinementRounds(1000, 900, 0);
     const second = nextStalledRefinementRounds(900, 850, first);
     expect(first).toBe(1);
@@ -60,7 +60,7 @@ describe("tile refinement policy", () => {
         hasLocalRefinement: true,
         microtileAllowed: false
       })
-    ).toBe(true);
+    ).toBe(false);
   });
 
   it("does not split just because global candidates fill the render list", () => {
