@@ -100,6 +100,31 @@ describe("ReferenceManager", () => {
     expect(client.compute).toHaveBeenCalledTimes(1);
   });
 
+  it("carries references to a new revision with the same screen transform as retained tiles", async () => {
+    const maxIter = 64;
+    const client = makeClient(maxIter);
+    const manager = new ReferenceManager(client);
+    const view = makeView(maxIter);
+    const tile = makeTile("carried", 100, 120);
+    const reference = await manager.ensureTileReference(view, tile, 128);
+
+    manager.carryForwardReferences(view.revision, 2, maxIter, {
+      dx: 7,
+      dy: -5,
+      scale: 2,
+      anchorX: 50,
+      anchorY: 60
+    });
+
+    const selected = manager.selectBest({ ...tile, revision: 2, centerScreenX: 157, centerScreenY: 175 }, maxIter, 2);
+    expect(selected).toBeDefined();
+    expect(selected?.id).not.toBe(reference.id);
+    expect(selected?.orbitRe).toBe(reference.orbitRe);
+    expect(selected?.orbitIm).toBe(reference.orbitIm);
+    expect(selected?.screenX).toBe(157);
+    expect(selected?.screenY).toBe(175);
+  });
+
   it("caps reference worker count to a small CPU fraction", () => {
     expect(resolveReferenceWorkerCount(1)).toBe(1);
     expect(resolveReferenceWorkerCount(8)).toBe(2);

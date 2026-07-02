@@ -1,6 +1,10 @@
 interface PendingReference {
   type: "computeReference";
   requestId: number;
+  revision: number | undefined;
+  priority: number;
+  sequence: number;
+  kind: ReferenceWorkKind;
   centerRe: string;
   centerIm: string;
   scale: string;
@@ -13,6 +17,10 @@ interface PendingReference {
 interface PendingDefaultIter {
   type: "estimateDefaultIter";
   requestId: number;
+  revision: number | undefined;
+  priority: number;
+  sequence: number;
+  kind: ReferenceWorkKind;
   re: string;
   im: string;
   scale: string;
@@ -24,6 +32,13 @@ interface PendingDefaultIter {
 }
 
 type PendingWork = PendingReference | PendingDefaultIter;
+export type ReferenceWorkKind = "viewReference" | "localReference" | "defaultIter";
+
+export interface ReferenceWorkOptions {
+  revision?: number;
+  priority?: number;
+  kind?: ReferenceWorkKind;
+}
 
 export interface RawReferenceResult {
   centerRe: string;
@@ -40,20 +55,11 @@ export class ReferenceClient {
   private readonly queue: PendingWork[] = [];
   private readonly inFlight = new Map<Worker, PendingWork>();
   private requestId = 0;
+  private sequence = 0;
 
   constructor(size = resolveReferenceWorkerCount()) {
     for (let index = 0; index < size; index += 1) {
-      const worker = new Worker(new URL("../workers/referenceWorker.ts", import.meta.url), { type: "module" });
-      worker.onmessage = (event: MessageEvent) => {
-        const data = event.data as
-          | { type: "referenceDone"; requestId: number; reference: RawReferenceResult }
-          | { type: "defaultIterDone"; requestId: number; maxIter: number }
-          | { type: "referenceError"; requestId: number; message: string };
-        this.handleMessage(worker, data);
-      };
-      worker.onerror = (event) => this.handleError(worker, new Error(event.message));
-      this.workers.push(worker);
-      this.idle.push(worker);
+      this.idle.push(this.createWorker());
     }
   }
 
@@ -61,22 +67,62 @@ export class ReferenceClient {
     return this.workers.length;
   }
 
-  compute(centerRe: string, centerIm: string, scale: string, maxIter: number, minPrecisionBits = 128): Promise<RawReferenceResult> {
+  compute(centerRe: string, centerIm: string, scale: string, maxIter: number, minPrecisionBits = 128, options: ReferenceWorkOptions = {}): Promise<RawReferenceResult> {
     const requestId = ++this.requestId;
     const promise = new Promise<RawReferenceResult>((resolve, reject) => {
-      this.queue.push({ type: "computeReference", requestId, centerRe, centerIm, scale, maxIter, minPrecisionBits, resolve, reject });
+      this.enqueue({
+        type: "computeReference",
+        requestId,
+        revision: options.revision,
+        priority: options.priority ?? 10,
+        sequence: ++this.sequence,
+        kind: options.kind ?? "localReference",
+        centerRe,
+        centerIm,
+        scale,
+        maxIter,
+        minPrecisionBits,
+        resolve,
+        reject
+      });
     });
     this.pump();
     return promise;
   }
 
-  estimateDefaultIter(input: { re: string; im: string; scale: string; width: number; height: number; baseline: number }): Promise<number> {
+  estimateDefaultIter(input: { re: string; im: string; scale: string; width: number; height: number; baseline: number }, options: ReferenceWorkOptions = {}): Promise<number> {
     const requestId = ++this.requestId;
     const promise = new Promise<number>((resolve, reject) => {
-      this.queue.push({ type: "estimateDefaultIter", requestId, ...input, resolve, reject });
+      this.enqueue({
+        type: "estimateDefaultIter",
+        requestId,
+        revision: options.revision,
+        priority: options.priority ?? 100,
+        sequence: ++this.sequence,
+        kind: options.kind ?? "defaultIter",
+        ...input,
+        resolve,
+        reject
+      });
     });
     this.pump();
     return promise;
+  }
+
+  cancelObsoleteWork(currentRevision: number): void {
+    for (let index = this.queue.length - 1; index >= 0; index -= 1) {
+      const pending = this.queue[index];
+      if (pending.revision === undefined || pending.revision >= currentRevision) continue;
+      this.queue.splice(index, 1);
+      pending.reject(new Error("obsolete reference revision"));
+    }
+    for (const [worker, pending] of [...this.inFlight.entries()]) {
+      if (pending.revision === undefined || pending.revision >= currentRevision) continue;
+      this.inFlight.delete(worker);
+      pending.reject(new Error("obsolete reference revision"));
+      this.replaceWorker(worker);
+    }
+    this.pump();
   }
 
   dispose(): void {
@@ -86,6 +132,34 @@ export class ReferenceClient {
     this.queue.splice(0);
     this.inFlight.clear();
     this.idle.splice(0);
+  }
+
+  private enqueue(work: PendingWork): void {
+    this.queue.push(work);
+    this.queue.sort((a, b) => a.priority - b.priority || a.sequence - b.sequence);
+  }
+
+  private createWorker(): Worker {
+    const worker = new Worker(new URL("../workers/referenceWorker.ts", import.meta.url), { type: "module" });
+    worker.onmessage = (event: MessageEvent) => {
+      const data = event.data as
+        | { type: "referenceDone"; requestId: number; reference: RawReferenceResult }
+        | { type: "defaultIterDone"; requestId: number; maxIter: number }
+        | { type: "referenceError"; requestId: number; message: string };
+      this.handleMessage(worker, data);
+    };
+    worker.onerror = (event) => this.handleError(worker, new Error(event.message));
+    this.workers.push(worker);
+    return worker;
+  }
+
+  private replaceWorker(worker: Worker): void {
+    worker.terminate();
+    const idleIndex = this.idle.indexOf(worker);
+    if (idleIndex >= 0) this.idle.splice(idleIndex, 1);
+    const workerIndex = this.workers.indexOf(worker);
+    if (workerIndex >= 0) this.workers.splice(workerIndex, 1);
+    this.idle.push(this.createWorker());
   }
 
   private handleMessage(

@@ -1,11 +1,19 @@
 import { REFERENCE_CACHE_SOFT_BYTES, type ReferenceSnapshot, type RuntimeView, type TileDescriptor } from "../types";
-import { ReferenceClient } from "./referenceClient";
+import { ReferenceClient, type ReferenceWorkOptions } from "./referenceClient";
 
 interface ReferenceKey {
   centerRe: string;
   centerIm: string;
   maxIter: number;
   precisionBits: number;
+}
+
+export interface ReferenceScreenTransform {
+  dx: number;
+  dy: number;
+  scale: number;
+  anchorX: number;
+  anchorY: number;
 }
 
 export class ReferenceManager {
@@ -41,7 +49,7 @@ export class ReferenceManager {
     this.trim(this.currentViewReference?.revision ?? 0);
   }
 
-  async ensureViewReference(view: RuntimeView): Promise<ReferenceSnapshot> {
+  async ensureViewReference(view: RuntimeView, priority = 0): Promise<ReferenceSnapshot> {
     const reference = await this.ensureReference({
       centerRe: view.re,
       centerIm: view.im,
@@ -50,13 +58,14 @@ export class ReferenceManager {
       scale: view.scale,
       maxIter: view.maxIter,
       revision: view.revision,
-      minPrecisionBits: 128
+      minPrecisionBits: 128,
+      work: { revision: view.revision, priority, kind: "viewReference" }
     });
     this.currentViewReference = reference;
     return reference;
   }
 
-  async ensureTileReference(view: RuntimeView, tile: TileDescriptor, minPrecisionBits: number): Promise<ReferenceSnapshot> {
+  async ensureTileReference(view: RuntimeView, tile: TileDescriptor, minPrecisionBits: number, priority = 10): Promise<ReferenceSnapshot> {
     return this.ensureReference({
       centerRe: tile.centerRe,
       centerIm: tile.centerIm,
@@ -65,7 +74,8 @@ export class ReferenceManager {
       scale: view.scale,
       maxIter: view.maxIter,
       revision: view.revision,
-      minPrecisionBits
+      minPrecisionBits,
+      work: { revision: view.revision, priority, kind: "localReference" }
     });
   }
 
@@ -128,8 +138,41 @@ export class ReferenceManager {
     return best?.reference;
   }
 
-  estimateDefaultIter(input: { re: string; im: string; scale: string; width: number; height: number; baseline: number }): Promise<number> {
-    return this.client.estimateDefaultIter(input);
+  estimateDefaultIter(input: { re: string; im: string; scale: string; width: number; height: number; baseline: number }, revision?: number): Promise<number> {
+    return this.client.estimateDefaultIter(input, { revision, priority: 100, kind: "defaultIter" });
+  }
+
+  cancelObsoleteWork(currentRevision: number): void {
+    this.client.cancelObsoleteWork(currentRevision);
+    this.trim(currentRevision);
+  }
+
+  carryForwardReferences(fromRevision: number, toRevision: number, maxIter: number, transform: ReferenceScreenTransform): void {
+    const carried: ReferenceSnapshot[] = [];
+    for (const reference of this.references.values()) {
+      if (reference.revision !== fromRevision || reference.maxIter < maxIter) continue;
+      const screen = transformReferenceScreen(reference.screenX, reference.screenY, transform);
+      carried.push({
+        ...reference,
+        id: `ref-${++this.sequence}`,
+        screenX: screen.x,
+        screenY: screen.y,
+        maxIter,
+        revision: toRevision
+      });
+    }
+    for (const reference of carried) {
+      this.references.set(
+        referenceKey({
+          centerRe: reference.centerRe,
+          centerIm: reference.centerIm,
+          maxIter: reference.maxIter,
+          precisionBits: reference.precisionBits
+        }),
+        reference
+      );
+    }
+    this.trim(toRevision);
   }
 
   dispose(): void {
@@ -145,6 +188,7 @@ export class ReferenceManager {
     maxIter: number;
     revision: number;
     minPrecisionBits: number;
+    work?: ReferenceWorkOptions;
   }): Promise<ReferenceSnapshot> {
     const satisfying = this.findSatisfyingReference(input.centerRe, input.centerIm, input.maxIter, input.minPrecisionBits);
     if (satisfying) {
@@ -171,7 +215,7 @@ export class ReferenceManager {
     }
 
     const promise = this.client
-      .compute(input.centerRe, input.centerIm, input.scale, input.maxIter, input.minPrecisionBits)
+      .compute(input.centerRe, input.centerIm, input.scale, input.maxIter, input.minPrecisionBits, input.work)
       .then((raw) => {
         const snapshot: ReferenceSnapshot = {
           id: `ref-${++this.sequence}`,
@@ -252,4 +296,11 @@ function referenceKey(key: ReferenceKey): string {
 
 function referenceBytes(reference: ReferenceSnapshot): number {
   return reference.orbitRe.byteLength + reference.orbitIm.byteLength;
+}
+
+function transformReferenceScreen(x: number, y: number, transform: ReferenceScreenTransform): { x: number; y: number } {
+  return {
+    x: transform.anchorX + (x - transform.anchorX) * transform.scale + transform.dx,
+    y: transform.anchorY + (y - transform.anchorY) * transform.scale + transform.dy
+  };
 }

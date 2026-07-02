@@ -44,6 +44,7 @@ try {
   }
 
   const elapsedMs = Date.now() - started;
+  const interactive = summaryCanInteract(hud, options) ? await runInteraction(page, options.interaction) : undefined;
   const bench = await page.evaluate(() => globalThis.__deepBench);
   bench.stableAt = elapsedMs;
   const hudTiles = parseTileProgress(hud.tiles);
@@ -77,6 +78,7 @@ try {
       previewQueueMs: percentiles(bench.samples.previewQueueMs)
     },
     waves: bench.waves,
+    interactive,
     slowFinalTiles: bench.slowFinalTiles,
     regression: {
       stableMs: hud.status === "stable" ? elapsedMs : null,
@@ -121,7 +123,8 @@ function parseArgs(args) {
     timeoutMs: 180_000,
     port: 4173,
     url: undefined,
-    profileJson: undefined
+    profileJson: undefined,
+    interaction: undefined
   };
   for (let i = 0; i < args.length; i += 1) {
     const arg = args[i];
@@ -145,6 +148,10 @@ function parseArgs(args) {
       parsed.profileJson = args[++i];
     } else if (arg.startsWith("--profile-json=")) {
       parsed.profileJson = arg.slice("--profile-json=".length);
+    } else if (arg === "--interaction") {
+      parsed.interaction = args[++i];
+    } else if (arg.startsWith("--interaction=")) {
+      parsed.interaction = arg.slice("--interaction=".length);
     } else {
       throw new Error(`Unknown argument: ${arg}`);
     }
@@ -154,7 +161,130 @@ function parseArgs(args) {
   }
   if (!Number.isFinite(parsed.timeoutMs) || parsed.timeoutMs <= 0) throw new Error("--timeout-ms must be a positive number");
   if (!Number.isFinite(parsed.port) || parsed.port <= 0) throw new Error("--port must be a positive number");
+  if (parsed.interaction !== undefined && !["pan", "zoom"].includes(parsed.interaction)) throw new Error("--interaction must be pan or zoom");
   return parsed;
+}
+
+function summaryCanInteract(hud, options) {
+  return options.interaction !== undefined && hud.status === "stable";
+}
+
+async function runInteraction(page, interaction) {
+  const before = await canvasSignature(page);
+  const inputTime = await dispatchInteraction(page, interaction);
+
+  let firstVisualChangeMs = await waitForRetainedFrame(page, inputTime, 250);
+  if (firstVisualChangeMs === null) {
+    const visualDeadline = Date.now() + 1000;
+    while (Date.now() < visualDeadline) {
+      const current = await canvasSignature(page);
+      if (current !== before) {
+        firstVisualChangeMs = await page.evaluate((started) => performance.now() - started, inputTime);
+        break;
+      }
+      await page.waitForTimeout(25);
+    }
+  }
+
+  await page.waitForTimeout(1500);
+  return page.evaluate(({ inputTime, firstVisualChangeMs, interaction }) => {
+    const bench = globalThis.__deepBench;
+    const events = bench?.profile?.events ?? [];
+    const revisions = events
+      .filter((event) => typeof event.revision === "number" && event.now >= inputTime)
+      .map((event) => event.revision);
+    const newRevision = revisions.length > 0 ? Math.max(...revisions) : undefined;
+    const newQueues = events.filter((event) => event.type === "tileQueued" && event.now >= inputTime && event.revision === newRevision);
+    const firstQueued = newQueues.reduce((best, event) => Math.min(best, event.now), Number.POSITIVE_INFINITY);
+    const renders = Object.values(bench?.profile?.tiles ?? {}).flatMap((tile) =>
+      (tile.renders ?? []).map((render) => ({ ...render, revision: tile.revision }))
+    );
+    const newRenders = renders.filter((render) => render.doneAt >= inputTime && render.revision === newRevision);
+    const oldRenders = renders.filter((render) => render.doneAt >= inputTime && newRevision !== undefined && render.revision < newRevision);
+    const firstDone = newRenders.reduce((best, render) => Math.min(best, render.doneAt), Number.POSITIVE_INFINITY);
+    return {
+      interaction,
+      inputTime,
+      newRevision,
+      firstVisualChangeMs: firstVisualChangeMs === null ? null : Number(firstVisualChangeMs.toFixed(2)),
+      newRevisionQueuedMs: Number.isFinite(firstQueued) ? Number((firstQueued - inputTime).toFixed(2)) : null,
+      firstNewTileDoneMs: Number.isFinite(firstDone) ? Number((firstDone - inputTime).toFixed(2)) : null,
+      oldRevisionTileDoneAfterInput: oldRenders.length,
+      status: document.querySelector("#readStatus")?.textContent ?? ""
+    };
+  }, { inputTime, firstVisualChangeMs, interaction });
+}
+
+async function waitForRetainedFrame(page, inputTime, timeoutMs) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    const elapsed = await page.evaluate((started) => {
+      const events = globalThis.__deepBench?.profile?.events ?? [];
+      const frame = events.find((event) => event.type === "retainedFrameRendered" && event.now >= started);
+      return frame === undefined ? null : frame.now - started;
+    }, inputTime);
+    if (elapsed !== null) return elapsed;
+    await page.waitForTimeout(10);
+  }
+  return null;
+}
+
+async function dispatchInteraction(page, interaction) {
+  return page.evaluate((interaction) => {
+    const canvas = document.querySelector("canvas");
+    if (!canvas) return performance.now();
+    const rect = canvas.getBoundingClientRect();
+    const x = rect.left + rect.width * 0.5;
+    const y = rect.top + rect.height * 0.5;
+    const started = performance.now();
+    if (interaction === "pan") {
+      const init = {
+        bubbles: true,
+        cancelable: true,
+        pointerId: 1,
+        pointerType: "mouse",
+        isPrimary: true,
+        buttons: 1
+      };
+      canvas.dispatchEvent(new PointerEvent("pointerdown", { ...init, clientX: x, clientY: y }));
+      canvas.dispatchEvent(new PointerEvent("pointermove", { ...init, clientX: x + 300, clientY: y + 120 }));
+      canvas.dispatchEvent(new PointerEvent("pointerup", { ...init, buttons: 0, clientX: x + 300, clientY: y + 120 }));
+    } else {
+      canvas.dispatchEvent(new WheelEvent("wheel", {
+        bubbles: true,
+        cancelable: true,
+        clientX: x,
+        clientY: y,
+        deltaY: -600
+      }));
+    }
+    return started;
+  }, interaction);
+}
+
+async function canvasSignature(page) {
+  const box = await page.locator("canvas").boundingBox();
+  if (!box) return "";
+  const png = await page.screenshot({ clip: centeredClip(box), timeout: 2000 });
+  return hashBytes(png);
+}
+
+function centeredClip(box) {
+  return {
+    x: Math.floor(box.x + box.width * 0.25),
+    y: Math.floor(box.y + box.height * 0.25),
+    width: Math.max(1, Math.floor(box.width * 0.5)),
+    height: Math.max(1, Math.floor(box.height * 0.5))
+  };
+}
+
+function hashBytes(bytes) {
+  let hash = 2166136261;
+  for (const byte of bytes) {
+    hash ^= byte;
+    hash = Math.imul(hash, 16777619) >>> 0;
+  }
+  return String(hash);
 }
 
 async function findFreePort(startPort) {

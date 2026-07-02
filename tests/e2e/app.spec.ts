@@ -191,6 +191,30 @@ test("previews and stabilizes the 1912x948 deep interior regression view", async
   expect(pixel[0] + pixel[1] + pixel[2]).toBeGreaterThan(10);
 });
 
+test("keeps rendered deep tiles responsive during pan and zoom", async ({ page }) => {
+  test.setTimeout(90_000);
+  await page.setViewportSize({ width: 1912, height: 948 });
+  await page.goto(DEEP_INTERIOR_REGRESSION_URL);
+  await waitForNonBlankCanvas(page, 75_000);
+
+  const panStart = await page.evaluate(() => performance.now());
+  await page.mouse.move(956, 474);
+  await page.mouse.down();
+  await page.mouse.move(1256, 594, { steps: 1 });
+  await page.mouse.up();
+  await expect.poll(() => hasRetainedFrameAfter(page, panStart), { timeout: 500 }).toBe(true);
+  await expect(page.locator("#readStatus")).not.toHaveText(/iteration probe|reference pan/i);
+
+  await page.goto(DEEP_INTERIOR_REGRESSION_URL);
+  await waitForNonBlankCanvas(page, 75_000);
+
+  const zoomStart = await page.evaluate(() => performance.now());
+  await page.mouse.move(956, 474);
+  await page.mouse.wheel(0, -600);
+  await expect.poll(() => hasRetainedFrameAfter(page, zoomStart), { timeout: 500 }).toBe(true);
+  await expect(page.locator("#readStatus")).not.toHaveText(/iteration probe|reference zoom/i);
+});
+
 test("does not leave false periodic disks black at 1e27", async ({ page }) => {
   test.setTimeout(90_000);
   await page.setViewportSize({ width: 1912, height: 948 });
@@ -350,6 +374,15 @@ async function readCanvasPixel(page: import("@playwright/test").Page, x: number,
     },
     { x, y }
   );
+}
+
+async function hasRetainedFrameAfter(page: import("@playwright/test").Page, started: number): Promise<boolean> {
+  return page.evaluate((startedAt) => {
+    const frame = (globalThis as unknown as {
+      __mandelbrotLastRetainedFrame?: { now?: number; retainedCount?: number };
+    }).__mandelbrotLastRetainedFrame;
+    return typeof frame?.now === "number" && frame.now >= startedAt && (frame.retainedCount ?? 0) > 0;
+  }, started);
 }
 
 async function readTileCounts(page: import("@playwright/test").Page): Promise<{ completed: number; total: number }> {

@@ -1,5 +1,5 @@
 import { ReferenceManager } from "./reference/referenceManager";
-import { WebglTileRenderer } from "./render/webglRenderer";
+import { WebglTileRenderer, type RetainedScreenTransform } from "./render/webglRenderer";
 import {
   clusterReferenceLimit,
   MAX_CLUSTER_REFERENCES_PER_PASS,
@@ -14,7 +14,7 @@ import {
   writeViewToUrl
 } from "./state/urlState";
 import { decimalLog10, defaultMaxIter, formatCompactDecimal, pixelSpanForView } from "./math/view";
-import { initWasm, pointToViewCenter, transformView } from "./wasmApi";
+import { initWasm, pointToViewCenterNow, transformViewNow } from "./wasmApi";
 import {
   SERIES_DEGREE,
   TILE_SIZE,
@@ -65,6 +65,8 @@ interface TileWorkState {
   exactUnresolvedMask: ArrayBuffer | undefined;
 }
 
+type TileShell = Omit<TileDescriptor, "centerRe" | "centerIm">;
+
 interface ExactPatchInput {
   baseRgba: ArrayBuffer;
   unresolvedMask: ArrayBuffer;
@@ -98,6 +100,13 @@ interface PinchSample {
   distance: number;
 }
 
+interface ActivateViewOptions {
+  resetRetained?: boolean;
+  retainedTransform?: RetainedScreenTransform;
+  carryReferences?: boolean;
+  startAdaptiveProbe?: boolean;
+}
+
 const MAX_RENDER_REFERENCES = 24;
 const PREVIEW_REFERENCE_LIMIT = 2;
 const PREVIEW_REFERENCE_GLOBAL_BUDGET = 96;
@@ -112,6 +121,8 @@ const STALLED_ROUNDS_BEFORE_EXACT = 2;
 const EXACT_PATCH_MAX_PIXELS = 4096;
 const EXACT_PATCH_PADDING = 2;
 const MIN_EXACT_PATCH_SIZE = 8;
+const TILE_SCHEDULE_BATCH_MS = 6;
+const TILE_SCHEDULE_MIN_BATCH = 2;
 
 export async function startApp(root: HTMLElement): Promise<void> {
   root.innerHTML = `
@@ -169,21 +180,20 @@ export async function startApp(root: HTMLElement): Promise<void> {
   let initialTileCount = 0;
   let patchTilesCreated = 0;
   let patchTileLimit = 512;
+  let pendingTileShells = 0;
 
   let runtime = currentRuntimeView();
   resize();
-  if (!parsedView.explicitIter) {
-    view = await withAdaptiveDefaultIter(view, runtime.width, runtime.height);
-    runtime = currentRuntimeView();
-  }
   renderer.setActiveRevision(runtime.revision);
-  void scheduleTiles("initial");
+  renderToken += 1;
+  if (!parsedView.explicitIter) startAdaptiveIterProbe(view, renderToken);
+  scheduleTiles("initial", renderToken);
 
   root.querySelector<HTMLButtonElement>("#homeButton")?.addEventListener("click", () => {
-    void setView({ ...DEFAULT_VIEW }, "home");
+    activateView({ ...DEFAULT_VIEW }, "home", { resetRetained: true, startAdaptiveProbe: false });
   });
   root.querySelector<HTMLButtonElement>("#deepButton")?.addEventListener("click", () => {
-    void setView({ ...DEEP_TEST_VIEW }, "deep");
+    activateView({ ...DEEP_TEST_VIEW }, "deep", { resetRetained: true });
   });
 
   const activePointers = new Map<number, PointerSample>();
@@ -208,11 +218,9 @@ export async function startApp(root: HTMLElement): Promise<void> {
     const dx = current.x - previous.x;
     const dy = current.y - previous.y;
     if (Math.abs(dx) + Math.abs(dy) < 0.5) return;
-    renderer.applyRetainedPan(dx, dy);
-    void transformView(view, runtime.width, runtime.height, dx, dy, 1, runtime.width * 0.5, runtime.height * 0.5).then(async (next) => {
-      const adjusted = await withAdaptiveDefaultIter(next, runtime.width, runtime.height);
-      void setView(adjusted, "pan", false);
-    });
+    const transform = screenTransform(dx, dy, 1, runtime.width * 0.5, runtime.height * 0.5);
+    const next = transformViewNow(view, runtime.width, runtime.height, dx, dy, 1, transform.anchorX, transform.anchorY);
+    activateView(immediateInteractionView(next), "pan", { resetRetained: false, retainedTransform: transform });
   });
   canvas.addEventListener("pointerup", (event) => {
     finishPointer(event);
@@ -232,17 +240,15 @@ export async function startApp(root: HTMLElement): Promise<void> {
       const anchorX = (event.clientX - rect.left) * runtime.pixelRatio;
       const anchorY = (event.clientY - rect.top) * runtime.pixelRatio;
       const factor = Math.exp(-event.deltaY * 0.0015);
-      renderer.applyRetainedZoom(factor, anchorX, anchorY);
-      void transformView(view, runtime.width, runtime.height, 0, 0, factor, anchorX, anchorY).then(async (next) => {
-        const adjusted = await withAdaptiveDefaultIter(next, runtime.width, runtime.height);
-        void setView(adjusted, "zoom", false);
-      });
+      const transform = screenTransform(0, 0, factor, anchorX, anchorY);
+      const next = transformViewNow(view, runtime.width, runtime.height, 0, 0, factor, anchorX, anchorY);
+      activateView(immediateInteractionView(next), "zoom", { resetRetained: false, retainedTransform: transform });
     },
     { passive: false }
   );
   window.addEventListener("resize", () => {
     resize();
-    void setView(view, "resize", false);
+    activateView(immediateInteractionView(view), "resize", { resetRetained: false, startAdaptiveProbe: false, carryReferences: false });
   });
 
   let lastFrame = performance.now();
@@ -256,41 +262,73 @@ export async function startApp(root: HTMLElement): Promise<void> {
   }
   requestAnimationFrame(frame);
 
-  async function setView(next: ViewState, reason: string, resetRetained = true): Promise<void> {
+  function activateView(next: ViewState, reason: string, options: ActivateViewOptions = {}): void {
+    const previousRevision = revision;
     view = next;
     revision += 1;
+    renderToken += 1;
+    const token = renderToken;
     runtime = currentRuntimeView();
-    renderer.setActiveRevision(revision);
-    if (resetRetained) renderer.pruneRetainedWhenActiveCoverage(0);
+    references.cancelObsoleteWork(revision);
     pool.clearQueueForOldRevisions(revision);
+    renderer.setActiveRevision(revision);
+    if (options.resetRetained ?? true) {
+      renderer.pruneRetainedWhenActiveCoverage(0);
+    } else {
+      if (options.retainedTransform) renderer.applyRetainedTransform(options.retainedTransform);
+      if (options.retainedTransform && options.carryReferences !== false) {
+        references.carryForwardReferences(previousRevision, revision, view.maxIter, options.retainedTransform);
+      }
+    }
+    renderer.render(true);
+    updateHud();
     scheduleUrlSync();
-    await scheduleTiles(reason);
-  }
-
-  async function withAdaptiveDefaultIter(next: ViewState, width: number, height: number): Promise<ViewState> {
-    const baseline = defaultMaxIter(next.scale);
-    const baseView = { ...next, maxIter: baseline };
-    if (baseline >= 20_000 || decimalLog10(next.scale) < 8) return baseView;
-    try {
-      stats.status = "iteration probe";
-      const maxIter = await references.estimateDefaultIter({
-        re: next.re,
-        im: next.im,
-        scale: next.scale,
-        width,
-        height,
-        baseline
-      });
-      return { ...baseView, maxIter: Math.max(baseline, maxIter) };
-    } catch {
-      return baseView;
+    const schedule = () => {
+      if (token !== renderToken) return;
+      scheduleTiles(reason, token);
+      if (options.startAdaptiveProbe !== false) startAdaptiveIterProbe(view, token);
+    };
+    if (options.resetRetained ?? true) {
+      window.setTimeout(schedule, 0);
+    } else {
+      requestAnimationFrame(() => window.setTimeout(schedule, 0));
     }
   }
 
-  async function scheduleTiles(reason: string): Promise<void> {
-    const token = ++renderToken;
+  function immediateInteractionView(next: ViewState): ViewState {
+    const baseline = defaultMaxIter(next.scale);
+    return { ...next, maxIter: Math.min(20_000, Math.max(baseline, view.maxIter)) };
+  }
+
+  function startAdaptiveIterProbe(candidate: ViewState, token: number): void {
+    const baseline = defaultMaxIter(candidate.scale);
+    if (baseline >= 20_000 || decimalLog10(candidate.scale) < 8) return;
+    const probeView = { ...candidate, maxIter: baseline };
+    try {
+      void references.estimateDefaultIter({
+        re: probeView.re,
+        im: probeView.im,
+        scale: probeView.scale,
+        width: runtime.width,
+        height: runtime.height,
+        baseline
+      }, revision).then((maxIter) => {
+        if (token !== renderToken) return;
+        if (maxIter <= view.maxIter) return;
+        activateView({ ...view, maxIter }, "iter refine", {
+          resetRetained: false,
+          carryReferences: false,
+          startAdaptiveProbe: false
+        });
+      }).catch(() => undefined);
+    } catch {
+      // Best-effort background probe; rendering must never wait on it.
+    }
+  }
+
+  function scheduleTiles(reason: string, token: number): void {
     const localRuntime = currentRuntimeView();
-    stats.status = `reference ${reason}`;
+    stats.status = `rendering ${reason}`;
     stats.pending = 0;
     stats.completedTiles = 0;
     stats.glitches = 0;
@@ -303,30 +341,78 @@ export async function startApp(root: HTMLElement): Promise<void> {
     initialTileCount = 0;
     patchTilesCreated = 0;
     patchTileLimit = 512;
+    pendingTileShells = 0;
 
-    await references.ensureViewReference(localRuntime);
-    if (token !== renderToken) return;
+    startViewReference(localRuntime, token);
     void submitViewportPreview(localRuntime, token);
 
-    const shells = createVisibleTileShells(localRuntime, TILE_SIZE);
-    const tiles = await Promise.all(
-      shells.map(async (shell) => {
-        const center = await pointToViewCenter(view, localRuntime.width, localRuntime.height, shell.centerScreenX, shell.centerScreenY);
-        return { ...shell, centerRe: center.re, centerIm: center.im } satisfies TileDescriptor;
-      })
-    );
+    const shells = prioritizeTileShells(createVisibleTileShells(localRuntime, TILE_SIZE), localRuntime);
     if (token !== renderToken) return;
 
-    initialTileCount = tiles.length;
+    initialTileCount = shells.length;
     patchTileLimit = Math.max(512, initialTileCount * 6);
-    for (const tile of tiles) createTileState(tile, [], 0);
-    syncPinnedReferences();
-    previewReferenceBudget = Math.min(PREVIEW_REFERENCE_GLOBAL_BUDGET, Math.max(16, tiles.length));
-    stats.pending = pendingTileIds.size;
+    pendingTileShells = shells.length;
+    previewReferenceBudget = Math.min(PREVIEW_REFERENCE_GLOBAL_BUDGET, Math.max(16, shells.length));
+    stats.pending = pendingWorkCount();
     stats.references = references.size;
-    stats.status = `rendering ${tiles.length} tiles`;
+    stats.status = `rendering ${shells.length} tiles`;
 
-    for (const tile of tiles) void submitPreview(localRuntime, mustTileState(tile.id));
+    scheduleTileShellBatch(localRuntime, shells, 0, token);
+  }
+
+  function scheduleTileShellBatch(localRuntime: RuntimeView, shells: TileShell[], startIndex: number, token: number): void {
+    if (token !== renderToken || localRuntime.revision !== revision) return;
+    const deadline = performance.now() + TILE_SCHEDULE_BATCH_MS;
+    let index = startIndex;
+    let processed = 0;
+    while (index < shells.length && (processed < TILE_SCHEDULE_MIN_BATCH || performance.now() < deadline)) {
+      const tile = materializeTileShell(localRuntime, shells[index]);
+      if (token !== renderToken || localRuntime.revision !== revision) return;
+      createTileState(tile, [], 0);
+      pendingTileShells = Math.max(0, shells.length - index - 1);
+      void submitPreview(localRuntime, mustTileState(tile.id));
+      index += 1;
+      processed += 1;
+    }
+    syncPinnedReferences();
+    stats.pending = pendingWorkCount();
+    stats.references = references.size;
+    updateWorkStatus("rendering");
+    if (index < shells.length) {
+      window.setTimeout(() => scheduleTileShellBatch(localRuntime, shells, index, token), 0);
+    }
+  }
+
+  function materializeTileShell(localRuntime: RuntimeView, shell: TileShell): TileDescriptor {
+    const center = pointToViewCenterNow(view, localRuntime.width, localRuntime.height, shell.centerScreenX, shell.centerScreenY);
+    return { ...shell, centerRe: center.re, centerIm: center.im };
+  }
+
+  function prioritizeTileShells(shells: TileShell[], localRuntime: RuntimeView): TileShell[] {
+    const centerX = localRuntime.width * 0.5;
+    const centerY = localRuntime.height * 0.5;
+    return [...shells].sort((a, b) => {
+      const da = Math.hypot(a.centerScreenX - centerX, a.centerScreenY - centerY);
+      const db = Math.hypot(b.centerScreenX - centerX, b.centerScreenY - centerY);
+      return da - db;
+    });
+  }
+
+  function startViewReference(localRuntime: RuntimeView, token: number): void {
+    void references.ensureViewReference(localRuntime, 0).then((reference) => {
+      if (token !== renderToken || localRuntime.revision !== revision) return;
+      stats.references = references.size;
+      for (const state of tileStates.values()) {
+        if (state.tile.revision !== revision || state.completed) continue;
+        state.referenceIds.add(reference.id);
+      }
+      syncPinnedReferences();
+      void submitViewportPreview(localRuntime, token);
+      for (const state of tileStates.values()) void submitPreview(localRuntime, state);
+      updateWorkStatus("rendering");
+    }).catch((error) => {
+      if (token === renderToken) stats.status = error instanceof Error ? error.message : String(error);
+    });
   }
 
   function createTileState(tile: TileDescriptor, referenceIds: Iterable<string>, splitLevel: number): TileWorkState {
@@ -374,12 +460,7 @@ export async function startApp(root: HTMLElement): Promise<void> {
     if (state.previewInFlight || state.previewUploaded || state.completed || state.tile.revision !== revision) return;
     const candidates = buildReferenceCandidates(state, localRuntime);
     if (candidates.length === 0) {
-      const reference = await references.ensureTileReference(localRuntime, state.tile, 128);
-      if (state.tile.revision !== revision || state.completed) return;
-      state.referenceIds.add(reference.id);
-      state.localReferenceRequests += 1;
-      syncPinnedReferences();
-      void submitPreview(localRuntime, state);
+      updateWorkStatus("rendering");
       return;
     }
     state.previewInFlight = true;
@@ -420,7 +501,7 @@ export async function startApp(root: HTMLElement): Promise<void> {
         if (state.lastReferencePressure < HIGH_REFERENCE_PRESSURE) {
           const queued = queuePreviewReferences(localRuntime, state, result.stats.unresolvedClusters);
           if (queued > 0 || state.pendingReferences > 0) {
-            stats.pending = pendingTileIds.size;
+            stats.pending = pendingWorkCount();
             stats.status = "refining";
             updateWorkStatus("refining");
             return;
@@ -441,12 +522,7 @@ export async function startApp(root: HTMLElement): Promise<void> {
     if (!state.forceExact && (!state.previewUploaded || state.pendingReferences > 0)) return;
     const candidates = state.forceExact ? [] : buildReferenceCandidates(state, localRuntime);
     if (!state.forceExact && candidates.length === 0) {
-      const reference = await references.ensureTileReference(localRuntime, state.tile, 128);
-      if (state.tile.revision !== revision || state.completed) return;
-      state.referenceIds.add(reference.id);
-      state.localReferenceRequests += 1;
-      syncPinnedReferences();
-      void submitTile(localRuntime, state);
+      updateWorkStatus("rendering");
       return;
     }
 
@@ -488,7 +564,7 @@ export async function startApp(root: HTMLElement): Promise<void> {
         state.completed = true;
         stats.completedTiles += 1;
         pendingTileIds.delete(state.tile.id);
-        stats.pending = pendingTileIds.size;
+        stats.pending = pendingWorkCount();
         updateWorkStatus("rendering");
         return;
       }
@@ -512,7 +588,7 @@ export async function startApp(root: HTMLElement): Promise<void> {
         if (shouldRequestCenterReferenceFirst(localRuntime, state, result.stats.referenceIdsUsed)) {
           const queuedCenter = requestCenterReference(localRuntime, state, highestPrecisionForState(state, localRuntime) + 32);
           if (queuedCenter) {
-            stats.pending = pendingTileIds.size;
+            stats.pending = pendingWorkCount();
             stats.status = "refining";
             return;
           }
@@ -525,7 +601,7 @@ export async function startApp(root: HTMLElement): Promise<void> {
 
         const queued = queueClusterReferences(localRuntime, state, result.stats.unresolvedClusters);
         if (queued > 0 || state.pendingReferences > 0) {
-          stats.pending = pendingTileIds.size;
+          stats.pending = pendingWorkCount();
           stats.status = "refining";
           return;
         }
@@ -543,7 +619,7 @@ export async function startApp(root: HTMLElement): Promise<void> {
       stats.completedTiles += 1;
       pendingTileIds.delete(state.tile.id);
       syncPinnedReferences();
-      stats.pending = pendingTileIds.size;
+      stats.pending = pendingWorkCount();
       renderer.pruneRetainedWhenActiveCoverage(Math.max(1, Math.floor((localRuntime.width * localRuntime.height) / (TILE_SIZE * TILE_SIZE) * 0.7)));
       updateWorkStatus("rendering");
     } catch (error) {
@@ -566,7 +642,7 @@ export async function startApp(root: HTMLElement): Promise<void> {
     state.requestedReferenceKeys.add(requestKey);
     state.pendingReferences += 1;
     state.localReferenceRequests += 1;
-    stats.pending = pendingTileIds.size;
+    stats.pending = pendingWorkCount();
     stats.status = "refining";
     enqueueBrokerReference(localRuntime, state, {
       ...request,
@@ -713,7 +789,7 @@ export async function startApp(root: HTMLElement): Promise<void> {
         return;
       }
 
-      const targetCenter = await pointToViewCenter(view, localRuntime.width, localRuntime.height, entry.targetScreenX, entry.targetScreenY);
+      const targetCenter = pointToViewCenterNow(view, localRuntime.width, localRuntime.height, entry.targetScreenX, entry.targetScreenY);
       if (entry.revision !== revision) return;
       const targetTile: TileDescriptor = {
         id: `reference:${entry.key}`,
@@ -725,7 +801,7 @@ export async function startApp(root: HTMLElement): Promise<void> {
         centerIm: targetCenter.im,
         revision: entry.revision
       };
-      const reference = await references.ensureTileReference(localRuntime, targetTile, entry.requiredPrecision);
+      const reference = await references.ensureTileReference(localRuntime, targetTile, entry.requiredPrecision, 10);
       if (entry.revision !== revision) return;
       distributeBrokerReference(localRuntime, entry, reference.id);
     } catch (error) {
@@ -756,7 +832,7 @@ export async function startApp(root: HTMLElement): Promise<void> {
         rects.map(async (rect, index) => {
           const input = buildExactPatchInput(result, rect);
           if (!input) return undefined;
-          const patch = await createExactPatchTile(localRuntime, tile, rect, index);
+          const patch = createExactPatchTile(localRuntime, tile, rect, index);
           return { patch, input };
         })
       )
@@ -767,7 +843,7 @@ export async function startApp(root: HTMLElement): Promise<void> {
     tileStates.delete(tile.id);
     patchTilesCreated += patches.length;
     for (const { patch } of patches) pendingTileIds.add(patch.id);
-    stats.pending = pendingTileIds.size;
+    stats.pending = pendingWorkCount();
     stats.status = "exact fallback";
 
     for (const { patch, input } of patches) {
@@ -824,10 +900,10 @@ export async function startApp(root: HTMLElement): Promise<void> {
     return { baseRgba: baseRgba.buffer, unresolvedMask: unresolvedMask.buffer };
   }
 
-  async function createExactPatchTile(localRuntime: RuntimeView, parent: TileDescriptor, rect: TileDescriptor["rect"], index: number): Promise<TileDescriptor> {
+  function createExactPatchTile(localRuntime: RuntimeView, parent: TileDescriptor, rect: TileDescriptor["rect"], index: number): TileDescriptor {
     const centerScreenX = rect.x + rect.width * 0.5;
     const centerScreenY = rect.y + rect.height * 0.5;
-    const center = await pointToViewCenter(view, localRuntime.width, localRuntime.height, centerScreenX, centerScreenY);
+    const center = pointToViewCenterNow(view, localRuntime.width, localRuntime.height, centerScreenX, centerScreenY);
     const key = {
       level: parent.key.level + 1,
       x: Math.floor(rect.x),
@@ -981,7 +1057,7 @@ export async function startApp(root: HTMLElement): Promise<void> {
   }
 
   function hasOutstandingWork(): boolean {
-    if (pendingTileIds.size > 0 || pool.pending > 0 || pool.active > 0) return true;
+    if (pendingTileShells > 0 || pendingTileIds.size > 0 || pool.pending > 0 || pool.active > 0) return true;
     for (const state of tileStates.values()) {
       if (state.inFlight || state.previewInFlight || state.pendingReferences > 0) return true;
     }
@@ -989,10 +1065,14 @@ export async function startApp(root: HTMLElement): Promise<void> {
   }
 
   function updateWorkStatus(activeStatus: string): void {
-    stats.pending = pendingTileIds.size;
+    stats.pending = pendingWorkCount();
     stats.activeWorkers = pool.active;
     stats.references = references.size;
     stats.status = hasOutstandingWork() ? activeStatus : "stable";
+  }
+
+  function pendingWorkCount(): number {
+    return pendingTileIds.size + pendingTileShells;
   }
 
   function distributeBrokerReference(localRuntime: RuntimeView, entry: ReferenceBrokerEntry, referenceId: string): void {
@@ -1113,7 +1193,7 @@ export async function startApp(root: HTMLElement): Promise<void> {
 
   async function computeCenterReference(localRuntime: RuntimeView, state: TileWorkState, precisionBits: number): Promise<void> {
     try {
-      const reference = await references.ensureTileReference(localRuntime, state.tile, precisionBits);
+      const reference = await references.ensureTileReference(localRuntime, state.tile, precisionBits, 5);
       state.pendingReferences = Math.max(0, state.pendingReferences - 1);
       if (state.tile.revision !== revision || state.completed) return;
       state.referenceIds.add(reference.id);
@@ -1216,12 +1296,13 @@ export async function startApp(root: HTMLElement): Promise<void> {
     if (!Number.isFinite(factor) || factor <= 0) return;
     if (Math.abs(current.distance - previous.distance) < 0.5 && Math.abs(dx) + Math.abs(dy) < 0.5) return;
 
-    renderer.applyRetainedZoom(factor, previous.centerX, previous.centerY);
-    renderer.applyRetainedPan(dx, dy);
-    void transformView(view, runtime.width, runtime.height, dx, dy, factor, previous.centerX, previous.centerY).then(async (next) => {
-      const adjusted = await withAdaptiveDefaultIter(next, runtime.width, runtime.height);
-      void setView(adjusted, "pinch", false);
-    });
+    const transform = screenTransform(dx, dy, factor, previous.centerX, previous.centerY);
+    const next = transformViewNow(view, runtime.width, runtime.height, dx, dy, factor, previous.centerX, previous.centerY);
+    activateView(immediateInteractionView(next), "pinch", { resetRetained: false, retainedTransform: transform });
+  }
+
+  function screenTransform(dx: number, dy: number, scale: number, anchorX: number, anchorY: number): RetainedScreenTransform {
+    return { dx, dy, scale, anchorX, anchorY };
   }
 
   function scheduleUrlSync(): void {

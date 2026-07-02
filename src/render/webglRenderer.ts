@@ -17,6 +17,14 @@ interface Transform {
   scale: number;
 }
 
+export interface RetainedScreenTransform {
+  dx: number;
+  dy: number;
+  scale: number;
+  anchorX: number;
+  anchorY: number;
+}
+
 export class WebglTileRenderer {
   private readonly gl: WebGL2RenderingContext;
   private readonly program: WebGLProgram;
@@ -61,12 +69,18 @@ export class WebglTileRenderer {
 
   setActiveRevision(revision: number): void {
     if (revision === this.activeRevision) return;
+    const previousRevision = this.activeRevision;
+    let retainedCount = 0;
     for (const id of this.cache.keys()) {
       const tile = this.cache.get(id);
-      if (tile && tile.revision === this.activeRevision) tile.retained = true;
+      if (tile && tile.revision === previousRevision) {
+        tile.retained = true;
+        retainedCount += 1;
+      }
     }
     this.activeRevision = revision;
-    this.retainedTransforms.set(revision - 1, identityTransform());
+    this.retainedTransforms.set(previousRevision, identityTransform());
+    recordDeepBench({ type: "activeRevisionChanged", previousRevision, revision, retainedCount });
   }
 
   applyRetainedPan(dx: number, dy: number): void {
@@ -82,6 +96,14 @@ export class WebglTileRenderer {
       transform.offsetY = anchorY + (transform.offsetY - anchorY) * factor;
       transform.scale *= factor;
     }
+  }
+
+  applyRetainedTransform(transform: RetainedScreenTransform): void {
+    if (Number.isFinite(transform.scale) && transform.scale > 0 && transform.scale !== 1) {
+      this.applyRetainedZoom(transform.scale, transform.anchorX, transform.anchorY);
+    }
+    if (transform.dx !== 0 || transform.dy !== 0) this.applyRetainedPan(transform.dx, transform.dy);
+    recordDeepBench({ type: "retainedTransformApplied", ...transform, retainedTransformCount: this.retainedTransforms.size });
   }
 
   uploadTile(result: TileDoneMessage): void {
@@ -150,7 +172,7 @@ export class WebglTileRenderer {
     }
   }
 
-  render(): void {
+  render(flush = false): void {
     const gl = this.gl;
     gl.viewport(0, 0, this.canvas.width, this.canvas.height);
     gl.clearColor(0.006, 0.009, 0.014, 1);
@@ -169,6 +191,17 @@ export class WebglTileRenderer {
       .sort((a, b) => tileArea(b) - tileArea(a));
     for (const tile of retained) this.drawTile(tile, this.retainedTransforms.get(tile.revision) ?? identityTransform());
     for (const tile of active) this.drawTile(tile, identityTransform());
+    if (flush && retained.length > 0) {
+      const retainedFrame = {
+        revision: this.activeRevision,
+        retainedCount: retained.length,
+        activeCount: active.length,
+        now: performance.now()
+      };
+      (globalThis as unknown as { __mandelbrotLastRetainedFrame?: typeof retainedFrame }).__mandelbrotLastRetainedFrame = retainedFrame;
+      recordDeepBench({ type: "retainedFrameRendered", ...retainedFrame });
+    }
+    if (flush) gl.flush();
   }
 
   private configure(): void {

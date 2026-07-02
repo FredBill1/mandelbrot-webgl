@@ -42,6 +42,34 @@ const SCENARIOS = [
     baselineComparable: false
   },
   {
+    name: "interactive-deep-pan",
+    timeoutMs: 180_000,
+    url: undefined,
+    interaction: "pan",
+    requirements: {
+      stable: true,
+      maxFirstVisualChangeMs: 100,
+      maxNewRevisionQueuedMs: 100,
+      maxFirstNewTileDoneMs: 1000,
+      maxOldRevisionTileDoneAfterInput: 0
+    },
+    baselineComparable: false
+  },
+  {
+    name: "interactive-deep-zoom",
+    timeoutMs: 180_000,
+    url: undefined,
+    interaction: "zoom",
+    requirements: {
+      stable: true,
+      maxFirstVisualChangeMs: 100,
+      maxNewRevisionQueuedMs: 100,
+      maxFirstNewTileDoneMs: 1000,
+      maxOldRevisionTileDoneAfterInput: 0
+    },
+    baselineComparable: false
+  },
+  {
     name: "deep-button-baseline",
     timeoutMs: 180_000,
     url: undefined,
@@ -138,6 +166,7 @@ function selectScenarios(names) {
 function runDeepViewBench(scenario, port) {
   const args = ["scripts/bench-deep-view.mjs", "--timeout-ms", String(scenario.timeoutMs), "--port", String(port)];
   if (scenario.url !== undefined) args.push("--url", scenario.url);
+  if (scenario.interaction !== undefined) args.push("--interaction", scenario.interaction);
   return new Promise((resolve, reject) => {
     const child = spawn(process.execPath, args, {
       cwd: process.cwd(),
@@ -185,6 +214,10 @@ function projectMetrics(scenario, raw) {
     onePixelTiles: regression.onePixelTiles ?? raw.waves?.onePixelTiles ?? 0,
     hudIter: Number(raw.hud?.iter) || 0,
     hudTiles: raw.hud?.tiles ?? "",
+    firstVisualChangeMs: raw.interactive?.firstVisualChangeMs ?? null,
+    newRevisionQueuedMs: raw.interactive?.newRevisionQueuedMs ?? null,
+    firstNewTileDoneMs: raw.interactive?.firstNewTileDoneMs ?? null,
+    oldRevisionTileDoneAfterInput: raw.interactive?.oldRevisionTileDoneAfterInput ?? 0,
     scenario: scenario.name
   };
 }
@@ -208,6 +241,18 @@ function checkRequirements(requirements, metrics) {
   }
   if (requirements.exactHudIter !== undefined && metrics.hudIter !== requirements.exactHudIter) {
     failures.push(`hudIter ${metrics.hudIter} !== ${requirements.exactHudIter}`);
+  }
+  if (requirements.maxFirstVisualChangeMs !== undefined && (metrics.firstVisualChangeMs === null || metrics.firstVisualChangeMs > requirements.maxFirstVisualChangeMs)) {
+    failures.push(`firstVisualChangeMs ${metrics.firstVisualChangeMs} > ${requirements.maxFirstVisualChangeMs}`);
+  }
+  if (requirements.maxNewRevisionQueuedMs !== undefined && (metrics.newRevisionQueuedMs === null || metrics.newRevisionQueuedMs > requirements.maxNewRevisionQueuedMs)) {
+    failures.push(`newRevisionQueuedMs ${metrics.newRevisionQueuedMs} > ${requirements.maxNewRevisionQueuedMs}`);
+  }
+  if (requirements.maxFirstNewTileDoneMs !== undefined && (metrics.firstNewTileDoneMs === null || metrics.firstNewTileDoneMs > requirements.maxFirstNewTileDoneMs)) {
+    failures.push(`firstNewTileDoneMs ${metrics.firstNewTileDoneMs} > ${requirements.maxFirstNewTileDoneMs}`);
+  }
+  if (requirements.maxOldRevisionTileDoneAfterInput !== undefined && metrics.oldRevisionTileDoneAfterInput > requirements.maxOldRevisionTileDoneAfterInput) {
+    failures.push(`oldRevisionTileDoneAfterInput ${metrics.oldRevisionTileDoneAfterInput} > ${requirements.maxOldRevisionTileDoneAfterInput}`);
   }
   return failures;
 }
@@ -239,7 +284,10 @@ function baselineMetrics(result) {
     previewCount: result.previewCount,
     referenceDone: result.referenceDone,
     totalTiles: result.totalTiles,
-    refs: result.refs
+    refs: result.refs,
+    firstVisualChangeMs: result.firstVisualChangeMs,
+    newRevisionQueuedMs: result.newRevisionQueuedMs,
+    firstNewTileDoneMs: result.firstNewTileDoneMs
   };
 }
 
