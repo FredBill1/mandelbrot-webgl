@@ -190,7 +190,10 @@ function installWorkerProbe() {
       completedFinals: 0,
       maxRefsUsed: 0,
       maxSeriesSkip: 0,
-      totalAaSamples: 0
+      totalAaSamples: 0,
+      totalGlitches: 0,
+      totalRebases: 0,
+      totalPeriodicInterior: 0
     },
     slowFinalTiles: [],
     profile: {
@@ -298,6 +301,9 @@ function installWorkerProbe() {
           bench.waves.maxRefsUsed = Math.max(bench.waves.maxRefsUsed, data.stats.referenceIdsUsed.length);
           bench.waves.maxSeriesSkip = Math.max(bench.waves.maxSeriesSkip, data.stats.seriesSkip);
           bench.waves.totalAaSamples += data.stats.aaSampleCount;
+          bench.waves.totalGlitches += data.stats.glitchCount;
+          bench.waves.totalRebases += data.stats.rebaseCount;
+          bench.waves.totalPeriodicInterior += data.stats.periodicInteriorCount;
           pushSlowFinal({
             workerMs: Math.round(data.stats.elapsedMs),
             wallMs: Math.round(wallMs),
@@ -309,6 +315,9 @@ function installWorkerProbe() {
             seriesSkip: data.stats.seriesSkip,
             blaSkip: data.stats.blaSkipCount,
             blaSteps: data.stats.blaStepCount,
+            glitches: data.stats.glitchCount,
+            rebases: data.stats.rebaseCount,
+            periodicInterior: data.stats.periodicInteriorCount,
             aaSamples: data.stats.aaSampleCount,
             refsUsed: data.stats.referenceIdsUsed.length,
             clusters: data.stats.unresolvedClusters.length
@@ -337,6 +346,9 @@ function installWorkerProbe() {
               unresolved: data.stats.unresolvedCount,
               escaped: data.stats.escapedPixels,
               seriesSkip: data.stats.seriesSkip,
+              glitches: data.stats.glitchCount,
+              rebases: data.stats.rebaseCount,
+              periodicInterior: data.stats.periodicInteriorCount,
               aaSamples: data.stats.aaSampleCount,
               refsUsed: data.stats.referenceIdsUsed.length,
               clusters: data.stats.unresolvedClusters.length
@@ -353,6 +365,9 @@ function installWorkerProbe() {
             unresolved: data.stats.unresolvedCount,
             escaped: data.stats.escapedPixels,
             seriesSkip: data.stats.seriesSkip,
+            glitches: data.stats.glitchCount,
+            rebases: data.stats.rebaseCount,
+            periodicInterior: data.stats.periodicInteriorCount,
             aaSamples: data.stats.aaSampleCount,
             refsUsed: data.stats.referenceIdsUsed.length,
             clusters: data.stats.unresolvedClusters.length

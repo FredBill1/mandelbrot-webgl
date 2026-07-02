@@ -154,13 +154,23 @@ export function renderPerturbationTile(message: RenderTileMessage): TileDoneMess
   for (let py = 0; py < height; py += 1) {
     screenYs[py] = Math.min(tile.rect.y + tile.rect.height - 0.5, tile.rect.y + (py + 0.5) * sampleStep);
   }
+  const allowPeriodicInterior = pixelSpan >= MIN_PIXEL_SPAN_FOR_PERIODIC_INTERIOR;
 
   for (let py = 0; py < height; py += 1) {
     const screenY = screenYs[py];
     for (let px = 0; px < width; px += 1) {
       const pixelIndex = py * width + px;
       const screenX = screenXs[px];
-      const { result, referenceIndex, skip } = renderPixelWithReferences(screenX, screenY, pixelSpan, maxIter, seriesDegree, contexts, scratch);
+      const { result, referenceIndex, skip } = renderPixelWithReferences(
+        screenX,
+        screenY,
+        pixelSpan,
+        maxIter,
+        seriesDegree,
+        contexts,
+        scratch,
+        allowPeriodicInterior
+      );
       const offset = pixelIndex * 4;
       if (result.iter < maxIter) escapedPixels += 1;
       if (result.periodicInterior) periodicInteriorCount += 1;
@@ -187,7 +197,21 @@ export function renderPerturbationTile(message: RenderTileMessage): TileDoneMess
   }
 
   const boundaryStats = message.renderMode === "final" && unresolvedCount === 0
-    ? applyBoundarySmoothing(rgba, smoothValues!, escapedMask!, unresolvedMask, width, height, tile.rect, pixelSpan, maxIter, seriesDegree, contexts, scratch)
+    ? applyBoundarySmoothing(
+        rgba,
+        smoothValues!,
+        escapedMask!,
+        unresolvedMask,
+        width,
+        height,
+        tile.rect,
+        pixelSpan,
+        maxIter,
+        seriesDegree,
+        contexts,
+        scratch,
+        allowPeriodicInterior
+      )
     : emptyBoundaryStats();
 
   if (unresolvedCount > 0) fillUnresolvedPreview(rgba, unresolvedMask, width, height);
@@ -243,7 +267,8 @@ function renderPixelWithReferences(
   maxIter: number,
   seriesDegree: number,
   contexts: ReferenceContext[],
-  scratch: PeriodicScratch
+  scratch: PeriodicScratch,
+  allowPeriodicInterior: boolean
 ): PixelSelection {
   const selection = scratch.selection;
   selection.referenceIndex = -1;
@@ -252,8 +277,6 @@ function renderPixelWithReferences(
   let hasBestUnresolved = false;
   let bestUnresolvedReferenceIndex = -1;
   let maxSkip = 0;
-  const allowPeriodicInterior = pixelSpan >= MIN_PIXEL_SPAN_FOR_PERIODIC_INTERIOR;
-
   for (let index = 0; index < contexts.length; index += 1) {
     const context = contexts[index];
     const cRe = (screenX - context.screenX) * pixelSpan;
@@ -369,14 +392,14 @@ function perturb(
   while (iter <= maxIter && refIndex <= limit) {
     const refRe = orbitRe[refIndex];
     const refIm = orbitIm[refIndex];
-    if (!Number.isFinite(refRe) || !Number.isFinite(refIm)) {
-      glitch = true;
-      break;
-    }
 
     const zRe = refRe + dzRe;
     const zIm = refIm + dzIm;
     mag2 = zRe * zRe + zIm * zIm;
+    if (!Number.isFinite(mag2)) {
+      glitch = true;
+      break;
+    }
     if (mag2 > 4) return successResult(output, iter, mag2, glitch, false, rebaseCount, rebaseLimit, blaSkipCount, blaStepCount);
     if (iter >= maxIter) return successResult(output, maxIter, mag2, false, false, rebaseCount, rebaseLimit, blaSkipCount, blaStepCount);
 
@@ -405,7 +428,6 @@ function perturb(
     let stepRefMag2 = refMag2;
     if (
       refIndex > 0 &&
-      Number.isFinite(mag2) &&
       Number.isFinite(refMag2) &&
       refMag2 > 1e-30 &&
       mag2 < refMag2 * REBASE_G
@@ -423,7 +445,6 @@ function perturb(
       stepRefMag2 = stepRefRe * stepRefRe + stepRefIm * stepRefIm;
       rebaseCount += 1;
     } else if (
-      !Number.isFinite(mag2) ||
       !Number.isFinite(refMag2) ||
       !Number.isFinite(dzMag2BeforeStep) ||
       (refMag2 > 1e-30 && dzMag2BeforeStep > 1e-30 && dzMag2BeforeStep > refMag2 * 1e-4 && mag2 < refMag2 * 1e-20)
@@ -587,7 +608,8 @@ function applyBoundarySmoothing(
   maxIter: number,
   seriesDegree: number,
   contexts: ReferenceContext[],
-  scratch: PeriodicScratch
+  scratch: PeriodicScratch,
+  allowPeriodicInterior: boolean
 ): BoundaryStats {
   if (width <= 1 || height <= 1) return emptyBoundaryStats();
   const edgeStrengths = new Float32Array(width * height);
@@ -634,7 +656,8 @@ function applyBoundarySmoothing(
         maxIter,
         seriesDegree,
         contexts,
-        scratch
+        scratch,
+        allowPeriodicInterior
       );
       aaPixelCount += 1;
       aaSampleCount += offsets.length;
@@ -706,7 +729,8 @@ function supersamplePixel(
   maxIter: number,
   seriesDegree: number,
   contexts: ReferenceContext[],
-  scratch: PeriodicScratch
+  scratch: PeriodicScratch,
+  allowPeriodicInterior: boolean
 ): { fallbacks: number } {
   const baseOffset = pixelIndex * 4;
   let linearR = srgbToLinear(buffer[baseOffset] / 255);
@@ -722,7 +746,8 @@ function supersamplePixel(
       maxIter,
       seriesDegree,
       contexts,
-      scratch
+      scratch,
+      allowPeriodicInterior
     );
     const color = result.unresolved
       ? {

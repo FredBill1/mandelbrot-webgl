@@ -61,6 +61,8 @@ interface TileWorkState {
   centerReferenceAttempted: boolean;
   referenceWaveLevel: number;
   lastReferencePressure: number;
+  lastPreviewElapsedMs: number;
+  lastPreviewUnresolvedCount: number;
 }
 
 interface ReferenceBrokerWaiter {
@@ -280,7 +282,9 @@ export async function startApp(root: HTMLElement): Promise<void> {
       splitReason: undefined,
       centerReferenceAttempted: false,
       referenceWaveLevel: 0,
-      lastReferencePressure: 0
+      lastReferencePressure: 0,
+      lastPreviewElapsedMs: 0,
+      lastPreviewUnresolvedCount: 0
     };
     tileStates.set(tile.id, state);
     pendingTileIds.add(tile.id);
@@ -333,6 +337,8 @@ export async function startApp(root: HTMLElement): Promise<void> {
       }
       renderer.uploadTile(result);
       state.previewUploaded = true;
+      state.lastPreviewElapsedMs = result.stats.elapsedMs;
+      state.lastPreviewUnresolvedCount = result.stats.unresolvedCount;
       stats.activeWorkers = pool.active;
       stats.references = references.size;
       if (result.stats.unresolvedCount > 0) {
@@ -372,6 +378,7 @@ export async function startApp(root: HTMLElement): Promise<void> {
 
     syncPinnedReferences();
     state.inFlight = true;
+    const priority = finalRenderPriority(state);
     try {
       const result = await pool.render(
         {
@@ -389,7 +396,7 @@ export async function startApp(root: HTMLElement): Promise<void> {
           renderMode: "final",
           sampleStep: 1
         },
-        -1
+        priority
       );
       state.inFlight = false;
       if (result.revision !== revision || state.completed || state.tile.revision !== revision) return;
@@ -735,6 +742,14 @@ export async function startApp(root: HTMLElement): Promise<void> {
     if (span >= 96) return 4;
     if (span >= 32) return 2;
     return 1;
+  }
+
+  function finalRenderPriority(state: TileWorkState): number {
+    const previewCost = Math.min(300, Math.max(0, state.lastPreviewElapsedMs));
+    const unresolvedCost = Math.min(200, state.lastPreviewUnresolvedCount * 0.2);
+    const refinementCost = state.refinementLevel * 24;
+    const score = previewCost + unresolvedCost + refinementCost;
+    return -1 - Math.min(0.95, score / 360);
   }
 
   async function submitViewportPreview(localRuntime: RuntimeView, token: number): Promise<void> {
