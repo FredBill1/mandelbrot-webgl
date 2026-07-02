@@ -665,6 +665,13 @@ struct BoundaryStats64 {
 struct BoundaryCandidate64 {
     index: usize,
     edge_strength: f64,
+    classification_change: bool,
+}
+
+#[derive(Clone, Copy)]
+struct RenderEdgeInfo64 {
+    edge_strength: f64,
+    classification_change: bool,
 }
 
 thread_local! {
@@ -681,10 +688,10 @@ const RENDER_SMOOTH_DELTA_LOW: f64 = 6.0;
 const RENDER_SMOOTH_DELTA_HIGH: f64 = 24.0;
 const RENDER_CLASSIFICATION_EDGE_BOOST: f64 = 0.35;
 const RENDER_AA_EDGE_THRESHOLD: f64 = 0.45;
-const RENDER_AA_PIXEL_CAP: usize = 128;
-const RENDER_AA_PIXEL_FRACTION: f64 = 0.01;
-const RENDER_AA_FOUR_SAMPLE_CAP: usize = 32;
-const RENDER_AA_FOUR_SAMPLE_FRACTION: f64 = 0.0025;
+const RENDER_AA_PIXEL_CAP: usize = 512;
+const RENDER_AA_PIXEL_FRACTION: f64 = 0.04;
+const RENDER_AA_FOUR_SAMPLE_CAP: usize = 128;
+const RENDER_AA_FOUR_SAMPLE_FRACTION: f64 = 0.01;
 const RENDER_MIN_EDGE_CHROMA_SCALE: f64 = 0.35;
 const RENDER_PALETTE_SIZE: usize = 2048;
 const RENDER_INV_LN2: f64 = std::f64::consts::LOG2_E;
@@ -788,10 +795,14 @@ pub fn render_tile_cached(
         None
     };
     let screen_xs: Vec<f64> = (0..width)
-        .map(|px| (rect.x + rect.width - 0.5).min(rect.x + (px as f64 + 0.5) * normalized_sample_step))
+        .map(|px| {
+            (rect.x + rect.width - 0.5).min(rect.x + (px as f64 + 0.5) * normalized_sample_step)
+        })
         .collect();
     let screen_ys: Vec<f64> = (0..height)
-        .map(|py| (rect.y + rect.height - 0.5).min(rect.y + (py as f64 + 0.5) * normalized_sample_step))
+        .map(|py| {
+            (rect.y + rect.height - 0.5).min(rect.y + (py as f64 + 0.5) * normalized_sample_step)
+        })
         .collect();
 
     for py in 0..height {
@@ -834,7 +845,13 @@ pub fn render_tile_cached(
                 unresolved_screen_x_sum += screen_x;
                 unresolved_screen_y_sum += screen_y;
                 unresolved_mask[pixel_index] = 1;
-                record_render_unresolved_cluster(&mut clusters, rect, screen_x, screen_y, result.survived_iter);
+                record_render_unresolved_cluster(
+                    &mut clusters,
+                    rect,
+                    screen_x,
+                    screen_y,
+                    result.survived_iter,
+                );
             } else if result.iter < max_iter {
                 if let Some(mask) = escaped_mask.as_mut() {
                     mask[pixel_index] = 1;
@@ -844,7 +861,13 @@ pub fn render_tile_cached(
             if let Some(values) = smooth_values.as_mut() {
                 values[pixel_index] = smooth as f32;
             }
-            write_render_color_for_smooth(&mut rgba, offset, result.iter >= max_iter, smooth, &palette);
+            write_render_color_for_smooth(
+                &mut rgba,
+                offset,
+                result.iter >= max_iter,
+                smooth,
+                &palette,
+            );
         }
     }
 
@@ -919,7 +942,11 @@ pub fn render_tile_cached(
     )
 }
 
-fn build_render_contexts(rect: Rect64, pixel_span: f64, ref_ids: &Int32Array) -> Result<Vec<RenderContext>, JsValue> {
+fn build_render_contexts(
+    rect: Rect64,
+    pixel_span: f64,
+    ref_ids: &Int32Array,
+) -> Result<Vec<RenderContext>, JsValue> {
     let mut contexts = Vec::with_capacity(ref_ids.length() as usize);
     for index in 0..ref_ids.length() {
         let id = ref_ids.get_index(index) as u32;
@@ -927,7 +954,8 @@ fn build_render_contexts(rect: Rect64, pixel_span: f64, ref_ids: &Int32Array) ->
             .with(|cache| cache.borrow().get(&id).cloned())
             .ok_or_else(|| JsValue::from_str("render reference cache miss"))?;
         let radius = render_tile_radius(rect, reference.screen_x, reference.screen_y, pixel_span);
-        let probes = render_tile_probe_offsets(rect, reference.screen_x, reference.screen_y, pixel_span);
+        let probes =
+            render_tile_probe_offsets(rect, reference.screen_x, reference.screen_y, pixel_span);
         contexts.push(RenderContext {
             reference,
             radius,
@@ -979,22 +1007,46 @@ fn build_render_tile_value(
 
     let stats = Object::new();
     set_js_property(&stats, "elapsedMs", &JsValue::from_f64(elapsed_ms))?;
-    set_js_property(&stats, "glitchCount", &JsValue::from_f64(glitch_count as f64))?;
-    set_js_property(&stats, "unresolvedCount", &JsValue::from_f64(unresolved_count as f64))?;
-    set_js_property(&stats, "escapedPixels", &JsValue::from_f64(escaped_pixels as f64))?;
+    set_js_property(
+        &stats,
+        "glitchCount",
+        &JsValue::from_f64(glitch_count as f64),
+    )?;
+    set_js_property(
+        &stats,
+        "unresolvedCount",
+        &JsValue::from_f64(unresolved_count as f64),
+    )?;
+    set_js_property(
+        &stats,
+        "escapedPixels",
+        &JsValue::from_f64(escaped_pixels as f64),
+    )?;
     set_js_property(
         &stats,
         "periodicInteriorCount",
         &JsValue::from_f64(periodic_interior_count as f64),
     )?;
-    set_js_property(&stats, "rebaseCount", &JsValue::from_f64(rebase_count as f64))?;
+    set_js_property(
+        &stats,
+        "rebaseCount",
+        &JsValue::from_f64(rebase_count as f64),
+    )?;
     set_js_property(
         &stats,
         "rebaseLimitCount",
         &JsValue::from_f64(rebase_limit_count as f64),
     )?;
-    set_js_property(&stats, "blaSkipCount", &JsValue::from_f64(bla_skip_count as f64))?;
-    set_js_property(&stats, "blaStepCount", &JsValue::from_f64(bla_step_count as f64))?;
+    set_js_property(
+        &stats,
+        "blaSkipCount",
+        &JsValue::from_f64(bla_skip_count as f64),
+    )?;
+    set_js_property(
+        &stats,
+        "blaStepCount",
+        &JsValue::from_f64(bla_step_count as f64),
+    )?;
     set_js_property(&stats, "referenceCacheMissCount", &JsValue::from_f64(0.0))?;
     set_js_property(&stats, "seriesSkip", &JsValue::from_f64(series_skip as f64))?;
     set_js_property(
@@ -1042,7 +1094,11 @@ fn build_render_tile_value(
         "unresolvedClusters",
         unresolved_clusters_to_js(&unresolved_clusters)?.as_ref(),
     )?;
-    set_js_property(&stats, "preview", &JsValue::from_bool(render_mode == "preview"))?;
+    set_js_property(
+        &stats,
+        "preview",
+        &JsValue::from_bool(render_mode == "preview"),
+    )?;
     set_js_property(&stats, "renderMode", &JsValue::from_str(render_mode))?;
     set_js_property(&object, "stats", stats.as_ref())?;
     Ok(object.into())
@@ -1236,7 +1292,8 @@ fn perturb64(
                 }
                 let cycle_delta_re = z_re - scratch.checkpoint_re[checkpoint];
                 let cycle_delta_im = z_im - scratch.checkpoint_im[checkpoint];
-                let cycle_delta2 = cycle_delta_re * cycle_delta_re + cycle_delta_im * cycle_delta_im;
+                let cycle_delta2 =
+                    cycle_delta_re * cycle_delta_re + cycle_delta_im * cycle_delta_im;
                 if cycle_delta2.is_finite() && cycle_delta2 < cycle_tolerance {
                     return success_result64(
                         max_iter,
@@ -1559,7 +1616,11 @@ fn probes_validate_series_step64(
         let error = (exact_re - estimate_re).hypot(exact_im - estimate_im);
         let exact_mag = exact_re.hypot(exact_im);
         let estimate_mag = estimate_re.hypot(estimate_im);
-        let allowed = RENDER_SERIES_ERROR_SCALE * tile_radius.max(exact_mag).max(estimate_mag).max(f64::MIN_POSITIVE);
+        let allowed = RENDER_SERIES_ERROR_SCALE
+            * tile_radius
+                .max(exact_mag)
+                .max(estimate_mag)
+                .max(f64::MIN_POSITIVE);
         if !error.is_finite() || error > allowed {
             return false;
         }
@@ -1581,7 +1642,11 @@ fn is_render_cancellation_glitch(mag2: f64, ref_mag2: f64, dz_mag2: f64) -> bool
 }
 
 fn create_render_cluster_accumulators(rect: Rect64) -> Vec<ClusterAccumulator64> {
-    let cols = if rect.width >= rect.height * 1.5 { 8 } else { 4 };
+    let cols = if rect.width >= rect.height * 1.5 {
+        8
+    } else {
+        4
+    };
     let rows = 4;
     let mut clusters = Vec::with_capacity((cols * rows) as usize);
     for bin_y in 0..rows {
@@ -1614,7 +1679,11 @@ fn record_render_unresolved_cluster(
     screen_y: f64,
     survived_iter: u32,
 ) {
-    let cols = if rect.width >= rect.height * 1.5 { 8 } else { 4 };
+    let cols = if rect.width >= rect.height * 1.5 {
+        8
+    } else {
+        4
+    };
     let rows = 4;
     let bin_x = (((screen_x - rect.x) / rect.width.max(1.0)) * cols as f64)
         .floor()
@@ -1636,7 +1705,10 @@ fn record_render_unresolved_cluster(
     }
 }
 
-fn build_render_unresolved_clusters(clusters: &[ClusterAccumulator64], rect: Rect64) -> Vec<UnresolvedCluster64> {
+fn build_render_unresolved_clusters(
+    clusters: &[ClusterAccumulator64],
+    rect: Rect64,
+) -> Vec<UnresolvedCluster64> {
     let radius_px = 0.5f64.max(rect.width.hypot(rect.height) * 0.25);
     let mut result: Vec<UnresolvedCluster64> = clusters
         .iter()
@@ -1689,27 +1761,46 @@ fn apply_render_boundary_smoothing(
         return empty_render_boundary_stats();
     }
     let mut edge_strengths = vec![0f32; width * height];
+    let mut classification_changes = vec![0u8; width * height];
     let mut candidates: Vec<BoundaryCandidate64> = Vec::new();
     let mut boundary_dampened_count = 0u32;
 
     for y in 0..height {
         for x in 0..width {
             let index = y * width + x;
-            if unresolved_mask[index] != 0 || escaped_mask[index] == 0 {
+            if unresolved_mask[index] != 0 {
                 continue;
             }
-            let edge_strength = render_edge_strength_at(index, x, y, width, height, smooth_values, escaped_mask, unresolved_mask);
-            edge_strengths[index] = edge_strength as f32;
-            if edge_strength >= RENDER_AA_EDGE_THRESHOLD {
+            let edge = render_edge_strength_at(
+                index,
+                x,
+                y,
+                width,
+                height,
+                smooth_values,
+                escaped_mask,
+                unresolved_mask,
+            );
+            edge_strengths[index] = edge.edge_strength as f32;
+            if edge.classification_change {
+                classification_changes[index] = 1;
+            }
+            if edge.edge_strength >= RENDER_AA_EDGE_THRESHOLD {
                 candidates.push(BoundaryCandidate64 {
                     index,
-                    edge_strength,
+                    edge_strength: edge.edge_strength,
+                    classification_change: edge.classification_change,
                 });
             }
         }
     }
 
-    candidates.sort_by(|a, b| b.edge_strength.total_cmp(&a.edge_strength));
+    candidates.sort_by(|a, b| {
+        b.classification_change
+            .cmp(&a.classification_change)
+            .then_with(|| b.edge_strength.total_cmp(&a.edge_strength))
+            .then_with(|| a.index.cmp(&b.index))
+    });
     let aa_limit = candidates
         .len()
         .min(RENDER_AA_PIXEL_CAP)
@@ -1720,6 +1811,7 @@ fn apply_render_boundary_smoothing(
     let mut aa_pixel_count = 0u32;
     let mut aa_sample_count = 0u32;
     let mut aa_fallback_count = 0u32;
+    let mut supersampled_mask = vec![0u8; width * height];
 
     if !contexts.is_empty() {
         let pixel_step_x = rect.width / width as f64;
@@ -1728,8 +1820,10 @@ fn apply_render_boundary_smoothing(
             let candidate = candidates[candidate_index];
             let x = candidate.index % width;
             let y = candidate.index / width;
-            let screen_x = (rect.x + rect.width - 0.5 * pixel_step_x).min(rect.x + (x as f64 + 0.5) * pixel_step_x);
-            let screen_y = (rect.y + rect.height - 0.5 * pixel_step_y).min(rect.y + (y as f64 + 0.5) * pixel_step_y);
+            let screen_x = (rect.x + rect.width - 0.5 * pixel_step_x)
+                .min(rect.x + (x as f64 + 0.5) * pixel_step_x);
+            let screen_y = (rect.y + rect.height - 0.5 * pixel_step_y)
+                .min(rect.y + (y as f64 + 0.5) * pixel_step_y);
             let offsets: &[(f64, f64)] = if candidate_index < four_sample_limit {
                 &RENDER_FOUR_SAMPLE_OFFSETS
             } else {
@@ -1753,12 +1847,29 @@ fn apply_render_boundary_smoothing(
             aa_pixel_count += 1;
             aa_sample_count += offsets.len() as u32;
             aa_fallback_count += fallbacks;
+            supersampled_mask[candidate.index] = 1;
         }
     }
 
     for index in 0..edge_strengths.len() {
         let edge_strength = edge_strengths[index] as f64;
-        if edge_strength <= 0.0 || escaped_mask[index] == 0 || unresolved_mask[index] != 0 {
+        if edge_strength <= 0.0 || unresolved_mask[index] != 0 || supersampled_mask[index] != 0 {
+            continue;
+        }
+        if escaped_mask[index] == 0 {
+            if classification_changes[index] == 0 {
+                continue;
+            }
+            if blend_render_interior_boundary_from_neighbors(
+                buffer,
+                index,
+                width,
+                height,
+                escaped_mask,
+                unresolved_mask,
+            ) {
+                boundary_dampened_count += 1;
+            }
             continue;
         }
         let offset = index * 4;
@@ -1797,7 +1908,7 @@ fn render_edge_strength_at(
     smooth_values: &[f32],
     escaped_mask: &[u8],
     unresolved_mask: &[u8],
-) -> f64 {
+) -> RenderEdgeInfo64 {
     let escaped = escaped_mask[index] != 0;
     let smooth = smooth_values[index] as f64;
     let mut max_smooth_delta = 0.0;
@@ -1817,13 +1928,29 @@ fn render_edge_strength_at(
             classification_change = true;
         }
         if neighbor_escaped && escaped {
-            max_smooth_delta = f64::max(max_smooth_delta, (smooth - smooth_values[neighbor_index] as f64).abs());
+            max_smooth_delta = f64::max(
+                max_smooth_delta,
+                (smooth - smooth_values[neighbor_index] as f64).abs(),
+            );
         } else if neighbor_escaped || escaped {
             max_smooth_delta = f64::max(max_smooth_delta, RENDER_SMOOTH_DELTA_HIGH);
         }
     }
-    let smooth_edge = clamp01((max_smooth_delta - RENDER_SMOOTH_DELTA_LOW) / (RENDER_SMOOTH_DELTA_HIGH - RENDER_SMOOTH_DELTA_LOW));
-    clamp01(smooth_edge + if classification_change { RENDER_CLASSIFICATION_EDGE_BOOST } else { 0.0 })
+    let smooth_edge = clamp01(
+        (max_smooth_delta - RENDER_SMOOTH_DELTA_LOW)
+            / (RENDER_SMOOTH_DELTA_HIGH - RENDER_SMOOTH_DELTA_LOW),
+    );
+    RenderEdgeInfo64 {
+        edge_strength: clamp01(
+            smooth_edge
+                + if classification_change {
+                    RENDER_CLASSIFICATION_EDGE_BOOST
+                } else {
+                    0.0
+                },
+        ),
+        classification_change,
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1866,7 +1993,12 @@ fn render_supersample_pixel(
                 b: buffer[base_offset + 2],
             }
         } else {
-            color_for_render_result(selection.result.iter, max_iter, selection.result.mag2, palette)
+            color_for_render_result(
+                selection.result.iter,
+                max_iter,
+                selection.result.mag2,
+                palette,
+            )
         };
         linear_r += srgb_to_linear(color.r as f64 / 255.0);
         linear_g += srgb_to_linear(color.g as f64 / 255.0);
@@ -1886,7 +2018,69 @@ fn render_supersample_pixel(
     fallbacks
 }
 
-fn fill_render_unresolved_preview(buffer: &mut [u8], unresolved_mask: &mut [u8], width: usize, height: usize) {
+fn blend_render_interior_boundary_from_neighbors(
+    buffer: &mut [u8],
+    pixel_index: usize,
+    width: usize,
+    height: usize,
+    escaped_mask: &[u8],
+    unresolved_mask: &[u8],
+) -> bool {
+    let x = pixel_index % width;
+    let y = pixel_index / width;
+    let base_offset = pixel_index * 4;
+    let mut linear_r = srgb_to_linear(buffer[base_offset] as f64 / 255.0);
+    let mut linear_g = srgb_to_linear(buffer[base_offset + 1] as f64 / 255.0);
+    let mut linear_b = srgb_to_linear(buffer[base_offset + 2] as f64 / 255.0);
+    let mut total_weight = 1.0;
+    let mut escaped_neighbors = 0u32;
+
+    for dy in -1isize..=1 {
+        for dx in -1isize..=1 {
+            if dx == 0 && dy == 0 {
+                continue;
+            }
+            let nx = x as isize + dx;
+            let ny = y as isize + dy;
+            if nx < 0 || ny < 0 || nx >= width as isize || ny >= height as isize {
+                continue;
+            }
+            let neighbor_index = ny as usize * width + nx as usize;
+            if unresolved_mask[neighbor_index] != 0 || escaped_mask[neighbor_index] == 0 {
+                continue;
+            }
+            let neighbor_offset = neighbor_index * 4;
+            let weight = if dx == 0 || dy == 0 { 1.0 } else { 0.5 };
+            linear_r += srgb_to_linear(buffer[neighbor_offset] as f64 / 255.0) * weight;
+            linear_g += srgb_to_linear(buffer[neighbor_offset + 1] as f64 / 255.0) * weight;
+            linear_b += srgb_to_linear(buffer[neighbor_offset + 2] as f64 / 255.0) * weight;
+            total_weight += weight;
+            escaped_neighbors += 1;
+        }
+    }
+
+    if escaped_neighbors == 0 {
+        return false;
+    }
+
+    write_render_color(
+        buffer,
+        base_offset,
+        Color64 {
+            r: clamp_byte((linear_to_srgb(linear_r / total_weight) * 255.0).round()),
+            g: clamp_byte((linear_to_srgb(linear_g / total_weight) * 255.0).round()),
+            b: clamp_byte((linear_to_srgb(linear_b / total_weight) * 255.0).round()),
+        },
+    );
+    true
+}
+
+fn fill_render_unresolved_preview(
+    buffer: &mut [u8],
+    unresolved_mask: &mut [u8],
+    width: usize,
+    height: usize,
+) {
     for pass in 0..3 {
         let mut changed = false;
         for y in 0..height {
@@ -1955,7 +2149,12 @@ fn render_tile_radius(rect: Rect64, screen_x: f64, screen_y: f64, pixel_span: f6
         .fold(0.0, f64::max)
 }
 
-fn render_tile_probe_offsets(rect: Rect64, screen_x: f64, screen_y: f64, pixel_span: f64) -> Vec<Complex64> {
+fn render_tile_probe_offsets(
+    rect: Rect64,
+    screen_x: f64,
+    screen_y: f64,
+    pixel_span: f64,
+) -> Vec<Complex64> {
     let min_x = rect.x + 0.5;
     let max_x = rect.x + 0.5f64.max(rect.width - 0.5);
     let min_y = rect.y + 0.5;
@@ -1994,7 +2193,13 @@ fn color_for_render_result(iter: u32, max_iter: u32, mag2: f64, palette: &[u8]) 
     }
 }
 
-fn write_render_color_for_smooth(buffer: &mut [u8], offset: usize, interior: bool, smooth: f64, palette: &[u8]) {
+fn write_render_color_for_smooth(
+    buffer: &mut [u8],
+    offset: usize,
+    interior: bool,
+    smooth: f64,
+    palette: &[u8],
+) {
     if interior {
         buffer[offset] = 4;
         buffer[offset + 1] = 8;
@@ -2032,7 +2237,11 @@ fn render_smooth_iteration(iter: u32, max_iter: u32, mag2: f64) -> f64 {
     if iter >= max_iter {
         return max_iter as f64;
     }
-    iter as f64 + 1.0 - (mag2.max(4.0).ln() * RENDER_SMOOTH_LOG_SCALE).max(1e-12).ln() * RENDER_INV_LN2
+    iter as f64 + 1.0
+        - (mag2.max(4.0).ln() * RENDER_SMOOTH_LOG_SCALE)
+            .max(1e-12)
+            .ln()
+            * RENDER_INV_LN2
 }
 
 fn dampen_render_chroma(color: Color64, edge_strength: f64) -> Color64 {

@@ -61,6 +61,7 @@ interface Color {
 interface BoundaryCandidate {
   index: number;
   edgeStrength: number;
+  classificationChange: boolean;
 }
 
 interface BoundaryStats {
@@ -68,6 +69,11 @@ interface BoundaryStats {
   aaPixelCount: number;
   aaSampleCount: number;
   aaFallbackCount: number;
+}
+
+interface EdgeInfo {
+  edgeStrength: number;
+  classificationChange: boolean;
 }
 
 const MIN_PIXEL_SPAN_FOR_PERIODIC_INTERIOR = 1e-18;
@@ -78,10 +84,10 @@ const SMOOTH_DELTA_LOW = 6;
 const SMOOTH_DELTA_HIGH = 24;
 const CLASSIFICATION_EDGE_BOOST = 0.35;
 const AA_EDGE_THRESHOLD = 0.45;
-const AA_PIXEL_CAP = 128;
-const AA_PIXEL_FRACTION = 0.01;
-const AA_FOUR_SAMPLE_CAP = 32;
-const AA_FOUR_SAMPLE_FRACTION = 0.0025;
+const AA_PIXEL_CAP = 512;
+const AA_PIXEL_FRACTION = 0.04;
+const AA_FOUR_SAMPLE_CAP = 128;
+const AA_FOUR_SAMPLE_FRACTION = 0.01;
 const MIN_EDGE_CHROMA_SCALE = 0.35;
 const PALETTE_SIZE = 2048;
 const COSINE_PALETTE = createCosinePalette(PALETTE_SIZE);
@@ -613,26 +619,37 @@ function applyBoundarySmoothing(
 ): BoundaryStats {
   if (width <= 1 || height <= 1) return emptyBoundaryStats();
   const edgeStrengths = new Float32Array(width * height);
+  const classificationChanges = new Uint8Array(width * height);
   const candidates: BoundaryCandidate[] = [];
   let boundaryDampenedCount = 0;
 
   for (let y = 0; y < height; y += 1) {
     for (let x = 0; x < width; x += 1) {
       const index = y * width + x;
-      if (unresolvedMask[index] !== 0 || escapedMask[index] === 0) continue;
-      const edgeStrength = edgeStrengthAt(index, x, y, width, height, smoothValues, escapedMask, unresolvedMask);
-      edgeStrengths[index] = edgeStrength;
-      if (edgeStrength <= 0) continue;
-      if (edgeStrength >= AA_EDGE_THRESHOLD) candidates.push({ index, edgeStrength });
+      if (unresolvedMask[index] !== 0) continue;
+      const edge = edgeStrengthAt(index, x, y, width, height, smoothValues, escapedMask, unresolvedMask);
+      edgeStrengths[index] = edge.edgeStrength;
+      if (edge.classificationChange) classificationChanges[index] = 1;
+      if (edge.edgeStrength <= 0) continue;
+      if (edge.edgeStrength >= AA_EDGE_THRESHOLD) {
+        candidates.push({
+          index,
+          edgeStrength: edge.edgeStrength,
+          classificationChange: edge.classificationChange
+        });
+      }
     }
   }
 
-  candidates.sort((a, b) => b.edgeStrength - a.edgeStrength);
+  candidates.sort(
+    (a, b) => Number(b.classificationChange) - Number(a.classificationChange) || b.edgeStrength - a.edgeStrength || a.index - b.index
+  );
   const aaLimit = Math.min(candidates.length, AA_PIXEL_CAP, Math.ceil(width * height * AA_PIXEL_FRACTION));
   const fourSampleLimit = Math.min(aaLimit, AA_FOUR_SAMPLE_CAP, Math.ceil(width * height * AA_FOUR_SAMPLE_FRACTION));
   let aaPixelCount = 0;
   let aaSampleCount = 0;
   let aaFallbackCount = 0;
+  const supersampledMask = new Uint8Array(width * height);
 
   if (contexts.length > 0) {
     const pixelStepX = rect.width / width;
@@ -662,13 +679,21 @@ function applyBoundarySmoothing(
       aaPixelCount += 1;
       aaSampleCount += offsets.length;
       aaFallbackCount += sampleStats.fallbacks;
+      supersampledMask[candidate.index] = 1;
     }
   }
 
   for (let index = 0; index < edgeStrengths.length; index += 1) {
     const edgeStrength = edgeStrengths[index];
-    if (edgeStrength <= 0 || escapedMask[index] === 0 || unresolvedMask[index] !== 0) continue;
+    if (edgeStrength <= 0 || unresolvedMask[index] !== 0 || supersampledMask[index] !== 0) continue;
     const offset = index * 4;
+    if (escapedMask[index] === 0) {
+      if (classificationChanges[index] === 0) continue;
+      if (blendInteriorBoundaryFromNeighbors(buffer, index, width, height, escapedMask, unresolvedMask)) {
+        boundaryDampenedCount += 1;
+      }
+      continue;
+    }
     const color = {
       r: buffer[offset],
       g: buffer[offset + 1],
@@ -694,7 +719,7 @@ function edgeStrengthAt(
   smoothValues: Float32Array,
   escapedMask: Uint8Array,
   unresolvedMask: Uint8Array
-): number {
+): EdgeInfo {
   const escaped = escapedMask[index] !== 0;
   const smooth = smoothValues[index];
   let maxSmoothDelta = 0;
@@ -714,7 +739,10 @@ function edgeStrengthAt(
     }
   }
   const smoothEdge = clamp01((maxSmoothDelta - SMOOTH_DELTA_LOW) / (SMOOTH_DELTA_HIGH - SMOOTH_DELTA_LOW));
-  return clamp01(smoothEdge + (classificationChange ? CLASSIFICATION_EDGE_BOOST : 0));
+  return {
+    edgeStrength: clamp01(smoothEdge + (classificationChange ? CLASSIFICATION_EDGE_BOOST : 0)),
+    classificationChange
+  };
 }
 
 function supersamplePixel(
@@ -769,6 +797,50 @@ function supersamplePixel(
     b: Math.round(linearToSrgb(linearB / divisor) * 255)
   });
   return { fallbacks };
+}
+
+function blendInteriorBoundaryFromNeighbors(
+  buffer: Uint8ClampedArray,
+  pixelIndex: number,
+  width: number,
+  height: number,
+  escapedMask: Uint8Array,
+  unresolvedMask: Uint8Array
+): boolean {
+  const x = pixelIndex % width;
+  const y = Math.floor(pixelIndex / width);
+  const baseOffset = pixelIndex * 4;
+  let linearR = srgbToLinear(buffer[baseOffset] / 255);
+  let linearG = srgbToLinear(buffer[baseOffset + 1] / 255);
+  let linearB = srgbToLinear(buffer[baseOffset + 2] / 255);
+  let totalWeight = 1;
+  let escapedNeighbors = 0;
+
+  for (let dy = -1; dy <= 1; dy += 1) {
+    for (let dx = -1; dx <= 1; dx += 1) {
+      if (dx === 0 && dy === 0) continue;
+      const nx = x + dx;
+      const ny = y + dy;
+      if (nx < 0 || ny < 0 || nx >= width || ny >= height) continue;
+      const neighborIndex = ny * width + nx;
+      if (unresolvedMask[neighborIndex] !== 0 || escapedMask[neighborIndex] === 0) continue;
+      const neighborOffset = neighborIndex * 4;
+      const weight = dx === 0 || dy === 0 ? 1 : 0.5;
+      linearR += srgbToLinear(buffer[neighborOffset] / 255) * weight;
+      linearG += srgbToLinear(buffer[neighborOffset + 1] / 255) * weight;
+      linearB += srgbToLinear(buffer[neighborOffset + 2] / 255) * weight;
+      totalWeight += weight;
+      escapedNeighbors += 1;
+    }
+  }
+
+  if (escapedNeighbors === 0) return false;
+  writeColor(buffer, baseOffset, {
+    r: Math.round(linearToSrgb(linearR / totalWeight) * 255),
+    g: Math.round(linearToSrgb(linearG / totalWeight) * 255),
+    b: Math.round(linearToSrgb(linearB / totalWeight) * 255)
+  });
+  return true;
 }
 
 function fillUnresolvedPreview(buffer: Uint8ClampedArray, unresolvedMask: Uint8Array, width: number, height: number): void {

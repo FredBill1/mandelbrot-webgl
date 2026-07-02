@@ -43,6 +43,8 @@ const DEEP_MEMORY_REGRESSION_URL =
   "/?re=-7.4688394343169276054191953271440985923260663988633375070109254116564380822428796e-1&im=-1.0052598241121587675259369892011437164151107429135698306788524375078819321907893e-1&scale=2.1270123524035260478728648392445123424166443778810410355510198092432642054827677e78&iter=5525";
 const RAINBOW_NOISE_REGRESSION_URL =
   "/?re=-7.44743856455867584502971474051977658103817187893185200400939609851583632432852598231790469e-1&im=-1.35593942108114561959508453803647827165860206496504860209432696505792919260554145799490801e-1&scale=2.5723755590577444907048627502998122776921365543852726093737771835857766320092045519877944e2&iter=667";
+const ANTI_ALIASING_PEPPER_REGRESSION_URL =
+  "/?re=-7.47689723441669939527017253976715439192679851461831874268821803604290203278587516851291729e-1&im=-7.22121932539053588116373452229159661989232396616246710140552835347280711817029504503225198e-2&scale=1.47647815655772413738325308653033716994542630984542066793843052404878099060420525511068532e4&iter=779";
 const UNSAFE_ACCELERATION_TILE_REGRESSIONS = [
   {
     url:
@@ -295,6 +297,23 @@ test("reduces rainbow speckle on the reported boundary view", async ({ page }) =
   expect(speckleRatio).toBeLessThanOrEqual(0.05);
 });
 
+test("anti aliasing removes pepper noise on the reported edge view", async ({ page }) => {
+  test.setTimeout(90_000);
+  await page.setViewportSize({ width: 1912, height: 948 });
+  await page.goto(ANTI_ALIASING_PEPPER_REGRESSION_URL);
+  await waitForNonBlankCanvas(page, 75_000);
+
+  const tileCounts = await readTileCounts(page);
+  expect(tileCounts.completed).toBe(tileCounts.total);
+
+  const speckleRatio = await readCanvasSpeckleRatio(
+    page,
+    { left: 420, top: 40, right: 1680, bottom: 880 },
+    { includeLumaOutliers: true }
+  );
+  expect(speckleRatio).toBeLessThanOrEqual(0.04);
+});
+
 async function waitForNonBlankCanvas(page: import("@playwright/test").Page, timeout = 15_000): Promise<void> {
   await expect(page.locator("#readStatus")).toHaveText("stable", { timeout });
   await expect
@@ -347,9 +366,10 @@ async function readReferenceCount(page: import("@playwright/test").Page): Promis
 
 async function readCanvasSpeckleRatio(
   page: import("@playwright/test").Page,
-  roi: { left: number; top: number; right: number; bottom: number }
+  roi: { left: number; top: number; right: number; bottom: number },
+  options: { includeLumaOutliers?: boolean } = {}
 ): Promise<number> {
-  return page.evaluate((roi) => {
+  return page.evaluate(({ roi, includeLumaOutliers }) => {
     const canvas = document.querySelector<HTMLCanvasElement>("#fractal");
     const gl = canvas?.getContext("webgl2", { alpha: false, antialias: false, preserveDrawingBuffer: true });
     if (!canvas || !gl) return Number.POSITIVE_INFINITY;
@@ -370,8 +390,10 @@ async function readCanvasSpeckleRatio(
         const red = pixels[offset];
         const green = pixels[offset + 1];
         const blue = pixels[offset + 2];
+        const luma = 0.2126 * red + 0.7152 * green + 0.0722 * blue;
         const chroma = Math.max(red, green, blue) - Math.min(red, green, blue);
         let maxDelta = 0;
+        const neighborLuma: number[] = [];
         for (const [dx, dy] of [[1, 0], [-1, 0], [0, 1], [0, -1]] as const) {
           const neighbor = pixelOffset(x + dx, y + dy);
           const delta =
@@ -380,10 +402,27 @@ async function readCanvasSpeckleRatio(
             Math.abs(blue - pixels[neighbor + 2]);
           maxDelta = Math.max(maxDelta, delta);
         }
+        if (includeLumaOutliers) {
+          for (let dy = -1; dy <= 1; dy += 1) {
+            for (let dx = -1; dx <= 1; dx += 1) {
+              if (dx === 0 && dy === 0) continue;
+              const neighbor = pixelOffset(x + dx, y + dy);
+              neighborLuma.push(
+                0.2126 * pixels[neighbor] + 0.7152 * pixels[neighbor + 1] + 0.0722 * pixels[neighbor + 2]
+              );
+            }
+          }
+        }
         total += 1;
-        if (chroma > 170 && maxDelta > 300) speckles += 1;
+        let lumaOutlier = false;
+        if (includeLumaOutliers) {
+          neighborLuma.sort((a, b) => a - b);
+          const medianLuma = (neighborLuma[3] + neighborLuma[4]) * 0.5;
+          lumaOutlier = (luma < 45 && medianLuma > 95) || (luma > 205 && medianLuma < 85);
+        }
+        if ((chroma > 170 && maxDelta > 300) || lumaOutlier) speckles += 1;
       }
     }
     return speckles / Math.max(1, total);
-  }, roi);
+  }, { roi, includeLumaOutliers: options.includeLumaOutliers === true });
 }
