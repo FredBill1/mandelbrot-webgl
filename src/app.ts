@@ -82,6 +82,17 @@ interface ReferenceBrokerEntry {
   waiters: ReferenceBrokerWaiter[];
 }
 
+interface PointerSample {
+  x: number;
+  y: number;
+}
+
+interface PinchSample {
+  centerX: number;
+  centerY: number;
+  distance: number;
+}
+
 const MAX_RENDER_REFERENCES = 16;
 const PREVIEW_REFERENCE_LIMIT = 2;
 const PREVIEW_REFERENCE_GLOBAL_BUDGET = 96;
@@ -156,19 +167,27 @@ export async function startApp(root: HTMLElement): Promise<void> {
     void setView({ ...DEEP_TEST_VIEW }, "deep");
   });
 
-  const interaction = { dragging: false, lastX: 0, lastY: 0 };
+  const activePointers = new Map<number, PointerSample>();
+  let lastPinch: PinchSample | undefined;
   canvas.addEventListener("pointerdown", (event) => {
     canvas.setPointerCapture(event.pointerId);
-    interaction.dragging = true;
-    interaction.lastX = event.clientX;
-    interaction.lastY = event.clientY;
+    activePointers.set(event.pointerId, pointerSample(event));
+    resetPinchBaseline();
   });
   canvas.addEventListener("pointermove", (event) => {
-    if (!interaction.dragging) return;
-    const dx = (event.clientX - interaction.lastX) * runtime.pixelRatio;
-    const dy = (event.clientY - interaction.lastY) * runtime.pixelRatio;
-    interaction.lastX = event.clientX;
-    interaction.lastY = event.clientY;
+    const previous = activePointers.get(event.pointerId);
+    if (!previous) return;
+    const current = pointerSample(event);
+    activePointers.set(event.pointerId, current);
+
+    if (activePointers.size >= 2) {
+      handlePinchMove();
+      return;
+    }
+
+    lastPinch = undefined;
+    const dx = current.x - previous.x;
+    const dy = current.y - previous.y;
     if (Math.abs(dx) + Math.abs(dy) < 0.5) return;
     renderer.applyRetainedPan(dx, dy);
     void transformView(view, runtime.width, runtime.height, dx, dy, 1, runtime.width * 0.5, runtime.height * 0.5).then((next) => {
@@ -177,11 +196,14 @@ export async function startApp(root: HTMLElement): Promise<void> {
     });
   });
   canvas.addEventListener("pointerup", (event) => {
-    interaction.dragging = false;
-    canvas.releasePointerCapture(event.pointerId);
+    finishPointer(event);
   });
-  canvas.addEventListener("pointercancel", () => {
-    interaction.dragging = false;
+  canvas.addEventListener("pointercancel", (event) => {
+    finishPointer(event);
+  });
+  canvas.addEventListener("lostpointercapture", (event) => {
+    activePointers.delete(event.pointerId);
+    resetPinchBaseline();
   });
   canvas.addEventListener(
     "wheel",
@@ -965,6 +987,60 @@ export async function startApp(root: HTMLElement): Promise<void> {
       pixelRatio: Math.max(1, Math.min(2, window.devicePixelRatio || 1)),
       revision
     };
+  }
+
+  function pointerSample(event: PointerEvent): PointerSample {
+    const rect = canvas.getBoundingClientRect();
+    return {
+      x: (event.clientX - rect.left) * runtime.pixelRatio,
+      y: (event.clientY - rect.top) * runtime.pixelRatio
+    };
+  }
+
+  function finishPointer(event: PointerEvent): void {
+    activePointers.delete(event.pointerId);
+    if (canvas.hasPointerCapture(event.pointerId)) canvas.releasePointerCapture(event.pointerId);
+    resetPinchBaseline();
+  }
+
+  function resetPinchBaseline(): void {
+    lastPinch = activePointers.size >= 2 ? currentPinchSample() : undefined;
+  }
+
+  function currentPinchSample(): PinchSample | undefined {
+    const points = [...activePointers.values()];
+    if (points.length < 2) return undefined;
+    const first = points[0];
+    const second = points[1];
+    return {
+      centerX: (first.x + second.x) * 0.5,
+      centerY: (first.y + second.y) * 0.5,
+      distance: Math.hypot(second.x - first.x, second.y - first.y)
+    };
+  }
+
+  function handlePinchMove(): void {
+    const current = currentPinchSample();
+    if (!current) {
+      lastPinch = undefined;
+      return;
+    }
+    const previous = lastPinch;
+    lastPinch = current;
+    if (!previous || previous.distance < 1) return;
+
+    const factor = current.distance / previous.distance;
+    const dx = current.centerX - previous.centerX;
+    const dy = current.centerY - previous.centerY;
+    if (!Number.isFinite(factor) || factor <= 0) return;
+    if (Math.abs(current.distance - previous.distance) < 0.5 && Math.abs(dx) + Math.abs(dy) < 0.5) return;
+
+    renderer.applyRetainedZoom(factor, previous.centerX, previous.centerY);
+    renderer.applyRetainedPan(dx, dy);
+    void transformView(view, runtime.width, runtime.height, dx, dy, factor, previous.centerX, previous.centerY).then((next) => {
+      next.maxIter = defaultMaxIter(next.scale);
+      void setView(next, "pinch", false);
+    });
   }
 
   function scheduleUrlSync(): void {

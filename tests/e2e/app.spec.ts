@@ -95,6 +95,44 @@ test("renders, pans, zooms, and restores URL state", async ({ page }) => {
   expect(new URL(page.url()).searchParams.get("scale")).toBe(beforeReload.searchParams.get("scale"));
 });
 
+test("supports pinch zoom with two touch pointers", async ({ page, browserName }) => {
+  test.skip(browserName !== "chromium", "CDP touch injection is Chromium-specific");
+  await page.setViewportSize({ width: 800, height: 600 });
+  await page.goto("/");
+  const canvas = page.locator("#fractal");
+  await expect(canvas).toBeVisible();
+  await waitForNonBlankCanvas(page);
+
+  const before = new URL(page.url());
+  const box = await canvas.boundingBox();
+  if (!box) throw new Error("Missing canvas bounds");
+  const centerX = box.x + box.width * 0.5;
+  const centerY = box.y + box.height * 0.5;
+  const client = await page.context().newCDPSession(page);
+  const touchPoint = (id: number, x: number, y: number) => ({ id, x, y, radiusX: 1, radiusY: 1, force: 1 });
+
+  try {
+    await client.send("Emulation.setTouchEmulationEnabled", { enabled: true, maxTouchPoints: 2 });
+    await client.send("Input.dispatchTouchEvent", {
+      type: "touchStart",
+      touchPoints: [touchPoint(1, centerX - 50, centerY), touchPoint(2, centerX + 50, centerY)]
+    });
+    for (const offset of [70, 90, 110]) {
+      await client.send("Input.dispatchTouchEvent", {
+        type: "touchMove",
+        touchPoints: [touchPoint(1, centerX - offset, centerY - 8), touchPoint(2, centerX + offset, centerY + 8)]
+      });
+    }
+    await client.send("Input.dispatchTouchEvent", { type: "touchEnd", touchPoints: [] });
+  } finally {
+    await client.send("Emulation.setTouchEmulationEnabled", { enabled: false });
+    await client.detach();
+  }
+
+  await expect.poll(() => new URL(page.url()).searchParams.get("scale")).not.toBe(before.searchParams.get("scale"));
+  await waitForNonBlankCanvas(page);
+});
+
 test("renders the reported regression views without false interior samples", async ({ page }) => {
   await page.setViewportSize({ width: 1912, height: 948 });
   for (const view of REGRESSION_VIEWS) {
