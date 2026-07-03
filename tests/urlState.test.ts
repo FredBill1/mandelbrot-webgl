@@ -7,6 +7,7 @@ describe("url state", () => {
     const view = parseViewFromUrl(url);
     expect(view).toEqual({ re: "-7.5e-1", im: "1.25e-1", scale: "1e100", maxIter: 6912 });
     expect(serializeViewToQuery(view)).toBe("?re=-7.5e-1&im=1.25e-1&scale=1e100&iter=6912");
+    expect(serializeViewToQuery(view, { iterMode: "auto" })).toBe("?re=-7.5e-1&im=1.25e-1&scale=1e100");
   });
 
   it("falls back on invalid values", () => {

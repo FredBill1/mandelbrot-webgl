@@ -65,7 +65,19 @@ const SCENARIOS = [
       maxFirstVisualChangeMs: 100,
       maxNewRevisionQueuedMs: 100,
       maxFirstNewTileDoneMs: 1000,
-      maxOldRevisionTileDoneAfterInput: 0
+      maxOldRevisionTileDoneAfterInput: 0,
+      maxIterProbeFastDoneMs: 180,
+      maxIterChangedAfterFinal: 0
+    },
+    baselineComparable: false
+  },
+  {
+    name: "deep-button-probe",
+    timeoutMs: 180_000,
+    url: undefined,
+    requirements: {
+      stable: true,
+      minIterProbeFastDoneCount: 1
     },
     baselineComparable: false
   },
@@ -218,6 +230,10 @@ function projectMetrics(scenario, raw) {
     newRevisionQueuedMs: raw.interactive?.newRevisionQueuedMs ?? null,
     firstNewTileDoneMs: raw.interactive?.firstNewTileDoneMs ?? null,
     oldRevisionTileDoneAfterInput: raw.interactive?.oldRevisionTileDoneAfterInput ?? 0,
+    iterProbeFastDoneMs: raw.interactive?.iterProbeFastDoneMs ?? regression.iterProbeFastDoneMs ?? raw.probe?.firstFastDoneMs ?? null,
+    iterProbeFastDoneCount: regression.iterProbeFastDoneCount ?? raw.probe?.fastDoneCount ?? 0,
+    iterChangedBeforeFinal: regression.iterChangedBeforeFinal ?? raw.probe?.iterChangedBeforeFinal ?? 0,
+    iterChangedAfterFinal: raw.interactive?.iterChangedAfterFinal ?? regression.iterChangedAfterFinal ?? raw.probe?.iterChangedAfterFinal ?? 0,
     scenario: scenario.name
   };
 }
@@ -254,6 +270,15 @@ function checkRequirements(requirements, metrics) {
   if (requirements.maxOldRevisionTileDoneAfterInput !== undefined && metrics.oldRevisionTileDoneAfterInput > requirements.maxOldRevisionTileDoneAfterInput) {
     failures.push(`oldRevisionTileDoneAfterInput ${metrics.oldRevisionTileDoneAfterInput} > ${requirements.maxOldRevisionTileDoneAfterInput}`);
   }
+  if (requirements.maxIterProbeFastDoneMs !== undefined && (metrics.iterProbeFastDoneMs === null || metrics.iterProbeFastDoneMs > requirements.maxIterProbeFastDoneMs)) {
+    failures.push(`iterProbeFastDoneMs ${metrics.iterProbeFastDoneMs} > ${requirements.maxIterProbeFastDoneMs}`);
+  }
+  if (requirements.minIterProbeFastDoneCount !== undefined && metrics.iterProbeFastDoneCount < requirements.minIterProbeFastDoneCount) {
+    failures.push(`iterProbeFastDoneCount ${metrics.iterProbeFastDoneCount} < ${requirements.minIterProbeFastDoneCount}`);
+  }
+  if (requirements.maxIterChangedAfterFinal !== undefined && metrics.iterChangedAfterFinal > requirements.maxIterChangedAfterFinal) {
+    failures.push(`iterChangedAfterFinal ${metrics.iterChangedAfterFinal} > ${requirements.maxIterChangedAfterFinal}`);
+  }
   return failures;
 }
 
@@ -287,7 +312,9 @@ function baselineMetrics(result) {
     refs: result.refs,
     firstVisualChangeMs: result.firstVisualChangeMs,
     newRevisionQueuedMs: result.newRevisionQueuedMs,
-    firstNewTileDoneMs: result.firstNewTileDoneMs
+    firstNewTileDoneMs: result.firstNewTileDoneMs,
+    iterProbeFastDoneMs: result.iterProbeFastDoneMs,
+    iterChangedAfterFinal: result.iterChangedAfterFinal
   };
 }
 

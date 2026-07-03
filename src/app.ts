@@ -1,4 +1,5 @@
 import { ReferenceManager } from "./reference/referenceManager";
+import { AutoIterController, type IterMode, type IterProbeInput } from "./iteration/autoIterController";
 import { WebglTileRenderer, type RetainedScreenTransform } from "./render/webglRenderer";
 import {
   clusterReferenceLimit,
@@ -13,8 +14,9 @@ import {
   parseViewStateFromUrl,
   writeViewToUrl
 } from "./state/urlState";
-import { decimalLog10, defaultMaxIter, formatCompactDecimal, pixelSpanForView } from "./math/view";
+import { decimalLog10, formatCompactDecimal, pixelSpanForView } from "./math/view";
 import { initWasm, pointToViewCenterNow, transformViewNow } from "./wasmApi";
+import type { DefaultIterEstimate } from "./reference/referenceClient";
 import {
   SERIES_DEGREE,
   TILE_SIZE,
@@ -61,6 +63,7 @@ interface TileWorkState {
   forceExact: boolean;
   exactFallback: boolean;
   createdFromPatch: boolean;
+  iterWaitScheduled: boolean;
   exactBaseRgba: ArrayBuffer | undefined;
   exactUnresolvedMask: ArrayBuffer | undefined;
 }
@@ -105,6 +108,16 @@ interface ActivateViewOptions {
   retainedTransform?: RetainedScreenTransform;
   carryReferences?: boolean;
   startAdaptiveProbe?: boolean;
+  iterMode?: IterMode;
+}
+
+interface IterProbeSession {
+  token: number;
+  revision: number;
+  startedAt: number;
+  waitUntil: number;
+  fastDone: boolean;
+  waiters: Set<string>;
 }
 
 const MAX_RENDER_REFERENCES = 24;
@@ -123,6 +136,7 @@ const EXACT_PATCH_PADDING = 2;
 const MIN_EXACT_PATCH_SIZE = 8;
 const TILE_SCHEDULE_BATCH_MS = 6;
 const TILE_SCHEDULE_MIN_BATCH = 2;
+const FAST_ITER_PROBE_WAIT_MS = 180;
 
 export async function startApp(root: HTMLElement): Promise<void> {
   root.innerHTML = `
@@ -152,6 +166,7 @@ export async function startApp(root: HTMLElement): Promise<void> {
 
   const parsedView = parseViewStateFromUrl();
   let view: ViewState = parsedView.view;
+  const autoIter = new AutoIterController(view, parsedView.explicitIter ? "explicit" : "auto");
   let revision = 1;
   let renderToken = 0;
   let scheduledUrlWrite = 0;
@@ -181,19 +196,20 @@ export async function startApp(root: HTMLElement): Promise<void> {
   let patchTilesCreated = 0;
   let patchTileLimit = 512;
   let pendingTileShells = 0;
+  let activeIterProbe: IterProbeSession | undefined;
 
   let runtime = currentRuntimeView();
   resize();
   renderer.setActiveRevision(runtime.revision);
   renderToken += 1;
-  if (!parsedView.explicitIter) startAdaptiveIterProbe(view, renderToken);
+  if (autoIter.shouldProbe(view)) startAdaptiveIterProbe(view, renderToken);
   scheduleTiles("initial", renderToken);
 
   root.querySelector<HTMLButtonElement>("#homeButton")?.addEventListener("click", () => {
-    activateView({ ...DEFAULT_VIEW }, "home", { resetRetained: true, startAdaptiveProbe: false });
+    activateView({ ...DEFAULT_VIEW }, "home", { resetRetained: true, startAdaptiveProbe: false, iterMode: "auto" });
   });
   root.querySelector<HTMLButtonElement>("#deepButton")?.addEventListener("click", () => {
-    activateView({ ...DEEP_TEST_VIEW }, "deep", { resetRetained: true });
+    activateView({ ...DEEP_TEST_VIEW }, "deep", { resetRetained: true, iterMode: "auto" });
   });
 
   const activePointers = new Map<number, PointerSample>();
@@ -220,7 +236,7 @@ export async function startApp(root: HTMLElement): Promise<void> {
     if (Math.abs(dx) + Math.abs(dy) < 0.5) return;
     const transform = screenTransform(dx, dy, 1, runtime.width * 0.5, runtime.height * 0.5);
     const next = transformViewNow(view, runtime.width, runtime.height, dx, dy, 1, transform.anchorX, transform.anchorY);
-    activateView(immediateInteractionView(next), "pan", { resetRetained: false, retainedTransform: transform });
+    activateView(autoIter.immediateView(next, view), "pan", { resetRetained: false, retainedTransform: transform });
   });
   canvas.addEventListener("pointerup", (event) => {
     finishPointer(event);
@@ -242,13 +258,13 @@ export async function startApp(root: HTMLElement): Promise<void> {
       const factor = Math.exp(-event.deltaY * 0.0015);
       const transform = screenTransform(0, 0, factor, anchorX, anchorY);
       const next = transformViewNow(view, runtime.width, runtime.height, 0, 0, factor, anchorX, anchorY);
-      activateView(immediateInteractionView(next), "zoom", { resetRetained: false, retainedTransform: transform });
+      activateView(autoIter.immediateView(next, view), "zoom", { resetRetained: false, retainedTransform: transform });
     },
     { passive: false }
   );
   window.addEventListener("resize", () => {
     resize();
-    activateView(immediateInteractionView(view), "resize", { resetRetained: false, startAdaptiveProbe: false, carryReferences: false });
+    activateView(autoIter.immediateView(view, view), "resize", { resetRetained: false, startAdaptiveProbe: false, carryReferences: false });
   });
 
   let lastFrame = performance.now();
@@ -264,11 +280,13 @@ export async function startApp(root: HTMLElement): Promise<void> {
 
   function activateView(next: ViewState, reason: string, options: ActivateViewOptions = {}): void {
     const previousRevision = revision;
+    if (options.iterMode) autoIter.setMode(options.iterMode, next);
     view = next;
     revision += 1;
     renderToken += 1;
     const token = renderToken;
     runtime = currentRuntimeView();
+    activeIterProbe = undefined;
     references.cancelObsoleteWork(revision);
     pool.clearQueueForOldRevisions(revision);
     renderer.setActiveRevision(revision);
@@ -285,8 +303,8 @@ export async function startApp(root: HTMLElement): Promise<void> {
     scheduleUrlSync();
     const schedule = () => {
       if (token !== renderToken) return;
+      if (options.startAdaptiveProbe !== false && autoIter.shouldProbe(view)) startAdaptiveIterProbe(view, token);
       scheduleTiles(reason, token);
-      if (options.startAdaptiveProbe !== false) startAdaptiveIterProbe(view, token);
     };
     if (options.resetRetained ?? true) {
       window.setTimeout(schedule, 0);
@@ -295,35 +313,147 @@ export async function startApp(root: HTMLElement): Promise<void> {
     }
   }
 
-  function immediateInteractionView(next: ViewState): ViewState {
-    const baseline = defaultMaxIter(next.scale);
-    return { ...next, maxIter: Math.min(20_000, Math.max(baseline, view.maxIter)) };
-  }
-
   function startAdaptiveIterProbe(candidate: ViewState, token: number): void {
-    const baseline = defaultMaxIter(candidate.scale);
-    if (baseline >= 20_000 || decimalLog10(candidate.scale) < 8) return;
-    const probeView = { ...candidate, maxIter: baseline };
+    if (!autoIter.shouldProbe(candidate)) return;
+    const localRuntime = currentRuntimeView();
+    const input = autoIter.probeInput(candidate, localRuntime.width, localRuntime.height);
+    const session: IterProbeSession = {
+      token,
+      revision: localRuntime.revision,
+      startedAt: performance.now(),
+      waitUntil: performance.now() + FAST_ITER_PROBE_WAIT_MS,
+      fastDone: false,
+      waiters: new Set()
+    };
+    activeIterProbe = session;
+    recordDeepBench({
+      type: "iterProbeQueued",
+      revision: localRuntime.revision,
+      phase: "fast",
+      baseline: input.baseline,
+      maxIter: candidate.maxIter
+    });
+    const heuristicEstimate = immediateIterEstimate(candidate, input);
+    if (heuristicEstimate) {
+      session.fastDone = true;
+      recordIterProbeDone("iterProbeFastDone", session, heuristicEstimate);
+      applyIterEstimate(heuristicEstimate, session);
+      flushIterProbeWaiters(session);
+      return;
+    }
     try {
-      void references.estimateDefaultIter({
-        re: probeView.re,
-        im: probeView.im,
-        scale: probeView.scale,
-        width: runtime.width,
-        height: runtime.height,
-        baseline
-      }, revision).then((maxIter) => {
-        if (token !== renderToken) return;
-        if (maxIter <= view.maxIter) return;
-        activateView({ ...view, maxIter }, "iter refine", {
-          resetRetained: false,
-          carryReferences: false,
-          startAdaptiveProbe: false
-        });
+      void references.estimateDefaultIter(input, localRuntime.revision, "fast", 1).then((estimate) => {
+        if (!isActiveIterProbe(session)) return;
+        session.fastDone = true;
+        recordIterProbeDone("iterProbeFastDone", session, estimate);
+        applyIterEstimate(estimate, session);
+        flushIterProbeWaiters(session);
+        if (estimate.confidence === "low") startFullIterProbe(input, session);
       }).catch(() => undefined);
     } catch {
       // Best-effort background probe; rendering must never wait on it.
     }
+  }
+
+  function immediateIterEstimate(candidate: ViewState, input: IterProbeInput): DefaultIterEstimate | undefined {
+    const logScale = decimalLog10(candidate.scale);
+    const hasPredictiveIter = candidate.maxIter > input.baseline;
+    if (logScale < 50 && !hasPredictiveIter) return undefined;
+    return {
+      recommendedIter: Math.max(input.baseline, candidate.maxIter),
+      confidence: "high",
+      phase: "fast",
+      fastMs: 0,
+      fullMs: 0,
+      maxEscapedAt: 0,
+      cap: Math.max(input.baseline, candidate.maxIter),
+      sampleCount: 0,
+      reason: hasPredictiveIter ? "cached" : "deep-baseline"
+    };
+  }
+
+  function startFullIterProbe(input: IterProbeInput, session: IterProbeSession): void {
+    recordDeepBench({
+      type: "iterProbeQueued",
+      revision: session.revision,
+      phase: "full",
+      baseline: input.baseline,
+      maxIter: view.maxIter
+    });
+    void references.estimateDefaultIter(input, session.revision, "full", 100).then((estimate) => {
+      if (session.token !== renderToken || session.revision !== revision) return;
+      recordIterProbeDone("iterProbeFullDone", session, estimate);
+      applyIterEstimate(estimate, session);
+    }).catch(() => undefined);
+  }
+
+  function applyIterEstimate(estimate: DefaultIterEstimate, session: IterProbeSession): void {
+    if (session.token !== renderToken || session.revision !== revision) return;
+    const change = autoIter.applyEstimate(view, estimate);
+    if (!change.changed) return;
+    const finalStarted = hasFinalStarted();
+    if (!finalStarted) {
+      view = { ...view, maxIter: change.maxIter };
+      runtime = currentRuntimeView();
+      recordDeepBench({
+        type: "iterChangedBeforeFinal",
+        revision,
+        previousIter: change.previousIter,
+        maxIter: change.maxIter,
+        phase: estimate.phase,
+        direction: change.direction
+      });
+      startViewReference(runtime, session.token);
+      for (const state of tileStates.values()) submitReadyTile(runtime, state);
+      updateHud();
+      scheduleUrlSync();
+      return;
+    }
+    recordDeepBench({
+      type: "iterChangedAfterFinal",
+      revision,
+      previousIter: change.previousIter,
+      maxIter: change.maxIter,
+      phase: estimate.phase,
+      direction: change.direction
+    });
+    activateView({ ...view, maxIter: change.maxIter }, "iter refine", {
+      resetRetained: false,
+      carryReferences: false,
+      startAdaptiveProbe: false
+    });
+  }
+
+  function isActiveIterProbe(session: IterProbeSession): boolean {
+    return activeIterProbe === session && session.token === renderToken && session.revision === revision;
+  }
+
+  function flushIterProbeWaiters(session: IterProbeSession): void {
+    const localRuntime = currentRuntimeView();
+    for (const tileId of session.waiters) {
+      const state = tileStates.get(tileId);
+      if (!state) continue;
+      state.iterWaitScheduled = false;
+      submitReadyTile(localRuntime, state);
+    }
+    session.waiters.clear();
+  }
+
+  function recordIterProbeDone(type: "iterProbeFastDone" | "iterProbeFullDone", session: IterProbeSession, estimate: DefaultIterEstimate): void {
+    recordDeepBench({
+      type,
+      revision: session.revision,
+      phase: estimate.phase,
+      elapsedMs: performance.now() - session.startedAt,
+      recommendedIter: estimate.recommendedIter,
+      confidence: estimate.confidence,
+      fastMs: estimate.fastMs,
+      fullMs: estimate.fullMs,
+      maxEscapedAt: estimate.maxEscapedAt,
+      cap: estimate.cap,
+      sampleCount: estimate.sampleCount,
+      reason: estimate.reason
+    });
   }
 
   function scheduleTiles(reason: string, token: number): void {
@@ -362,15 +492,16 @@ export async function startApp(root: HTMLElement): Promise<void> {
 
   function scheduleTileShellBatch(localRuntime: RuntimeView, shells: TileShell[], startIndex: number, token: number): void {
     if (token !== renderToken || localRuntime.revision !== revision) return;
+    const activeRuntime = currentRuntimeView();
     const deadline = performance.now() + TILE_SCHEDULE_BATCH_MS;
     let index = startIndex;
     let processed = 0;
     while (index < shells.length && (processed < TILE_SCHEDULE_MIN_BATCH || performance.now() < deadline)) {
-      const tile = materializeTileShell(localRuntime, shells[index]);
+      const tile = materializeTileShell(activeRuntime, shells[index]);
       if (token !== renderToken || localRuntime.revision !== revision) return;
       createTileState(tile, [], 0);
       pendingTileShells = Math.max(0, shells.length - index - 1);
-      void submitPreview(localRuntime, mustTileState(tile.id));
+      void submitPreview(activeRuntime, mustTileState(tile.id));
       index += 1;
       processed += 1;
     }
@@ -438,6 +569,7 @@ export async function startApp(root: HTMLElement): Promise<void> {
       forceExact: false,
       exactFallback: false,
       createdFromPatch: false,
+      iterWaitScheduled: false,
       exactBaseRgba: undefined,
       exactUnresolvedMask: undefined
     };
@@ -486,6 +618,7 @@ export async function startApp(root: HTMLElement): Promise<void> {
       );
       state.previewInFlight = false;
       if (result.revision !== revision || state.tile.revision !== revision) return;
+      const activeRuntime = currentRuntimeView();
       if (state.completed) {
         updateWorkStatus("rendering");
         return;
@@ -499,7 +632,7 @@ export async function startApp(root: HTMLElement): Promise<void> {
       if (result.stats.unresolvedCount > 0) {
         state.lastReferencePressure = previewUnresolvedPressure(result.stats.unresolvedCount, result.width, result.height);
         if (state.lastReferencePressure < HIGH_REFERENCE_PRESSURE) {
-          const queued = queuePreviewReferences(localRuntime, state, result.stats.unresolvedClusters);
+          const queued = queuePreviewReferences(activeRuntime, state, result.stats.unresolvedClusters);
           if (queued > 0 || state.pendingReferences > 0) {
             stats.pending = pendingWorkCount();
             stats.status = "refining";
@@ -509,7 +642,7 @@ export async function startApp(root: HTMLElement): Promise<void> {
         }
       }
       updateWorkStatus("rendering");
-      void submitTile(localRuntime, state);
+      void submitTile(activeRuntime, state);
     } catch (error) {
       state.previewInFlight = false;
       if (state.tile.revision !== revision) return;
@@ -518,8 +651,10 @@ export async function startApp(root: HTMLElement): Promise<void> {
   }
 
   async function submitTile(localRuntime: RuntimeView, state: TileWorkState): Promise<void> {
+    if (localRuntime.maxIter !== view.maxIter || localRuntime.revision !== revision) localRuntime = currentRuntimeView();
     if (state.inFlight || state.completed || state.tile.revision !== revision) return;
     if (!state.forceExact && (!state.previewUploaded || state.pendingReferences > 0)) return;
+    if (!state.forceExact && shouldWaitForFastIterProbe(state)) return;
     const candidates = state.forceExact ? [] : buildReferenceCandidates(state, localRuntime);
     if (!state.forceExact && candidates.length === 0) {
       updateWorkStatus("rendering");
@@ -1075,6 +1210,31 @@ export async function startApp(root: HTMLElement): Promise<void> {
     return pendingTileIds.size + pendingTileShells;
   }
 
+  function shouldWaitForFastIterProbe(state: TileWorkState): boolean {
+    const session = activeIterProbe;
+    if (!session || session.fastDone || session.revision !== revision || session.token !== renderToken) return false;
+    const waitMs = session.waitUntil - performance.now();
+    if (waitMs <= 0) return false;
+    session.waiters.add(state.tile.id);
+    if (!state.iterWaitScheduled) {
+      state.iterWaitScheduled = true;
+      window.setTimeout(() => {
+        if (state.tile.revision !== revision || state.completed) return;
+        state.iterWaitScheduled = false;
+        submitReadyTile(currentRuntimeView(), state);
+      }, waitMs);
+    }
+    updateWorkStatus("probing iter");
+    return true;
+  }
+
+  function hasFinalStarted(): boolean {
+    for (const state of tileStates.values()) {
+      if (state.inFlight || state.completed || state.forceExact) return true;
+    }
+    return false;
+  }
+
   function distributeBrokerReference(localRuntime: RuntimeView, entry: ReferenceBrokerEntry, referenceId: string): void {
     for (const waiter of entry.waiters) {
       const waiterState = tileStates.get(waiter.tileId);
@@ -1298,7 +1458,7 @@ export async function startApp(root: HTMLElement): Promise<void> {
 
     const transform = screenTransform(dx, dy, factor, previous.centerX, previous.centerY);
     const next = transformViewNow(view, runtime.width, runtime.height, dx, dy, factor, previous.centerX, previous.centerY);
-    activateView(immediateInteractionView(next), "pinch", { resetRetained: false, retainedTransform: transform });
+    activateView(autoIter.immediateView(next, view), "pinch", { resetRetained: false, retainedTransform: transform });
   }
 
   function screenTransform(dx: number, dy: number, scale: number, anchorX: number, anchorY: number): RetainedScreenTransform {
@@ -1307,7 +1467,7 @@ export async function startApp(root: HTMLElement): Promise<void> {
 
   function scheduleUrlSync(): void {
     window.clearTimeout(scheduledUrlWrite);
-    scheduledUrlWrite = window.setTimeout(() => writeViewToUrl(view), 80);
+    scheduledUrlWrite = window.setTimeout(() => writeViewToUrl(view, { iterMode: autoIter.mode }), 80);
   }
 
   function updateHud(): void {
@@ -1332,4 +1492,8 @@ function requireElement<T extends Element>(root: ParentNode, selector: string, c
   const element = root.querySelector(selector);
   if (!(element instanceof constructor)) throw new Error(`Missing ${selector}`);
   return element;
+}
+
+function recordDeepBench(event: Record<string, unknown>): void {
+  (globalThis as unknown as { __deepBenchRecord?: (event: Record<string, unknown>) => void }).__deepBenchRecord?.(event);
 }

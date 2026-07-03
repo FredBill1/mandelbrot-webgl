@@ -1,5 +1,6 @@
 import type { ViewState } from "../types";
 import { defaultMaxIter } from "../math/view";
+import type { IterMode } from "../iteration/autoIterController";
 
 export const DEFAULT_VIEW: ViewState = {
   re: "-5e-1",
@@ -36,21 +37,21 @@ export function parseViewStateFromUrl(url: URL = new URL(window.location.href)):
   return { view: { re, im, scale, maxIter }, explicitIter };
 }
 
-export function viewToSearchParams(view: ViewState): URLSearchParams {
+export function viewToSearchParams(view: ViewState, options: { iterMode?: IterMode } = {}): URLSearchParams {
   const params = new URLSearchParams();
   params.set("re", normalizeDecimal(view.re));
   params.set("im", normalizeDecimal(view.im));
   params.set("scale", normalizeDecimal(view.scale));
-  params.set("iter", String(Math.round(view.maxIter)));
+  if (options.iterMode !== "auto") params.set("iter", String(Math.round(view.maxIter)));
   return params;
 }
 
-export function serializeViewToQuery(view: ViewState): string {
-  return `?${viewToSearchParams(view).toString()}`;
+export function serializeViewToQuery(view: ViewState, options: { iterMode?: IterMode } = {}): string {
+  return `?${viewToSearchParams(view, options).toString()}`;
 }
 
-export function writeViewToUrl(view: ViewState): void {
-  const next = `${window.location.pathname}${serializeViewToQuery(view)}${window.location.hash}`;
+export function writeViewToUrl(view: ViewState, options: { iterMode?: IterMode } = {}): void {
+  const next = `${window.location.pathname}${serializeViewToQuery(view, options)}${window.location.hash}`;
   window.history.replaceState(null, "", next);
 }
 
