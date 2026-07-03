@@ -45,9 +45,21 @@ try {
 
   const elapsedMs = Date.now() - started;
   const interactive = summaryCanInteract(hud, options) ? await runInteraction(page, options.interaction) : undefined;
+  if (interactive !== undefined && options.postInteractionStable) {
+    const postStarted = Date.now();
+    while (Date.now() - postStarted < options.timeoutMs) {
+      hud = await readHud(page);
+      const hudTiles = parseTileProgress(hud.tiles);
+      maxHudCompletedTiles = Math.max(maxHudCompletedTiles, hudTiles.completed);
+      maxHudTotalTiles = Math.max(maxHudTotalTiles, hudTiles.total);
+      if (hud.status === "stable") break;
+      await page.waitForTimeout(500);
+    }
+  }
   const bench = await page.evaluate(() => globalThis.__deepBench);
   bench.stableAt = elapsedMs;
   const probe = probeMetrics(bench.profile.events);
+  const renderIter = renderIterMetrics(bench.profile.events);
   const hudTiles = parseTileProgress(hud.tiles);
   const refs = Number(hud.refs) || 0;
   const summary = {
@@ -80,6 +92,7 @@ try {
     },
     waves: bench.waves,
     probe,
+    renderIter,
     interactive,
     slowFinalTiles: bench.slowFinalTiles,
     regression: {
@@ -102,7 +115,12 @@ try {
       iterProbeFastDoneMs: probe.firstFastDoneMs,
       iterProbeFastDoneCount: probe.fastDoneCount,
       iterChangedBeforeFinal: probe.iterChangedBeforeFinal,
-      iterChangedAfterFinal: probe.iterChangedAfterFinal
+      iterChangedAfterFinal: probe.iterChangedAfterFinal,
+      renderIterIncreaseCount: renderIter.increaseCount,
+      renderIterDecreaseCount: renderIter.decreaseCount,
+      seedProbeConfirmedClusters: probe.firstFastConfirmedClusters,
+      capHitBoundaryPixels: renderIter.capHitBoundaryPixels,
+      nearCapEscapedPixels: renderIter.nearCapEscapedPixels
     }
   };
 
@@ -130,7 +148,8 @@ function parseArgs(args) {
     port: 4173,
     url: undefined,
     profileJson: undefined,
-    interaction: undefined
+    interaction: undefined,
+    postInteractionStable: false
   };
   for (let i = 0; i < args.length; i += 1) {
     const arg = args[i];
@@ -158,6 +177,8 @@ function parseArgs(args) {
       parsed.interaction = args[++i];
     } else if (arg.startsWith("--interaction=")) {
       parsed.interaction = arg.slice("--interaction=".length);
+    } else if (arg === "--post-interaction-stable") {
+      parsed.postInteractionStable = true;
     } else {
       throw new Error(`Unknown argument: ${arg}`);
     }
@@ -167,7 +188,7 @@ function parseArgs(args) {
   }
   if (!Number.isFinite(parsed.timeoutMs) || parsed.timeoutMs <= 0) throw new Error("--timeout-ms must be a positive number");
   if (!Number.isFinite(parsed.port) || parsed.port <= 0) throw new Error("--port must be a positive number");
-  if (parsed.interaction !== undefined && !["pan", "zoom"].includes(parsed.interaction)) throw new Error("--interaction must be pan or zoom");
+  if (parsed.interaction !== undefined && !["pan", "zoom", "zoom-out"].includes(parsed.interaction)) throw new Error("--interaction must be pan, zoom, or zoom-out");
   return parsed;
 }
 
@@ -242,8 +263,24 @@ function probeMetrics(events, since = 0) {
     firstFastDoneMs: firstQueued && firstFast ? Number((firstFast.now - firstQueued.now).toFixed(2)) : null,
     firstFastSampleCount: firstFast?.sampleCount ?? 0,
     firstFastRecommendedIter: firstFast?.recommendedIter ?? 0,
+    firstFastConfirmedClusters: firstFast?.confirmedClusters ?? 0,
     iterChangedBeforeFinal: filtered.filter((event) => event.type === "iterChangedBeforeFinal").length,
     iterChangedAfterFinal: filtered.filter((event) => event.type === "iterChangedAfterFinal").length
+  };
+}
+
+function renderIterMetrics(events, since = 0) {
+  const filtered = events.filter((event) => event.now >= since);
+  const increases = filtered.filter((event) => event.type === "renderIterIncrease");
+  const decreases = filtered.filter((event) => event.type === "renderIterDecrease");
+  const feedbackTiles = filtered.filter((event) => event.type === "renderIterFeedbackTile");
+  return {
+    increaseCount: increases.length,
+    decreaseCount: decreases.length,
+    capHitBoundaryPixels: feedbackTiles.reduce((sum, event) => sum + (event.capHitBoundaryCount ?? 0), 0),
+    nearCapEscapedPixels: feedbackTiles.reduce((sum, event) => sum + (event.nearCapEscapedCount ?? 0), 0),
+    lastIncreaseIter: increases.at(-1)?.maxIter ?? 0,
+    lastDecreaseIter: decreases.at(-1)?.maxIter ?? 0
   };
 }
 
@@ -287,7 +324,7 @@ async function dispatchInteraction(page, interaction) {
         cancelable: true,
         clientX: x,
         clientY: y,
-        deltaY: -600
+        deltaY: interaction === "zoom-out" ? 2400 : -600
       }));
     }
     return started;

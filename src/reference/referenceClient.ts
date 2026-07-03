@@ -45,6 +45,7 @@ export interface DefaultIterEstimate {
   maxEscapedAt: number;
   cap: number;
   sampleCount: number;
+  confirmedClusters: number;
   reason: string;
 }
 

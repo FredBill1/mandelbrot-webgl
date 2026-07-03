@@ -101,6 +101,11 @@ export interface TileStats {
   unresolvedCount: number;
   escapedPixels: number;
   periodicInteriorCount: number;
+  maxEscapedIter: number;
+  p95EscapedIter: number;
+  nearCapEscapedCount: number;
+  capHitUnknownCount: number;
+  capHitBoundaryCount: number;
   rebaseCount: number;
   rebaseLimitCount: number;
   blaSkipCount: number;

@@ -21,17 +21,26 @@ export interface IterEstimateChange {
   direction: "increase" | "decrease" | "unchanged";
 }
 
+interface VerifiedEstimate {
+  rePrefix: string;
+  imPrefix: string;
+  scaleLog: number;
+  maxIter: number;
+  lastUsed: number;
+}
+
 const MAX_AUTO_ITER = 20_000;
 const HYSTERESIS_MIN = 512;
 const HYSTERESIS_RATIO = 0.2;
+const VERIFIED_SCALE_LOG_WINDOW = 0.25;
+const MAX_VERIFIED_ESTIMATES = 96;
 
 export class AutoIterController {
-  private estimates = new Map<string, number>();
-  private currentEstimate: number;
+  private estimates: VerifiedEstimate[] = [];
+  private sequence = 0;
 
   constructor(initialView: ViewState, private modeValue: IterMode) {
-    this.currentEstimate = initialView.maxIter;
-    if (modeValue === "auto") this.remember(initialView, initialView.maxIter);
+    if (modeValue === "auto") this.rememberVerified(initialView, initialView.maxIter);
   }
 
   get mode(): IterMode {
@@ -40,8 +49,7 @@ export class AutoIterController {
 
   setMode(mode: IterMode, view: ViewState): void {
     this.modeValue = mode;
-    this.currentEstimate = view.maxIter;
-    if (mode === "auto") this.remember(view, view.maxIter);
+    if (mode === "auto") this.rememberVerified(view, view.maxIter);
   }
 
   shouldProbe(view: ViewState): boolean {
@@ -51,11 +59,8 @@ export class AutoIterController {
   immediateView(next: ViewState, previous: ViewState): ViewState {
     if (this.modeValue === "explicit") return { ...next, maxIter: previous.maxIter };
     const baseline = defaultMaxIter(next.scale);
-    const cached = this.cachedEstimate(next);
-    const predicted = this.predictedIter(previous, next);
-    const maxIter = clampIter(Math.max(baseline, cached ?? 0, predicted));
-    this.currentEstimate = maxIter;
-    this.remember(next, maxIter);
+    const cached = this.nearbyVerifiedEstimate(next);
+    const maxIter = clampIter(Math.max(baseline, cached ?? 0));
     return { ...next, maxIter };
   }
 
@@ -79,12 +84,9 @@ export class AutoIterController {
     const delta = maxIter - previousIter;
     const threshold = Math.max(HYSTERESIS_MIN, Math.round(previousIter * HYSTERESIS_RATIO));
     if (Math.abs(delta) < threshold) {
-      this.remember(view, previousIter);
       return unchanged(previousIter);
     }
 
-    this.currentEstimate = maxIter;
-    this.remember(view, maxIter);
     return {
       changed: true,
       maxIter,
@@ -94,24 +96,44 @@ export class AutoIterController {
     };
   }
 
-  remember(view: ViewState, maxIter: number): void {
-    this.estimates.set(cacheKey(view), clampIter(maxIter));
-    if (this.estimates.size > 96) {
-      const first = this.estimates.keys().next().value;
-      if (first !== undefined) this.estimates.delete(first);
+  rememberVerified(view: ViewState, maxIter: number): void {
+    if (this.modeValue !== "auto") return;
+    const entry = estimateKey(view);
+    const existing = this.estimates.find(
+      (candidate) =>
+        candidate.rePrefix === entry.rePrefix &&
+        candidate.imPrefix === entry.imPrefix &&
+        Math.abs(candidate.scaleLog - entry.scaleLog) <= VERIFIED_SCALE_LOG_WINDOW
+    );
+    if (existing) {
+      existing.scaleLog = entry.scaleLog;
+      existing.maxIter = clampIter(maxIter);
+      existing.lastUsed = ++this.sequence;
+    } else {
+      this.estimates.push({ ...entry, maxIter: clampIter(maxIter), lastUsed: ++this.sequence });
+    }
+    if (this.estimates.length > MAX_VERIFIED_ESTIMATES) {
+      this.estimates.sort((a, b) => b.lastUsed - a.lastUsed);
+      this.estimates.length = MAX_VERIFIED_ESTIMATES;
     }
   }
 
-  private cachedEstimate(view: ViewState): number | undefined {
-    return this.estimates.get(cacheKey(view));
-  }
-
-  private predictedIter(previous: ViewState, next: ViewState): number {
-    const previousLog = decimalLog10(previous.scale);
-    const nextLog = decimalLog10(next.scale);
-    const logDelta = nextLog - previousLog;
-    const predicted = this.currentEstimate + Math.round(logDelta * 64);
-    return clampIter(predicted);
+  private nearbyVerifiedEstimate(view: ViewState): number | undefined {
+    const entry = estimateKey(view);
+    let best: VerifiedEstimate | undefined;
+    let bestDistance = Number.POSITIVE_INFINITY;
+    for (const candidate of this.estimates) {
+      if (candidate.rePrefix !== entry.rePrefix || candidate.imPrefix !== entry.imPrefix) continue;
+      const distance = Math.abs(candidate.scaleLog - entry.scaleLog);
+      if (distance > VERIFIED_SCALE_LOG_WINDOW || distance > bestDistance) continue;
+      best = candidate;
+      bestDistance = distance;
+    }
+    if (best) {
+      best.lastUsed = ++this.sequence;
+      return best.maxIter;
+    }
+    return undefined;
   }
 }
 
@@ -124,7 +146,10 @@ function clampIter(maxIter: number): number {
   return Math.min(MAX_AUTO_ITER, Math.max(32, Math.round(maxIter)));
 }
 
-function cacheKey(view: Pick<ViewState, "re" | "im" | "scale">): string {
-  const scaleBucket = Math.round(decimalLog10(view.scale) * 4) / 4;
-  return `${scaleBucket}:${view.re.slice(0, 18)}:${view.im.slice(0, 18)}`;
+function estimateKey(view: Pick<ViewState, "re" | "im" | "scale">): Pick<VerifiedEstimate, "rePrefix" | "imPrefix" | "scaleLog"> {
+  return {
+    rePrefix: view.re.slice(0, 18),
+    imPrefix: view.im.slice(0, 18),
+    scaleLog: decimalLog10(view.scale)
+  };
 }

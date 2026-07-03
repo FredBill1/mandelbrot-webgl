@@ -681,6 +681,24 @@ struct BoundaryStats64 {
     aa_fallback_count: u32,
 }
 
+#[derive(Clone)]
+struct RenderIterStats64 {
+    escaped_iters: Vec<u32>,
+    max_escaped_iter: u32,
+    near_cap_escaped_count: u32,
+    cap_hit_unknown_count: u32,
+    cap_hit_boundary_count: u32,
+}
+
+#[derive(Clone, Copy)]
+struct RenderIterSummary64 {
+    max_escaped_iter: u32,
+    p95_escaped_iter: u32,
+    near_cap_escaped_count: u32,
+    cap_hit_unknown_count: u32,
+    cap_hit_boundary_count: u32,
+}
+
 #[derive(Clone, Copy)]
 struct BoundaryCandidate64 {
     index: usize,
@@ -794,6 +812,7 @@ pub fn render_tile_cached(
     let mut unresolved_count = 0u32;
     let mut escaped_pixels = 0u32;
     let mut periodic_interior_count = 0u32;
+    let mut iter_stats = empty_render_iter_stats(max_iter);
     let mut rebase_count = 0u32;
     let mut rebase_limit_count = 0u32;
     let mut bla_skip_count = 0u32;
@@ -805,6 +824,11 @@ pub fn render_tile_cached(
     let mut clusters = create_render_cluster_accumulators(rect);
     let mut unresolved_mask = vec![0u8; width * height];
     let mut escaped_mask = if render_mode == "final" {
+        Some(vec![0u8; width * height])
+    } else {
+        None
+    };
+    let mut cap_hit_unknown_mask = if render_mode == "final" {
         Some(vec![0u8; width * height])
     } else {
         None
@@ -843,6 +867,7 @@ pub fn render_tile_cached(
             let offset = pixel_index * 4;
             if result.iter < max_iter {
                 escaped_pixels += 1;
+                record_render_escaped_iter(&mut iter_stats, result.iter, max_iter);
             }
             if result.periodic_interior {
                 periodic_interior_count += 1;
@@ -886,6 +911,11 @@ pub fn render_tile_cached(
                 if let Some(mask) = escaped_mask.as_mut() {
                     mask[pixel_index] = 1;
                 }
+            } else if !result.periodic_interior {
+                iter_stats.cap_hit_unknown_count += 1;
+                if let Some(mask) = cap_hit_unknown_mask.as_mut() {
+                    mask[pixel_index] = 1;
+                }
             }
             let smooth = render_smooth_iteration(result.iter, max_iter, result.mag2);
             if let Some(values) = smooth_values.as_mut() {
@@ -920,6 +950,13 @@ pub fn render_tile_cached(
     } else {
         empty_render_boundary_stats()
     };
+    if let (Some(cap_mask), Some(escaped_mask)) =
+        (cap_hit_unknown_mask.as_ref(), escaped_mask.as_ref())
+    {
+        iter_stats.cap_hit_boundary_count =
+            count_render_cap_hit_boundary(cap_mask, escaped_mask, &unresolved_mask, width, height);
+    }
+    let iter_summary = summarize_render_iter_stats(iter_stats);
 
     let unresolved_mask_output = if render_mode == "final" && unresolved_count > 0 {
         Some(unresolved_mask.clone())
@@ -958,6 +995,7 @@ pub fn render_tile_cached(
         unresolved_count,
         escaped_pixels,
         periodic_interior_count,
+        iter_summary,
         rebase_count,
         rebase_limit_count,
         bla_skip_count,
@@ -1050,6 +1088,10 @@ pub fn render_tile_exact(
     let mask = exact_input.mask;
     let mut escaped_pixels = 0u32;
     let mut exact_pixels = 0u32;
+    let mut iter_stats = empty_render_iter_stats(max_iter);
+    let mut escaped_mask = vec![0u8; width * height];
+    let mut cap_hit_unknown_mask = vec![0u8; width * height];
+    let unresolved_mask = vec![0u8; width * height];
 
     for py in 0..height {
         let screen_y = (rect.y + rect.height - 0.5).min(rect.y + py as f64 + 0.5);
@@ -1067,6 +1109,11 @@ pub fn render_tile_exact(
             let exact = run_exact_escape_with_mag2(&cr, &ci, max_iter, p);
             if exact.iter < max_iter {
                 escaped_pixels += 1;
+                record_render_escaped_iter(&mut iter_stats, exact.iter, max_iter);
+                escaped_mask[pixel_index] = 1;
+            } else {
+                iter_stats.cap_hit_unknown_count += 1;
+                cap_hit_unknown_mask[pixel_index] = 1;
             }
             let smooth = render_smooth_iteration(exact.iter, max_iter, exact.mag2);
             write_render_color_for_smooth(
@@ -1078,6 +1125,9 @@ pub fn render_tile_exact(
             );
         }
     }
+    iter_stats.cap_hit_boundary_count =
+        count_render_cap_hit_boundary(&cap_hit_unknown_mask, &escaped_mask, &unresolved_mask, width, height);
+    let iter_summary = summarize_render_iter_stats(iter_stats);
 
     build_render_tile_value(
         tile_id,
@@ -1093,6 +1143,7 @@ pub fn render_tile_exact(
         0,
         escaped_pixels,
         0,
+        iter_summary,
         0,
         0,
         0,
@@ -1132,6 +1183,10 @@ fn render_tile_exact_f64(
     let mask = exact_input.mask;
     let mut escaped_pixels = 0u32;
     let mut exact_pixels = 0u32;
+    let mut iter_stats = empty_render_iter_stats(max_iter);
+    let mut escaped_mask = vec![0u8; width * height];
+    let mut cap_hit_unknown_mask = vec![0u8; width * height];
+    let unresolved_mask = vec![0u8; width * height];
 
     for py in 0..height {
         let screen_y = (rect.y + rect.height - 0.5).min(rect.y + py as f64 + 0.5);
@@ -1147,6 +1202,11 @@ fn render_tile_exact_f64(
             let exact = run_exact_escape_f64(cr, ci, max_iter);
             if exact.iter < max_iter {
                 escaped_pixels += 1;
+                record_render_escaped_iter(&mut iter_stats, exact.iter, max_iter);
+                escaped_mask[pixel_index] = 1;
+            } else {
+                iter_stats.cap_hit_unknown_count += 1;
+                cap_hit_unknown_mask[pixel_index] = 1;
             }
             let smooth = render_smooth_iteration(exact.iter, max_iter, exact.mag2);
             write_render_color_for_smooth(
@@ -1158,6 +1218,9 @@ fn render_tile_exact_f64(
             );
         }
     }
+    iter_stats.cap_hit_boundary_count =
+        count_render_cap_hit_boundary(&cap_hit_unknown_mask, &escaped_mask, &unresolved_mask, width, height);
+    let iter_summary = summarize_render_iter_stats(iter_stats);
 
     build_render_tile_value(
         tile_id,
@@ -1173,6 +1236,7 @@ fn render_tile_exact_f64(
         0,
         escaped_pixels,
         0,
+        iter_summary,
         0,
         0,
         0,
@@ -1305,6 +1369,7 @@ fn build_render_tile_value(
     unresolved_count: u32,
     escaped_pixels: u32,
     periodic_interior_count: u32,
+    iter_summary: RenderIterSummary64,
     rebase_count: u32,
     rebase_limit_count: u32,
     bla_skip_count: u32,
@@ -1357,6 +1422,31 @@ fn build_render_tile_value(
         &stats,
         "periodicInteriorCount",
         &JsValue::from_f64(periodic_interior_count as f64),
+    )?;
+    set_js_property(
+        &stats,
+        "maxEscapedIter",
+        &JsValue::from_f64(iter_summary.max_escaped_iter as f64),
+    )?;
+    set_js_property(
+        &stats,
+        "p95EscapedIter",
+        &JsValue::from_f64(iter_summary.p95_escaped_iter as f64),
+    )?;
+    set_js_property(
+        &stats,
+        "nearCapEscapedCount",
+        &JsValue::from_f64(iter_summary.near_cap_escaped_count as f64),
+    )?;
+    set_js_property(
+        &stats,
+        "capHitUnknownCount",
+        &JsValue::from_f64(iter_summary.cap_hit_unknown_count as f64),
+    )?;
+    set_js_property(
+        &stats,
+        "capHitBoundaryCount",
+        &JsValue::from_f64(iter_summary.cap_hit_boundary_count as f64),
     )?;
     set_js_property(
         &stats,
@@ -2371,6 +2461,76 @@ fn empty_render_boundary_stats() -> BoundaryStats64 {
         aa_sample_count: 0,
         aa_fallback_count: 0,
     }
+}
+
+fn empty_render_iter_stats(_max_iter: u32) -> RenderIterStats64 {
+    RenderIterStats64 {
+        escaped_iters: Vec::new(),
+        max_escaped_iter: 0,
+        near_cap_escaped_count: 0,
+        cap_hit_unknown_count: 0,
+        cap_hit_boundary_count: 0,
+    }
+}
+
+fn record_render_escaped_iter(stats: &mut RenderIterStats64, iter: u32, max_iter: u32) {
+    stats.max_escaped_iter = stats.max_escaped_iter.max(iter);
+    if (iter as f64) >= (max_iter as f64 * 0.85) {
+        stats.near_cap_escaped_count += 1;
+    }
+    stats.escaped_iters.push(iter);
+}
+
+fn summarize_render_iter_stats(mut stats: RenderIterStats64) -> RenderIterSummary64 {
+    stats.escaped_iters.sort_unstable();
+    let p95_escaped_iter = if stats.escaped_iters.is_empty() {
+        0
+    } else {
+        let index = ((stats.escaped_iters.len() as f64 - 1.0) * 0.95).round() as usize;
+        stats.escaped_iters[index.min(stats.escaped_iters.len() - 1)]
+    };
+    RenderIterSummary64 {
+        max_escaped_iter: stats.max_escaped_iter,
+        p95_escaped_iter,
+        near_cap_escaped_count: stats.near_cap_escaped_count,
+        cap_hit_unknown_count: stats.cap_hit_unknown_count,
+        cap_hit_boundary_count: stats.cap_hit_boundary_count,
+    }
+}
+
+fn count_render_cap_hit_boundary(
+    cap_hit_unknown_mask: &[u8],
+    escaped_mask: &[u8],
+    unresolved_mask: &[u8],
+    width: usize,
+    height: usize,
+) -> u32 {
+    let mut count = 0u32;
+    for y in 0..height {
+        for x in 0..width {
+            let index = y * width + x;
+            if cap_hit_unknown_mask[index] == 0 || unresolved_mask[index] != 0 {
+                continue;
+            }
+            let mut touches_escaped = false;
+            for (dx, dy) in [(1isize, 0isize), (-1, 0), (0, 1), (0, -1)] {
+                let nx = x as isize + dx;
+                let ny = y as isize + dy;
+                if nx < 0 || ny < 0 || nx >= width as isize || ny >= height as isize {
+                    continue;
+                }
+                let neighbor_index = ny as usize * width + nx as usize;
+                if escaped_mask[neighbor_index] != 0 {
+                    touches_escaped = true;
+                    break;
+                }
+            }
+            if touches_escaped {
+                count += 1;
+            }
+        }
+    }
+    count
 }
 
 fn render_edge_strength_at(

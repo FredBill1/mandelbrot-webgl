@@ -21,6 +21,18 @@ describe("AutoIterController", () => {
     expect(next.maxIter).toBeGreaterThanOrEqual(1152);
   });
 
+  it("reuses only nearby verified estimates", () => {
+    const view = makeView("1e8", 1025);
+    const controller = new AutoIterController(view, "auto");
+    controller.rememberVerified(view, 4096);
+
+    const nearby = controller.immediateView({ ...view, scale: "1.1e8", maxIter: 0 }, view);
+    expect(nearby.maxIter).toBe(4096);
+
+    const farScale = controller.immediateView({ ...view, scale: "1e9", maxIter: 0 }, nearby);
+    expect(farScale.maxIter).toBeLessThan(4096);
+  });
+
   it("uses hysteresis for small probe changes but accepts large decreases", () => {
     const view = makeView("1e20", 4096);
     const controller = new AutoIterController(view, "auto");
@@ -53,6 +65,7 @@ function makeEstimate(recommendedIter: number) {
     maxEscapedAt: recommendedIter,
     cap: recommendedIter,
     sampleCount: 17,
+    confirmedClusters: 0,
     reason: "test"
   };
 }

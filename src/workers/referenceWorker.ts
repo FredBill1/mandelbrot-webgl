@@ -31,7 +31,13 @@ interface DefaultIterEstimate {
   maxEscapedAt: number;
   cap: number;
   sampleCount: number;
+  confirmedClusters: number;
   reason: string;
+}
+
+interface ProbePoint {
+  fx: number;
+  fy: number;
 }
 
 type ReferenceWorkerIn = ComputeReferenceIn | EstimateDefaultIterIn;
@@ -91,6 +97,7 @@ function estimateAdaptiveDefaultIter(input: EstimateDefaultIterIn): DefaultIterE
   let maxEscapedAt = 0;
   let sampleCount = 0;
   let nearCapHit = false;
+  let confirmedClusters = 0;
   let reason = "baseline";
 
   for (let round = 0; round < 3; round += 1) {
@@ -100,7 +107,9 @@ function estimateAdaptiveDefaultIter(input: EstimateDefaultIterIn): DefaultIterE
     bestEscape = Math.max(bestEscape, result.bestEscape);
     maxEscapedAt = Math.max(maxEscapedAt, result.maxEscapedAt);
     nearCapHit ||= result.nearCapHit;
-    if (!result.nearCapHit || cap >= 20_000) break;
+    confirmedClusters += result.confirmedClusters;
+    if (input.phase === "fast" && result.confirmedClusters > 0 && result.nearCapHit) break;
+    if (!result.nearCapHit || result.confirmedClusters === 0 || cap >= 20_000) break;
     cap = Math.min(20_000, cap * 2);
     reason = "near-cap";
   }
@@ -113,11 +122,14 @@ function estimateAdaptiveDefaultIter(input: EstimateDefaultIterIn): DefaultIterE
     recommendedIter = roundUp128(cap);
     reason = "near-cap";
   }
+  if (input.phase === "fast" && confirmedClusters === 0) {
+    recommendedIter = Math.min(recommendedIter, roundUp128(input.baseline * 2));
+  }
   recommendedIter = Math.min(20_000, Math.max(input.baseline, recommendedIter));
 
   const elapsed = performance.now() - started;
-  const confidence = confidenceFor(input, recommendedIter, nearCapHit, reason);
-  if (input.phase === "fast" && confidence === "low" && reason !== "baseline") {
+  const confidence = confidenceFor(input, recommendedIter, nearCapHit, confirmedClusters, reason);
+  if (input.phase === "fast" && confidence === "low" && reason !== "baseline" && confirmedClusters > 0) {
     recommendedIter = Math.min(20_000, Math.max(recommendedIter, roundUp128(input.baseline * 4)));
   }
   return {
@@ -129,50 +141,81 @@ function estimateAdaptiveDefaultIter(input: EstimateDefaultIterIn): DefaultIterE
     maxEscapedAt,
     cap,
     sampleCount,
+    confirmedClusters,
     reason
   };
 }
 
 function runProbePoints(
   input: EstimateDefaultIterIn,
-  points: Array<{ fx: number; fy: number }>,
+  points: ProbePoint[],
   cap: number,
   precisionBits: number
-): { bestEscape: number; maxEscapedAt: number; nearCapHit: boolean; sampleCount: number } {
+): { bestEscape: number; maxEscapedAt: number; nearCapHit: boolean; confirmedClusters: number; sampleCount: number } {
   let bestEscape = 0;
   let maxEscapedAt = 0;
   let nearCapHit = false;
+  let confirmedClusters = 0;
   let sampleCount = 0;
   for (const pointFraction of points) {
     sampleCount += 1;
-    const x = input.width * pointFraction.fx;
-    const y = input.height * pointFraction.fy;
-    const point = apply_view_transform(
-      { re: input.re, im: input.im, scale: input.scale, width: input.width, height: input.height },
-      -(x - input.width * 0.5),
-      -(y - input.height * 0.5),
-      1,
-      input.width * 0.5,
-      input.height * 0.5
-    ) as { re: string; im: string };
-    const escapedAt = direct_escape(point.re, point.im, cap, precisionBits);
+    const escapedAt = probeEscape(input, pointFraction, cap, precisionBits);
     maxEscapedAt = Math.max(maxEscapedAt, escapedAt);
-    if (escapedAt < cap && escapedAt >= cap * 0.85) nearCapHit = true;
+    const nearCap = escapedAt >= cap * 0.85;
+    if (escapedAt < cap && nearCap) nearCapHit = true;
     if (escapedAt > input.baseline && escapedAt < cap) bestEscape = Math.max(bestEscape, escapedAt);
+    if (input.phase === "fast" && nearCap) {
+      const confirmed = confirmedNeighborCount(input, pointFraction, cap, precisionBits);
+      sampleCount += 4;
+      if (confirmed >= 2) {
+        confirmedClusters += 1;
+        nearCapHit = true;
+      }
+    }
     if (input.phase === "fast" && sampleCount >= 9 && (nearCapHit || bestEscape > input.baseline)) break;
   }
-  return { bestEscape, maxEscapedAt, nearCapHit, sampleCount };
+  return { bestEscape, maxEscapedAt, nearCapHit, confirmedClusters, sampleCount };
 }
 
-function confidenceFor(input: EstimateDefaultIterIn, recommendedIter: number, nearCapHit: boolean, reason: string): "high" | "low" {
+function probeEscape(input: EstimateDefaultIterIn, pointFraction: ProbePoint, cap: number, precisionBits: number): number {
+  const x = input.width * pointFraction.fx;
+  const y = input.height * pointFraction.fy;
+  const point = apply_view_transform(
+    { re: input.re, im: input.im, scale: input.scale, width: input.width, height: input.height },
+    -(x - input.width * 0.5),
+    -(y - input.height * 0.5),
+    1,
+    input.width * 0.5,
+    input.height * 0.5
+  ) as { re: string; im: string };
+  return direct_escape(point.re, point.im, cap, precisionBits);
+}
+
+function confirmedNeighborCount(input: EstimateDefaultIterIn, point: ProbePoint, cap: number, precisionBits: number): number {
+  const dx = Math.max(1 / Math.max(1, input.width), 0.01);
+  const dy = Math.max(1 / Math.max(1, input.height), 0.01);
+  let confirmed = 0;
+  for (const neighbor of [
+    { fx: clamp01(point.fx + dx), fy: point.fy },
+    { fx: clamp01(point.fx - dx), fy: point.fy },
+    { fx: point.fx, fy: clamp01(point.fy + dy) },
+    { fx: point.fx, fy: clamp01(point.fy - dy) }
+  ]) {
+    const escapedAt = probeEscape(input, neighbor, cap, precisionBits);
+    if (escapedAt >= cap * 0.85) confirmed += 1;
+  }
+  return confirmed;
+}
+
+function confidenceFor(input: EstimateDefaultIterIn, recommendedIter: number, nearCapHit: boolean, confirmedClusters: number, reason: string): "high" | "low" {
   if (input.phase === "full") return "high";
-  if (nearCapHit) return "low";
+  if (nearCapHit && confirmedClusters > 0) return "low";
   if (reason === "baseline" && decimalLog10FromString(input.scale) >= 12) return "low";
-  if (recommendedIter > input.baseline * 1.5) return "low";
+  if (recommendedIter > input.baseline * 1.5 && confirmedClusters > 0) return "low";
   return "high";
 }
 
-function fastProbePoints(): Array<{ fx: number; fy: number }> {
+function fastProbePoints(): ProbePoint[] {
   const points = [{ fx: 0.5, fy: 0.5 }];
   for (const radius of [0.18, 0.36]) {
     for (let index = 0; index < 8; index += 1) {
@@ -186,7 +229,7 @@ function fastProbePoints(): Array<{ fx: number; fy: number }> {
   return points;
 }
 
-function fullProbePoints(): Array<{ fx: number; fy: number }> {
+function fullProbePoints(): ProbePoint[] {
   const fractions = [0.125, 0.25, 0.3, 0.35, 0.4, 0.45, 0.5, 0.55, 0.6, 0.65, 0.7, 0.75, 0.875];
   const points: Array<{ fx: number; fy: number }> = [];
   for (const fx of fractions) {

@@ -14,7 +14,7 @@ import {
   parseViewStateFromUrl,
   writeViewToUrl
 } from "./state/urlState";
-import { decimalLog10, formatCompactDecimal, pixelSpanForView } from "./math/view";
+import { decimalLog10, defaultMaxIter, formatCompactDecimal, pixelSpanForView } from "./math/view";
 import { initWasm, pointToViewCenterNow, transformViewNow } from "./wasmApi";
 import type { DefaultIterEstimate } from "./reference/referenceClient";
 import {
@@ -120,6 +120,23 @@ interface IterProbeSession {
   waiters: Set<string>;
 }
 
+interface RenderIterTileSummary {
+  area: number;
+  maxEscapedIter: number;
+  p95EscapedIter: number;
+  nearCapEscapedCount: number;
+  capHitUnknownCount: number;
+  capHitBoundaryCount: number;
+}
+
+interface RenderIterFeedbackState {
+  revision: number;
+  tiles: Map<string, RenderIterTileSummary>;
+  coverageEvaluated: boolean;
+  increaseCount: number;
+  decreaseApplied: boolean;
+}
+
 const MAX_RENDER_REFERENCES = 24;
 const PREVIEW_REFERENCE_LIMIT = 2;
 const PREVIEW_REFERENCE_GLOBAL_BUDGET = 96;
@@ -137,6 +154,9 @@ const MIN_EXACT_PATCH_SIZE = 8;
 const TILE_SCHEDULE_BATCH_MS = 6;
 const TILE_SCHEDULE_MIN_BATCH = 2;
 const FAST_ITER_PROBE_WAIT_MS = 180;
+const RENDER_ITER_COVERAGE_RATIO = 0.6;
+const RENDER_ITER_MAX_AUTO_INCREASES_PER_REVISION = 2;
+const MAX_AUTO_ITER = 20_000;
 
 export async function startApp(root: HTMLElement): Promise<void> {
   root.innerHTML = `
@@ -197,6 +217,7 @@ export async function startApp(root: HTMLElement): Promise<void> {
   let patchTileLimit = 512;
   let pendingTileShells = 0;
   let activeIterProbe: IterProbeSession | undefined;
+  let renderIterFeedback = createRenderIterFeedbackState(revision);
 
   let runtime = currentRuntimeView();
   resize();
@@ -287,6 +308,7 @@ export async function startApp(root: HTMLElement): Promise<void> {
     const token = renderToken;
     runtime = currentRuntimeView();
     activeIterProbe = undefined;
+    renderIterFeedback = createRenderIterFeedbackState(revision);
     references.cancelObsoleteWork(revision);
     pool.clearQueueForOldRevisions(revision);
     renderer.setActiveRevision(revision);
@@ -368,6 +390,7 @@ export async function startApp(root: HTMLElement): Promise<void> {
       maxEscapedAt: 0,
       cap: Math.max(input.baseline, candidate.maxIter),
       sampleCount: 0,
+      confirmedClusters: 0,
       reason: hasPredictiveIter ? "cached" : "deep-baseline"
     };
   }
@@ -383,7 +406,6 @@ export async function startApp(root: HTMLElement): Promise<void> {
     void references.estimateDefaultIter(input, session.revision, "full", 100).then((estimate) => {
       if (session.token !== renderToken || session.revision !== revision) return;
       recordIterProbeDone("iterProbeFullDone", session, estimate);
-      applyIterEstimate(estimate, session);
     }).catch(() => undefined);
   }
 
@@ -392,36 +414,31 @@ export async function startApp(root: HTMLElement): Promise<void> {
     const change = autoIter.applyEstimate(view, estimate);
     if (!change.changed) return;
     const finalStarted = hasFinalStarted();
-    if (!finalStarted) {
-      view = { ...view, maxIter: change.maxIter };
-      runtime = currentRuntimeView();
+    if (finalStarted) {
       recordDeepBench({
-        type: "iterChangedBeforeFinal",
+        type: "iterSeedIgnoredAfterFinal",
         revision,
         previousIter: change.previousIter,
         maxIter: change.maxIter,
         phase: estimate.phase,
         direction: change.direction
       });
-      startViewReference(runtime, session.token);
-      for (const state of tileStates.values()) submitReadyTile(runtime, state);
-      updateHud();
-      scheduleUrlSync();
       return;
     }
+    view = { ...view, maxIter: change.maxIter };
+    runtime = currentRuntimeView();
     recordDeepBench({
-      type: "iterChangedAfterFinal",
+      type: "iterChangedBeforeFinal",
       revision,
       previousIter: change.previousIter,
       maxIter: change.maxIter,
       phase: estimate.phase,
       direction: change.direction
     });
-    activateView({ ...view, maxIter: change.maxIter }, "iter refine", {
-      resetRetained: false,
-      carryReferences: false,
-      startAdaptiveProbe: false
-    });
+    startViewReference(runtime, session.token);
+    for (const state of tileStates.values()) submitReadyTile(runtime, state);
+    updateHud();
+    scheduleUrlSync();
   }
 
   function isActiveIterProbe(session: IterProbeSession): boolean {
@@ -452,6 +469,7 @@ export async function startApp(root: HTMLElement): Promise<void> {
       maxEscapedAt: estimate.maxEscapedAt,
       cap: estimate.cap,
       sampleCount: estimate.sampleCount,
+      confirmedClusters: estimate.confirmedClusters,
       reason: estimate.reason
     });
   }
@@ -696,11 +714,13 @@ export async function startApp(root: HTMLElement): Promise<void> {
 
       if (state.forceExact) {
         renderer.uploadTile(result);
+        recordRenderIterFeedback(localRuntime, result);
         state.completed = true;
         stats.completedTiles += 1;
         pendingTileIds.delete(state.tile.id);
         stats.pending = pendingWorkCount();
         updateWorkStatus("rendering");
+        evaluateRenderIterFeedbackCoverage(localRuntime);
         return;
       }
 
@@ -750,6 +770,7 @@ export async function startApp(root: HTMLElement): Promise<void> {
       }
 
       renderer.uploadTile(result);
+      recordRenderIterFeedback(localRuntime, result);
       state.completed = true;
       stats.completedTiles += 1;
       pendingTileIds.delete(state.tile.id);
@@ -757,6 +778,7 @@ export async function startApp(root: HTMLElement): Promise<void> {
       stats.pending = pendingWorkCount();
       renderer.pruneRetainedWhenActiveCoverage(Math.max(1, Math.floor((localRuntime.width * localRuntime.height) / (TILE_SIZE * TILE_SIZE) * 0.7)));
       updateWorkStatus("rendering");
+      evaluateRenderIterFeedbackCoverage(localRuntime);
     } catch (error) {
       state.inFlight = false;
       if (state.tile.revision !== revision) return;
@@ -1204,6 +1226,7 @@ export async function startApp(root: HTMLElement): Promise<void> {
     stats.activeWorkers = pool.active;
     stats.references = references.size;
     stats.status = hasOutstandingWork() ? activeStatus : "stable";
+    if (stats.status === "stable") evaluateRenderIterFeedback(currentRuntimeView(), "stable");
   }
 
   function pendingWorkCount(): number {
@@ -1233,6 +1256,167 @@ export async function startApp(root: HTMLElement): Promise<void> {
       if (state.inFlight || state.completed || state.forceExact) return true;
     }
     return false;
+  }
+
+  function createRenderIterFeedbackState(localRevision: number): RenderIterFeedbackState {
+    return {
+      revision: localRevision,
+      tiles: new Map(),
+      coverageEvaluated: false,
+      increaseCount: 0,
+      decreaseApplied: false
+    };
+  }
+
+  function recordRenderIterFeedback(localRuntime: RuntimeView, result: TileDoneMessage): void {
+    if (autoIter.mode !== "auto") return;
+    if (result.revision !== revision || localRuntime.revision !== revision) return;
+    if (result.stats.renderMode !== "final" && result.stats.renderMode !== "exact") return;
+    if (renderIterFeedback.revision !== revision) renderIterFeedback = createRenderIterFeedbackState(revision);
+    const area = Math.max(1, Math.ceil(result.width) * Math.ceil(result.height));
+    renderIterFeedback.tiles.set(result.tileId, {
+      area,
+      maxEscapedIter: result.stats.maxEscapedIter,
+      p95EscapedIter: result.stats.p95EscapedIter,
+      nearCapEscapedCount: result.stats.nearCapEscapedCount,
+      capHitUnknownCount: result.stats.capHitUnknownCount,
+      capHitBoundaryCount: result.stats.capHitBoundaryCount
+    });
+    const summary = summarizeRenderIterFeedback(localRuntime);
+    recordDeepBench({
+      type: "renderIterFeedbackTile",
+      revision,
+      renderMode: result.stats.renderMode,
+      area,
+      maxEscapedIter: result.stats.maxEscapedIter,
+      p95EscapedIter: result.stats.p95EscapedIter,
+      nearCapEscapedCount: result.stats.nearCapEscapedCount,
+      capHitUnknownCount: result.stats.capHitUnknownCount,
+      capHitBoundaryCount: result.stats.capHitBoundaryCount,
+      coveredPixels: summary.coveredPixels
+    });
+  }
+
+  function evaluateRenderIterFeedbackCoverage(localRuntime: RuntimeView): void {
+    if (renderIterFeedback.coverageEvaluated) return;
+    const summary = summarizeRenderIterFeedback(localRuntime);
+    if (summary.coverageRatio < RENDER_ITER_COVERAGE_RATIO) return;
+    renderIterFeedback.coverageEvaluated = true;
+    evaluateRenderIterFeedback(localRuntime, "coverage");
+  }
+
+  function evaluateRenderIterFeedback(localRuntime: RuntimeView, reason: "coverage" | "stable"): void {
+    if (autoIter.mode !== "auto" || localRuntime.revision !== revision) return;
+    if (renderIterFeedback.revision !== revision || renderIterFeedback.tiles.size === 0) return;
+    const summary = summarizeRenderIterFeedback(localRuntime);
+    const nearThreshold = Math.max(256, Math.ceil(summary.visiblePixels * 0.0005));
+    const capBoundaryThreshold = Math.max(8192, Math.ceil(summary.visiblePixels * 0.01));
+    const nearQuietThreshold = Math.floor(nearThreshold * 0.25);
+    const hasCapBoundary = summary.capHitBoundaryCount >= capBoundaryThreshold;
+
+    const allowRenderIncrease = decimalLog10(localRuntime.scale) >= 12;
+    if (allowRenderIncrease && hasCapBoundary && renderIterFeedback.increaseCount < RENDER_ITER_MAX_AUTO_INCREASES_PER_REVISION) {
+      const proposed = roundUp128(Math.max(localRuntime.maxIter + 1024, localRuntime.maxIter * 1.5));
+      const maxIter = Math.min(MAX_AUTO_ITER, Math.max(localRuntime.maxIter, proposed));
+      if (maxIter > localRuntime.maxIter) {
+        renderIterFeedback.increaseCount += 1;
+        autoIter.rememberVerified(view, maxIter);
+        recordDeepBench({
+          type: "renderIterIncrease",
+          revision,
+          reason,
+          previousIter: localRuntime.maxIter,
+          maxIter,
+          maxEscapedIter: summary.maxEscapedIter,
+          p95EscapedIter: summary.p95EscapedIter,
+          nearCapEscapedCount: summary.nearCapEscapedCount,
+          capHitBoundaryCount: summary.capHitBoundaryCount,
+          coveredPixels: summary.coveredPixels
+        });
+        activateView({ ...view, maxIter }, "iter feedback", {
+          resetRetained: false,
+          carryReferences: false,
+          startAdaptiveProbe: false
+        });
+      }
+      return;
+    }
+
+    if (reason !== "stable" || renderIterFeedback.decreaseApplied) return;
+    if (summary.capHitBoundaryCount !== 0 || summary.nearCapEscapedCount > nearQuietThreshold) {
+      autoIter.rememberVerified(view, localRuntime.maxIter);
+      return;
+    }
+    const candidateIter = roundUp128(Math.max(defaultMaxIter(localRuntime.scale), summary.p95EscapedIter * 1.35 + 512));
+    if (summary.maxEscapedIter >= candidateIter) {
+      autoIter.rememberVerified(view, localRuntime.maxIter);
+      return;
+    }
+    const clampedCandidate = Math.min(localRuntime.maxIter, Math.max(defaultMaxIter(localRuntime.scale), candidateIter));
+    autoIter.rememberVerified(view, clampedCandidate);
+    const threshold = Math.max(512, Math.round(localRuntime.maxIter * 0.2));
+    if (localRuntime.maxIter - clampedCandidate < threshold) return;
+    renderIterFeedback.decreaseApplied = true;
+    const previousIter = view.maxIter;
+    view = { ...view, maxIter: clampedCandidate };
+    runtime = currentRuntimeView();
+    recordDeepBench({
+      type: "renderIterDecrease",
+      revision,
+      reason,
+      previousIter,
+      maxIter: clampedCandidate,
+      maxEscapedIter: summary.maxEscapedIter,
+      p95EscapedIter: summary.p95EscapedIter,
+      nearCapEscapedCount: summary.nearCapEscapedCount,
+      capHitBoundaryCount: summary.capHitBoundaryCount,
+      coveredPixels: summary.coveredPixels
+    });
+    updateHud();
+    scheduleUrlSync();
+  }
+
+  function summarizeRenderIterFeedback(localRuntime: RuntimeView) {
+    const visiblePixels = Math.max(1, Math.ceil(localRuntime.width) * Math.ceil(localRuntime.height));
+    const summaries = [...renderIterFeedback.tiles.values()];
+    let coveredPixels = 0;
+    let maxEscapedIter = 0;
+    let nearCapEscapedCount = 0;
+    let capHitUnknownCount = 0;
+    let capHitBoundaryCount = 0;
+    let nearCapTileCount = 0;
+    for (const summary of summaries) {
+      coveredPixels += summary.area;
+      maxEscapedIter = Math.max(maxEscapedIter, summary.maxEscapedIter);
+      nearCapEscapedCount += summary.nearCapEscapedCount;
+      capHitUnknownCount += summary.capHitUnknownCount;
+      capHitBoundaryCount += summary.capHitBoundaryCount;
+      if (summary.nearCapEscapedCount > 0) nearCapTileCount += 1;
+    }
+    summaries.sort((a, b) => a.p95EscapedIter - b.p95EscapedIter);
+    const p95Target = Math.max(1, coveredPixels * 0.95);
+    let weighted = 0;
+    let p95EscapedIter = 0;
+    for (const summary of summaries) {
+      weighted += summary.area;
+      p95EscapedIter = summary.p95EscapedIter;
+      if (weighted >= p95Target) break;
+    }
+    return {
+      visiblePixels,
+      coveredPixels,
+      coverageRatio: coveredPixels / visiblePixels,
+      maxEscapedIter,
+      p95EscapedIter,
+      nearCapEscapedCount,
+      capHitUnknownCount,
+      capHitBoundaryCount,
+      nearCapTileCount
+    };
+  }
+
+  function roundUp128(value: number): number {
+    return Math.ceil(value / 128) * 128;
   }
 
   function distributeBrokerReference(localRuntime: RuntimeView, entry: ReferenceBrokerEntry, referenceId: string): void {

@@ -42,6 +42,33 @@ const SCENARIOS = [
     baselineComparable: false
   },
   {
+    name: "auto-iter-spiral-zoom",
+    timeoutMs: 90_000,
+    url:
+      "/?re=-1.62435019809546661070130019418231791153586270765513841889153748878747854609210523965333931e0&im=-8.70990139262991039797754745425909141471890180110054912433964752401916327424577690764088027e-6&scale=8.86316876451934830810292246958438816831789504029136970599989761034201331636675547812932958e7",
+    interaction: "zoom",
+    postInteractionStable: true,
+    requirements: {
+      stable: true,
+      maxHudIter: 5000,
+      maxIterChangedAfterFinal: 0
+    },
+    baselineComparable: false
+  },
+  {
+    name: "auto-iter-zoom-out-reset",
+    timeoutMs: 90_000,
+    url:
+      "/?re=-1.86218386106848814866255662032946766557147909268160285449153596892015358185587196752405928e0&im=-8.91958180579457042174917493448619417836512436679850805730351156013941456934818546457269994e-19&scale=4.09038297932601834386390656422009272275389505396597529784561331345048745338146708772415699e16",
+    interaction: "zoom-out",
+    postInteractionStable: true,
+    requirements: {
+      stable: true,
+      maxHudIter: 5000
+    },
+    baselineComparable: false
+  },
+  {
     name: "interactive-deep-pan",
     timeoutMs: 180_000,
     url: undefined,
@@ -179,6 +206,7 @@ function runDeepViewBench(scenario, port) {
   const args = ["scripts/bench-deep-view.mjs", "--timeout-ms", String(scenario.timeoutMs), "--port", String(port)];
   if (scenario.url !== undefined) args.push("--url", scenario.url);
   if (scenario.interaction !== undefined) args.push("--interaction", scenario.interaction);
+  if (scenario.postInteractionStable) args.push("--post-interaction-stable");
   return new Promise((resolve, reject) => {
     const child = spawn(process.execPath, args, {
       cwd: process.cwd(),
@@ -234,6 +262,11 @@ function projectMetrics(scenario, raw) {
     iterProbeFastDoneCount: regression.iterProbeFastDoneCount ?? raw.probe?.fastDoneCount ?? 0,
     iterChangedBeforeFinal: regression.iterChangedBeforeFinal ?? raw.probe?.iterChangedBeforeFinal ?? 0,
     iterChangedAfterFinal: raw.interactive?.iterChangedAfterFinal ?? regression.iterChangedAfterFinal ?? raw.probe?.iterChangedAfterFinal ?? 0,
+    renderIterIncreaseCount: regression.renderIterIncreaseCount ?? raw.renderIter?.increaseCount ?? 0,
+    renderIterDecreaseCount: regression.renderIterDecreaseCount ?? raw.renderIter?.decreaseCount ?? 0,
+    seedProbeConfirmedClusters: regression.seedProbeConfirmedClusters ?? raw.probe?.firstFastConfirmedClusters ?? 0,
+    capHitBoundaryPixels: regression.capHitBoundaryPixels ?? raw.renderIter?.capHitBoundaryPixels ?? 0,
+    nearCapEscapedPixels: regression.nearCapEscapedPixels ?? raw.renderIter?.nearCapEscapedPixels ?? 0,
     scenario: scenario.name
   };
 }
@@ -257,6 +290,9 @@ function checkRequirements(requirements, metrics) {
   }
   if (requirements.exactHudIter !== undefined && metrics.hudIter !== requirements.exactHudIter) {
     failures.push(`hudIter ${metrics.hudIter} !== ${requirements.exactHudIter}`);
+  }
+  if (requirements.maxHudIter !== undefined && metrics.hudIter > requirements.maxHudIter) {
+    failures.push(`hudIter ${metrics.hudIter} > ${requirements.maxHudIter}`);
   }
   if (requirements.maxFirstVisualChangeMs !== undefined && (metrics.firstVisualChangeMs === null || metrics.firstVisualChangeMs > requirements.maxFirstVisualChangeMs)) {
     failures.push(`firstVisualChangeMs ${metrics.firstVisualChangeMs} > ${requirements.maxFirstVisualChangeMs}`);
@@ -314,7 +350,9 @@ function baselineMetrics(result) {
     newRevisionQueuedMs: result.newRevisionQueuedMs,
     firstNewTileDoneMs: result.firstNewTileDoneMs,
     iterProbeFastDoneMs: result.iterProbeFastDoneMs,
-    iterChangedAfterFinal: result.iterChangedAfterFinal
+    iterChangedAfterFinal: result.iterChangedAfterFinal,
+    renderIterIncreaseCount: result.renderIterIncreaseCount,
+    renderIterDecreaseCount: result.renderIterDecreaseCount
   };
 }
 

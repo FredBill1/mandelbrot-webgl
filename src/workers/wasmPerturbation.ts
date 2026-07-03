@@ -45,6 +45,11 @@ export async function renderPerturbationTileWasm(message: RenderTileMessage): Pr
       unresolvedMask: normalizeOptionalBuffer(raw.unresolvedMask),
       stats: {
         ...raw.stats,
+        maxEscapedIter: raw.stats.maxEscapedIter ?? 0,
+        p95EscapedIter: raw.stats.p95EscapedIter ?? 0,
+        nearCapEscapedCount: raw.stats.nearCapEscapedCount ?? 0,
+        capHitUnknownCount: raw.stats.capHitUnknownCount ?? 0,
+        capHitBoundaryCount: raw.stats.capHitBoundaryCount ?? 0,
         referenceCacheMissCount: 0,
         exactFallbackPixels: raw.stats.exactFallbackPixels ?? raw.width * raw.height
       }
@@ -90,6 +95,11 @@ export async function renderPerturbationTileWasm(message: RenderTileMessage): Pr
     unresolvedMask: normalizeOptionalBuffer(raw.unresolvedMask),
     stats: {
       ...raw.stats,
+      maxEscapedIter: raw.stats.maxEscapedIter ?? 0,
+      p95EscapedIter: raw.stats.p95EscapedIter ?? 0,
+      nearCapEscapedCount: raw.stats.nearCapEscapedCount ?? 0,
+      capHitUnknownCount: raw.stats.capHitUnknownCount ?? 0,
+      capHitBoundaryCount: raw.stats.capHitBoundaryCount ?? 0,
       referenceCacheMissCount: (raw.stats.referenceCacheMissCount ?? 0) + cacheMisses,
       exactFallbackPixels: raw.stats.exactFallbackPixels ?? 0
     }
