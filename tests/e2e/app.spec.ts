@@ -27,6 +27,12 @@ const REGRESSION_VIEWS = [
   }
 ] as const;
 
+const ALT_DEEP_PRESET = {
+  re: "3.65507337176578885294026060094803596771753851886465789116904636035808374831904454685041558745129659944566525621423768578726826509334259227102568025179459338196606859e-1",
+  im: "5.92476366173214971781468865486627113155901675162131546210951676040509852198816827792342255876351114213269405343861920688594863450989932441948429028708253010581298657e-1",
+  scale: "1e100"
+} as const;
+
 const MICROTILE_REGRESSION_URL =
   "/?re=-1.5737407486227469252433174706063197673796016133716925506497393696303123079866005e0&im=2.3298749061632902966620424763943810032963152815290060660675502164545864497691752e-5&scale=5.166754427175971621093750355246036136162467976203352006225560442836867743195112e3&iter=750";
 const DEEP_INTERIOR_REGRESSION_URL =
@@ -116,19 +122,41 @@ test("lets users switch between formula and fixed iteration controls", async ({ 
   await expect.poll(() => new URL(page.url()).searchParams.get("iterBase")).toBe("640");
   expect(new URL(page.url()).searchParams.get("iter")).toBeNull();
 
+  await page.locator("#iterBaseReset").click();
+  await expect(page.locator("#iterBaseInput")).toHaveValue("512");
+  await expect(page.locator("#readIter")).toHaveText("512");
+  await expect.poll(() => new URL(page.url()).searchParams.get("iterBase")).toBeNull();
+
+  await page.locator("#iterSlopeInput").fill("96");
+  await expect.poll(() => new URL(page.url()).searchParams.get("iterSlope")).toBe("96");
+  await page.locator("#iterSlopeReset").click();
+  await expect(page.locator("#iterSlopeInput")).toHaveValue("64");
+  await expect.poll(() => new URL(page.url()).searchParams.get("iterSlope")).toBeNull();
+
+  await page.locator("#iterCapInput").fill("12000");
+  await expect.poll(() => new URL(page.url()).searchParams.get("iterCap")).toBe("12000");
+  await page.locator("#iterCapReset").click();
+  await expect(page.locator("#iterCapInput")).toHaveValue("20000");
+  await expect.poll(() => new URL(page.url()).searchParams.get("iterCap")).toBeNull();
+
   await page.locator("#iterFixedMode").click();
-  await expect.poll(() => new URL(page.url()).searchParams.get("iter")).toBe("640");
+  await expect.poll(() => new URL(page.url()).searchParams.get("iter")).toBe("512");
 
   await page.locator("#iterFixedInput").fill("900");
   await expect(page.locator("#readIter")).toHaveText("900");
   await expect.poll(() => new URL(page.url()).searchParams.get("iter")).toBe("900");
 
+  await page.locator("#iterFixedReset").click();
+  await expect(page.locator("#iterFixedInput")).toHaveValue("512");
+  await expect(page.locator("#readIter")).toHaveText("512");
+  await expect.poll(() => new URL(page.url()).searchParams.get("iter")).toBe("512");
+
   const beforeZoom = new URL(page.url());
   await page.mouse.move(450, 325);
   await page.mouse.wheel(0, -500);
   await expect.poll(() => new URL(page.url()).searchParams.get("scale")).not.toBe(beforeZoom.searchParams.get("scale"));
-  await expect(page.locator("#readIter")).toHaveText("900");
-  expect(new URL(page.url()).searchParams.get("iter")).toBe("900");
+  await expect(page.locator("#readIter")).toHaveText("512");
+  expect(new URL(page.url()).searchParams.get("iter")).toBe("512");
 });
 
 test("docks controls vertically on desktop and toggles them offscreen", async ({ page }) => {
@@ -174,7 +202,8 @@ test("docks controls horizontally on small screens and keeps them scrollable", a
   expect(visible.iter.left).toBeGreaterThan(visible.toolbar.right);
   expect(visible.toolbar.width).toBeLessThan(120);
   expect(visible.deep.top).toBeGreaterThan(visible.home.bottom);
-  expect(Math.abs(visible.hud.height - visible.toolbar.height)).toBeLessThanOrEqual(1);
+  expect(visible.deepAlt.top).toBeGreaterThan(visible.deep.bottom);
+  expect(visible.toolbar.height).toBeLessThanOrEqual(visible.hud.height);
   expect(Math.abs(visible.hud.height - visible.iter.height)).toBeLessThanOrEqual(1);
   expect(visible.rail.scrollWidth).toBeGreaterThan(visible.rail.clientWidth);
   expect(visible.rail.scrollHeight).toBe(visible.rail.clientHeight);
@@ -194,6 +223,13 @@ test("docks controls horizontally on small screens and keeps them scrollable", a
   await expect(page.locator("#uiToggle")).toHaveAttribute("aria-expanded", "true");
   await page.locator("#deepButton").click();
   await expect(page.locator("#readStatus")).toContainText(/rendering|stable/);
+  await page.locator("#deepAltButton").click();
+  await expect
+    .poll(() => {
+      const url = new URL(page.url());
+      return `${url.searchParams.get("re")}|${url.searchParams.get("im")}|${url.searchParams.get("scale")}`;
+    })
+    .toBe(`${ALT_DEEP_PRESET.re}|${ALT_DEEP_PRESET.im}|${ALT_DEEP_PRESET.scale}`);
 });
 
 test("supports pinch zoom with two touch pointers", async ({ page, browserName }) => {
@@ -562,6 +598,7 @@ async function readUiLayout(page: import("@playwright/test").Page) {
       toolbar: rect(".toolbar"),
       home: rect("#homeButton"),
       deep: rect("#deepButton"),
+      deepAlt: rect("#deepAltButton"),
       iter: rect(".iterPanel")
     };
   });

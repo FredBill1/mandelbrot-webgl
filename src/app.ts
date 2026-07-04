@@ -14,12 +14,14 @@ import {
   writeViewToUrl
 } from "./state/urlState";
 import {
+  DEFAULT_ITER_FORMULA,
   ITER_MAX,
   ITER_MIN,
   ITER_SLOPE_MAX,
   ITER_SLOPE_MIN,
   clampIter,
   decimalLog10,
+  defaultMaxIter,
   formatCompactDecimal,
   normalizeIterSettings,
   pixelSpanForView,
@@ -137,6 +139,11 @@ const TILE_SCHEDULE_BATCH_MS = 6;
 const TILE_SCHEDULE_MIN_BATCH = 2;
 const ITER_CONTROL_DEBOUNCE_MS = 120;
 const WHEEL_RENDER_DEBOUNCE_MS = 80;
+const ALT_DEEP_TEST_VIEW: Pick<ViewState, "re" | "im" | "scale"> = {
+  re: "3.65507337176578885294026060094803596771753851886465789116904636035808374831904454685041558745129659944566525621423768578726826509334259227102568025179459338196606859e-1",
+  im: "5.92476366173214971781468865486627113155901675162131546210951676040509852198816827792342255876351114213269405343861920688594863450989932441948429028708253010581298657e-1",
+  scale: "1e100"
+};
 
 export async function startApp(root: HTMLElement): Promise<void> {
   root.innerHTML = `
@@ -169,6 +176,7 @@ export async function startApp(root: HTMLElement): Promise<void> {
           <nav class="toolbar" aria-label="View controls">
             <button id="homeButton" title="Reset view">Home</button>
             <button id="deepButton" title="Jump to a 1e100 validation location">1e100</button>
+            <button id="deepAltButton" title="Jump to an alternate 1e100 location">1e100 B</button>
           </nav>
           <section class="iterPanel" aria-label="Iteration controls">
             <div class="iterHeader">
@@ -178,26 +186,30 @@ export async function startApp(root: HTMLElement): Promise<void> {
                 <button id="iterFixedMode" type="button">Fixed</button>
               </div>
             </div>
-            <label class="iterControl" data-mode="default">
+            <div class="iterControl" data-mode="default">
               <span>Base</span>
               <input id="iterBaseRange" type="range" min="${ITER_MIN}" max="${ITER_MAX}" step="1" />
               <input id="iterBaseInput" type="number" min="${ITER_MIN}" max="${ITER_MAX}" step="1" />
-            </label>
-            <label class="iterControl" data-mode="default">
+              <button id="iterBaseReset" class="iterReset" type="button" title="Reset base to default" aria-label="Reset base to default"><span aria-hidden="true">&#8634;</span></button>
+            </div>
+            <div class="iterControl" data-mode="default">
               <span>Slope</span>
               <input id="iterSlopeRange" type="range" min="${ITER_SLOPE_MIN}" max="${ITER_SLOPE_MAX}" step="1" />
               <input id="iterSlopeInput" type="number" min="${ITER_SLOPE_MIN}" max="${ITER_SLOPE_MAX}" step="1" />
-            </label>
-            <label class="iterControl" data-mode="default">
+              <button id="iterSlopeReset" class="iterReset" type="button" title="Reset slope to default" aria-label="Reset slope to default"><span aria-hidden="true">&#8634;</span></button>
+            </div>
+            <div class="iterControl" data-mode="default">
               <span>Cap</span>
               <input id="iterCapRange" type="range" min="${ITER_MIN}" max="${ITER_MAX}" step="1" />
               <input id="iterCapInput" type="number" min="${ITER_MIN}" max="${ITER_MAX}" step="1" />
-            </label>
-            <label class="iterControl" data-mode="fixed">
+              <button id="iterCapReset" class="iterReset" type="button" title="Reset cap to default" aria-label="Reset cap to default"><span aria-hidden="true">&#8634;</span></button>
+            </div>
+            <div class="iterControl" data-mode="fixed">
               <span>Fixed</span>
               <input id="iterFixedRange" type="range" min="${ITER_MIN}" max="${ITER_MAX}" step="1" />
               <input id="iterFixedInput" type="number" min="${ITER_MIN}" max="${ITER_MAX}" step="1" />
-            </label>
+              <button id="iterFixedReset" class="iterReset" type="button" title="Reset fixed iterations to formula default" aria-label="Reset fixed iterations to formula default"><span aria-hidden="true">&#8634;</span></button>
+            </div>
           </section>
         </div>
       </aside>
@@ -267,6 +279,9 @@ export async function startApp(root: HTMLElement): Promise<void> {
   });
   root.querySelector<HTMLButtonElement>("#deepButton")?.addEventListener("click", () => {
     activateView(withResolvedIter(DEEP_TEST_VIEW), "deep", { resetRetained: true });
+  });
+  root.querySelector<HTMLButtonElement>("#deepAltButton")?.addEventListener("click", () => {
+    activateView(withResolvedIter(ALT_DEEP_TEST_VIEW), "deep alternate", { resetRetained: true });
   });
 
   const activePointers = new Map<number, PointerSample>();
@@ -1417,30 +1432,33 @@ export async function startApp(root: HTMLElement): Promise<void> {
       setIterSettings({ ...iterSettings, mode: "fixed", fixedIter: view.maxIter }, "iter fixed", true);
     });
 
-    bindIterControlPair("base", "#iterBaseRange", "#iterBaseInput", ITER_MIN, ITER_MAX, (value) => {
+    bindIterControlPair("base", "#iterBaseRange", "#iterBaseInput", "#iterBaseReset", ITER_MIN, ITER_MAX, (value) => {
       setIterFormula({ ...iterSettings.formula, base: value }, "iter formula");
-    });
-    bindIterControlPair("slope", "#iterSlopeRange", "#iterSlopeInput", ITER_SLOPE_MIN, ITER_SLOPE_MAX, (value) => {
+    }, () => DEFAULT_ITER_FORMULA.base);
+    bindIterControlPair("slope", "#iterSlopeRange", "#iterSlopeInput", "#iterSlopeReset", ITER_SLOPE_MIN, ITER_SLOPE_MAX, (value) => {
       setIterFormula({ ...iterSettings.formula, slope: value }, "iter formula");
-    });
-    bindIterControlPair("cap", "#iterCapRange", "#iterCapInput", ITER_MIN, ITER_MAX, (value) => {
+    }, () => DEFAULT_ITER_FORMULA.slope);
+    bindIterControlPair("cap", "#iterCapRange", "#iterCapInput", "#iterCapReset", ITER_MIN, ITER_MAX, (value) => {
       setIterFormula({ ...iterSettings.formula, cap: value }, "iter formula");
-    });
-    bindIterControlPair("fixed", "#iterFixedRange", "#iterFixedInput", ITER_MIN, ITER_MAX, (value) => {
+    }, () => DEFAULT_ITER_FORMULA.cap);
+    bindIterControlPair("fixed", "#iterFixedRange", "#iterFixedInput", "#iterFixedReset", ITER_MIN, ITER_MAX, (value) => {
       setIterSettings({ ...iterSettings, fixedIter: clampIter(value) }, "iter fixed");
-    });
+    }, () => defaultMaxIter(view.scale, iterSettings.formula));
   }
 
   function bindIterControlPair(
     name: string,
     rangeSelector: string,
     inputSelector: string,
+    resetSelector: string,
     min: number,
     max: number,
-    apply: (value: number) => void
+    apply: (value: number) => void,
+    resetValue: () => number
   ): void {
     const range = requireElement(root, rangeSelector, HTMLInputElement);
     const input = requireElement(root, inputSelector, HTMLInputElement);
+    const reset = requireElement(root, resetSelector, HTMLButtonElement);
     const read = (target: HTMLInputElement) => clampControlNumber(target.valueAsNumber, min, max);
     range.addEventListener("input", () => apply(read(range)));
     input.addEventListener("input", () => apply(read(input)));
@@ -1448,6 +1466,7 @@ export async function startApp(root: HTMLElement): Promise<void> {
       syncIterControls();
       apply(read(input));
     });
+    reset.addEventListener("click", () => apply(clampControlNumber(resetValue(), min, max)));
     range.setAttribute("aria-label", name);
     input.setAttribute("aria-label", name);
   }
@@ -1499,6 +1518,7 @@ export async function startApp(root: HTMLElement): Promise<void> {
       const active = element.dataset.mode === settings.mode;
       element.classList.toggle("inactive", !active);
       for (const input of element.querySelectorAll<HTMLInputElement>("input")) input.disabled = !active;
+      for (const button of element.querySelectorAll<HTMLButtonElement>("button")) button.disabled = !active;
     }
   }
 
