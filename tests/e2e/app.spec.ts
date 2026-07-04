@@ -97,6 +97,31 @@ test("renders, pans, zooms, and restores URL state", async ({ page }) => {
   expect(new URL(page.url()).searchParams.get("scale")).toBe(beforeReload.searchParams.get("scale"));
 });
 
+test("lets users switch between formula and fixed iteration controls", async ({ page }) => {
+  await page.setViewportSize({ width: 900, height: 650 });
+  await page.goto("/");
+  await waitForNonBlankCanvas(page);
+
+  await page.locator("#iterBaseInput").fill("640");
+  await expect(page.locator("#readIter")).toHaveText("640");
+  await expect.poll(() => new URL(page.url()).searchParams.get("iterBase")).toBe("640");
+  expect(new URL(page.url()).searchParams.get("iter")).toBeNull();
+
+  await page.locator("#iterFixedMode").click();
+  await expect.poll(() => new URL(page.url()).searchParams.get("iter")).toBe("640");
+
+  await page.locator("#iterFixedInput").fill("900");
+  await expect(page.locator("#readIter")).toHaveText("900");
+  await expect.poll(() => new URL(page.url()).searchParams.get("iter")).toBe("900");
+
+  const beforeZoom = new URL(page.url());
+  await page.mouse.move(450, 325);
+  await page.mouse.wheel(0, -500);
+  await expect.poll(() => new URL(page.url()).searchParams.get("scale")).not.toBe(beforeZoom.searchParams.get("scale"));
+  await expect(page.locator("#readIter")).toHaveText("900");
+  expect(new URL(page.url()).searchParams.get("iter")).toBe("900");
+});
+
 test("supports pinch zoom with two touch pointers", async ({ page, browserName }) => {
   test.skip(browserName !== "chromium", "CDP touch injection is Chromium-specific");
   await page.setViewportSize({ width: 800, height: 600 });
@@ -203,7 +228,7 @@ test("keeps rendered deep tiles responsive during pan and zoom", async ({ page }
   await page.mouse.move(1256, 594, { steps: 1 });
   await page.mouse.up();
   await expect.poll(() => hasRetainedFrameAfter(page, panStart), { timeout: 500 }).toBe(true);
-  await expect(page.locator("#readStatus")).not.toHaveText(/iteration probe|reference pan/i);
+  await expect(page.locator("#readStatus")).not.toHaveText(/reference pan/i);
 
   await page.goto(DEEP_INTERIOR_REGRESSION_URL);
   await waitForNonBlankCanvas(page, 75_000);
@@ -212,7 +237,7 @@ test("keeps rendered deep tiles responsive during pan and zoom", async ({ page }
   await page.mouse.move(956, 474);
   await page.mouse.wheel(0, -600);
   await expect.poll(() => hasRetainedFrameAfter(page, zoomStart), { timeout: 500 }).toBe(true);
-  await expect(page.locator("#readStatus")).not.toHaveText(/iteration probe|reference zoom/i);
+  await expect(page.locator("#readStatus")).not.toHaveText(/reference zoom/i);
 });
 
 test("does not leave false periodic disks black at 1e27", async ({ page }) => {

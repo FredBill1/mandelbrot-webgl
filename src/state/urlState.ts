@@ -1,6 +1,13 @@
 import type { ViewState } from "../types";
-import { defaultMaxIter } from "../math/view";
-import type { IterMode } from "../iteration/autoIterController";
+import {
+  DEFAULT_ITER_FORMULA,
+  clampIter,
+  defaultMaxIter,
+  iterFormulaEquals,
+  normalizeIterFormula,
+  type IterFormula,
+  type IterSettings
+} from "../math/view";
 
 export const DEFAULT_VIEW: ViewState = {
   re: "-5e-1",
@@ -20,6 +27,7 @@ const DECIMAL_RE = /^[+-]?(?:\d+\.?\d*|\.\d+)(?:e[+-]?\d+)?$/i;
 
 export interface ParsedViewState {
   view: ViewState;
+  iterSettings: IterSettings;
   explicitIter: boolean;
 }
 
@@ -31,26 +39,43 @@ export function parseViewStateFromUrl(url: URL = new URL(window.location.href)):
   const re = validDecimal(url.searchParams.get("re")) ?? DEFAULT_VIEW.re;
   const im = validDecimal(url.searchParams.get("im")) ?? DEFAULT_VIEW.im;
   const scale = positiveDecimal(url.searchParams.get("scale")) ?? DEFAULT_VIEW.scale;
+  const formula = parseIterFormula(url);
   const iter = Number.parseInt(url.searchParams.get("iter") ?? "", 10);
   const explicitIter = Number.isFinite(iter) && iter >= 32;
-  const maxIter = explicitIter ? Math.min(50_000, iter) : defaultMaxIter(scale);
-  return { view: { re, im, scale, maxIter }, explicitIter };
+  const fixedIter = explicitIter ? clampIter(iter) : defaultMaxIter(scale, formula);
+  const iterSettings: IterSettings = {
+    mode: explicitIter ? "fixed" : "default",
+    formula,
+    fixedIter
+  };
+  const maxIter = explicitIter ? fixedIter : defaultMaxIter(scale, formula);
+  return { view: { re, im, scale, maxIter }, iterSettings, explicitIter };
 }
 
-export function viewToSearchParams(view: ViewState, options: { iterMode?: IterMode } = {}): URLSearchParams {
+export function viewToSearchParams(view: ViewState, options: { iterSettings?: IterSettings } = {}): URLSearchParams {
   const params = new URLSearchParams();
   params.set("re", normalizeDecimal(view.re));
   params.set("im", normalizeDecimal(view.im));
   params.set("scale", normalizeDecimal(view.scale));
-  if (options.iterMode !== "auto") params.set("iter", String(Math.round(view.maxIter)));
+  const settings = options.iterSettings;
+  if (!settings || settings.mode === "fixed") {
+    params.set("iter", String(clampIter(settings?.fixedIter ?? view.maxIter)));
+  } else {
+    const formula = normalizeIterFormula(settings.formula);
+    if (!iterFormulaEquals(formula)) {
+      if (formula.base !== DEFAULT_ITER_FORMULA.base) params.set("iterBase", String(formula.base));
+      if (formula.slope !== DEFAULT_ITER_FORMULA.slope) params.set("iterSlope", String(formula.slope));
+      if (formula.cap !== DEFAULT_ITER_FORMULA.cap) params.set("iterCap", String(formula.cap));
+    }
+  }
   return params;
 }
 
-export function serializeViewToQuery(view: ViewState, options: { iterMode?: IterMode } = {}): string {
+export function serializeViewToQuery(view: ViewState, options: { iterSettings?: IterSettings } = {}): string {
   return `?${viewToSearchParams(view, options).toString()}`;
 }
 
-export function writeViewToUrl(view: ViewState, options: { iterMode?: IterMode } = {}): void {
+export function writeViewToUrl(view: ViewState, options: { iterSettings?: IterSettings } = {}): void {
   const next = `${window.location.pathname}${serializeViewToQuery(view, options)}${window.location.hash}`;
   window.history.replaceState(null, "", next);
 }
@@ -71,4 +96,19 @@ function positiveDecimal(value: string | null): string | undefined {
 
 function normalizeDecimal(value: string): string {
   return value.replace("E", "e").replace(/e\+/, "e");
+}
+
+function parseIterFormula(url: URL): IterFormula {
+  return normalizeIterFormula({
+    base: numberParam(url, "iterBase"),
+    slope: numberParam(url, "iterSlope"),
+    cap: numberParam(url, "iterCap")
+  });
+}
+
+function numberParam(url: URL, name: string): number | undefined {
+  const raw = url.searchParams.get(name);
+  if (raw === null || raw.trim() === "") return undefined;
+  const value = Number(raw);
+  return Number.isFinite(value) ? value : undefined;
 }

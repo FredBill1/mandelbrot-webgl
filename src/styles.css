@@ -80,10 +80,16 @@ button {
   white-space: nowrap;
 }
 
-.toolbar {
+.controls {
   position: fixed;
   right: 14px;
   bottom: 14px;
+  display: grid;
+  width: min(390px, calc(100vw - 28px));
+  gap: 8px;
+}
+
+.toolbar {
   display: flex;
   gap: 8px;
   padding: 8px;
@@ -108,6 +114,98 @@ button {
   background: #dce9f7;
 }
 
+.iterPanel {
+  display: grid;
+  gap: 10px;
+  padding: 10px;
+  border: 1px solid rgba(220, 230, 240, 0.14);
+  border-radius: 8px;
+  background: rgba(8, 12, 18, 0.82);
+  backdrop-filter: blur(12px);
+  box-shadow: 0 12px 34px rgba(0, 0, 0, 0.28);
+}
+
+.iterHeader {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  min-height: 30px;
+}
+
+.iterHeader > span {
+  color: #f4f7fb;
+  font-size: 13px;
+  font-weight: 680;
+}
+
+.segmented {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  width: 168px;
+  padding: 2px;
+  border: 1px solid rgba(228, 235, 244, 0.18);
+  border-radius: 6px;
+  background: rgba(255, 255, 255, 0.06);
+}
+
+.segmented button {
+  height: 28px;
+  border: 0;
+  border-radius: 4px;
+  background: transparent;
+  color: #a8b6c6;
+  font-size: 12px;
+  font-weight: 680;
+}
+
+.segmented button.active {
+  background: #a7f3d0;
+  color: #06231a;
+}
+
+.iterControl {
+  display: grid;
+  grid-template-columns: 48px minmax(130px, 1fr) 86px;
+  gap: 10px;
+  min-height: 32px;
+  align-items: center;
+  transition:
+    opacity 120ms ease,
+    filter 120ms ease;
+}
+
+.iterControl.inactive {
+  opacity: 0.42;
+}
+
+.iterControl span {
+  color: #9cadbd;
+  font-size: 12px;
+}
+
+.iterControl input[type="range"] {
+  width: 100%;
+  min-width: 0;
+  accent-color: #a7f3d0;
+}
+
+.iterControl input[type="number"] {
+  width: 86px;
+  height: 30px;
+  border: 1px solid rgba(228, 235, 244, 0.2);
+  border-radius: 6px;
+  background: rgba(255, 255, 255, 0.08);
+  color: #eef3f8;
+  font: inherit;
+  font-size: 12px;
+  text-align: right;
+}
+
+.iterControl input:disabled {
+  cursor: not-allowed;
+}
+
 .fatal {
   margin: 20px;
   color: #ffb7b7;
@@ -120,8 +218,23 @@ button {
     width: auto;
   }
 
-  .toolbar {
+  .controls {
     right: 10px;
     bottom: 10px;
+    left: 10px;
+    width: auto;
+  }
+
+  .toolbar {
+    justify-content: flex-end;
+  }
+
+  .iterControl {
+    grid-template-columns: 44px minmax(90px, 1fr) 76px;
+    gap: 8px;
+  }
+
+  .iterControl input[type="number"] {
+    width: 76px;
   }
 }

@@ -58,8 +58,6 @@ try {
   }
   const bench = await page.evaluate(() => globalThis.__deepBench);
   bench.stableAt = elapsedMs;
-  const probe = probeMetrics(bench.profile.events);
-  const renderIter = renderIterMetrics(bench.profile.events);
   const hudTiles = parseTileProgress(hud.tiles);
   const refs = Number(hud.refs) || 0;
   const summary = {
@@ -91,8 +89,6 @@ try {
       previewQueueMs: percentiles(bench.samples.previewQueueMs)
     },
     waves: bench.waves,
-    probe,
-    renderIter,
     interactive,
     slowFinalTiles: bench.slowFinalTiles,
     regression: {
@@ -111,16 +107,7 @@ try {
       unresolvedFinals: bench.waves.unresolvedFinals,
       onePixelTiles: bench.waves.onePixelTiles,
       minTileArea: bench.waves.minTileArea === Infinity ? 0 : bench.waves.minTileArea,
-      maxCompletedTiles: maxHudCompletedTiles,
-      iterProbeFastDoneMs: probe.firstFastDoneMs,
-      iterProbeFastDoneCount: probe.fastDoneCount,
-      iterChangedBeforeFinal: probe.iterChangedBeforeFinal,
-      iterChangedAfterFinal: probe.iterChangedAfterFinal,
-      renderIterIncreaseCount: renderIter.increaseCount,
-      renderIterDecreaseCount: renderIter.decreaseCount,
-      seedProbeConfirmedClusters: probe.firstFastConfirmedClusters,
-      capHitBoundaryPixels: renderIter.capHitBoundaryPixels,
-      nearCapEscapedPixels: renderIter.nearCapEscapedPixels
+      maxCompletedTiles: maxHudCompletedTiles
     }
   };
 
@@ -229,14 +216,6 @@ async function runInteraction(page, interaction) {
     const newRenders = renders.filter((render) => render.doneAt >= inputTime && render.revision === newRevision);
     const oldRenders = renders.filter((render) => render.doneAt >= inputTime && newRevision !== undefined && render.revision < newRevision);
     const firstDone = newRenders.reduce((best, render) => Math.min(best, render.doneAt), Number.POSITIVE_INFINITY);
-    const probeEvents = events.filter((event) => event.now >= inputTime);
-    const firstProbeQueued = probeEvents.find((event) => event.type === "iterProbeQueued" && event.phase === "fast");
-    const fastProbeDone = probeEvents.filter((event) => event.type === "iterProbeFastDone");
-    const firstFastProbe = fastProbeDone[0];
-    const probe = {
-      firstFastDoneMs: firstProbeQueued && firstFastProbe ? Number((firstFastProbe.now - firstProbeQueued.now).toFixed(2)) : null,
-      iterChangedAfterFinal: probeEvents.filter((event) => event.type === "iterChangedAfterFinal").length
-    };
     return {
       interaction,
       inputTime,
@@ -245,43 +224,9 @@ async function runInteraction(page, interaction) {
       newRevisionQueuedMs: Number.isFinite(firstQueued) ? Number((firstQueued - inputTime).toFixed(2)) : null,
       firstNewTileDoneMs: Number.isFinite(firstDone) ? Number((firstDone - inputTime).toFixed(2)) : null,
       oldRevisionTileDoneAfterInput: oldRenders.length,
-      iterProbeFastDoneMs: probe.firstFastDoneMs,
-      iterChangedAfterFinal: probe.iterChangedAfterFinal,
       status: document.querySelector("#readStatus")?.textContent ?? ""
     };
   }, { inputTime, firstVisualChangeMs, interaction });
-}
-
-function probeMetrics(events, since = 0) {
-  const filtered = events.filter((event) => event.now >= since);
-  const firstQueued = filtered.find((event) => event.type === "iterProbeQueued" && event.phase === "fast");
-  const fastDone = filtered.filter((event) => event.type === "iterProbeFastDone");
-  const firstFast = fastDone[0];
-  return {
-    fastDoneCount: fastDone.length,
-    fullDoneCount: filtered.filter((event) => event.type === "iterProbeFullDone").length,
-    firstFastDoneMs: firstQueued && firstFast ? Number((firstFast.now - firstQueued.now).toFixed(2)) : null,
-    firstFastSampleCount: firstFast?.sampleCount ?? 0,
-    firstFastRecommendedIter: firstFast?.recommendedIter ?? 0,
-    firstFastConfirmedClusters: firstFast?.confirmedClusters ?? 0,
-    iterChangedBeforeFinal: filtered.filter((event) => event.type === "iterChangedBeforeFinal").length,
-    iterChangedAfterFinal: filtered.filter((event) => event.type === "iterChangedAfterFinal").length
-  };
-}
-
-function renderIterMetrics(events, since = 0) {
-  const filtered = events.filter((event) => event.now >= since);
-  const increases = filtered.filter((event) => event.type === "renderIterIncrease");
-  const decreases = filtered.filter((event) => event.type === "renderIterDecrease");
-  const feedbackTiles = filtered.filter((event) => event.type === "renderIterFeedbackTile");
-  return {
-    increaseCount: increases.length,
-    decreaseCount: decreases.length,
-    capHitBoundaryPixels: feedbackTiles.reduce((sum, event) => sum + (event.capHitBoundaryCount ?? 0), 0),
-    nearCapEscapedPixels: feedbackTiles.reduce((sum, event) => sum + (event.nearCapEscapedCount ?? 0), 0),
-    lastIncreaseIter: increases.at(-1)?.maxIter ?? 0,
-    lastDecreaseIter: decreases.at(-1)?.maxIter ?? 0
-  };
 }
 
 async function waitForRetainedFrame(page, inputTime, timeoutMs) {

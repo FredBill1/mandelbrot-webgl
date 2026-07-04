@@ -14,46 +14,13 @@ interface PendingReference {
   reject: (reason: Error) => void;
 }
 
-interface PendingDefaultIter {
-  type: "estimateDefaultIter";
-  requestId: number;
-  revision: number | undefined;
-  priority: number;
-  sequence: number;
-  kind: ReferenceWorkKind;
-  phase: DefaultIterProbePhase;
-  re: string;
-  im: string;
-  scale: string;
-  width: number;
-  height: number;
-  baseline: number;
-  resolve: (value: DefaultIterEstimate) => void;
-  reject: (reason: Error) => void;
-}
-
-type PendingWork = PendingReference | PendingDefaultIter;
-export type ReferenceWorkKind = "viewReference" | "localReference" | "defaultIter";
-export type DefaultIterProbePhase = "fast" | "full";
-
-export interface DefaultIterEstimate {
-  recommendedIter: number;
-  confidence: "high" | "low";
-  phase: DefaultIterProbePhase;
-  fastMs: number;
-  fullMs: number;
-  maxEscapedAt: number;
-  cap: number;
-  sampleCount: number;
-  confirmedClusters: number;
-  reason: string;
-}
+type PendingWork = PendingReference;
+export type ReferenceWorkKind = "viewReference" | "localReference";
 
 export interface ReferenceWorkOptions {
   revision?: number;
   priority?: number;
   kind?: ReferenceWorkKind;
-  phase?: DefaultIterProbePhase;
 }
 
 export interface RawReferenceResult {
@@ -106,26 +73,6 @@ export class ReferenceClient {
     return promise;
   }
 
-  estimateDefaultIter(input: { re: string; im: string; scale: string; width: number; height: number; baseline: number }, options: ReferenceWorkOptions = {}): Promise<DefaultIterEstimate> {
-    const requestId = ++this.requestId;
-    const promise = new Promise<DefaultIterEstimate>((resolve, reject) => {
-      this.enqueue({
-        type: "estimateDefaultIter",
-        requestId,
-        revision: options.revision,
-        priority: options.priority ?? 100,
-        sequence: ++this.sequence,
-        kind: options.kind ?? "defaultIter",
-        phase: options.phase ?? "fast",
-        ...input,
-        resolve,
-        reject
-      });
-    });
-    this.pump();
-    return promise;
-  }
-
   cancelObsoleteWork(currentRevision: number): void {
     for (let index = this.queue.length - 1; index >= 0; index -= 1) {
       const pending = this.queue[index];
@@ -161,7 +108,6 @@ export class ReferenceClient {
     worker.onmessage = (event: MessageEvent) => {
       const data = event.data as
         | { type: "referenceDone"; requestId: number; reference: RawReferenceResult }
-        | { type: "defaultIterDone"; requestId: number; estimate: DefaultIterEstimate }
         | { type: "referenceError"; requestId: number; message: string };
       this.handleMessage(worker, data);
     };
@@ -183,7 +129,6 @@ export class ReferenceClient {
     worker: Worker,
     data:
       | { type: "referenceDone"; requestId: number; reference: RawReferenceResult }
-      | { type: "defaultIterDone"; requestId: number; estimate: DefaultIterEstimate }
       | { type: "referenceError"; requestId: number; message: string }
   ): void {
     const pending = this.inFlight.get(worker);
@@ -196,8 +141,6 @@ export class ReferenceClient {
         orbitRe: data.reference.orbitRe instanceof Float64Array ? data.reference.orbitRe : Float64Array.from(data.reference.orbitRe),
         orbitIm: data.reference.orbitIm instanceof Float64Array ? data.reference.orbitIm : Float64Array.from(data.reference.orbitIm)
       });
-    } else if (data.type === "defaultIterDone" && pending.type === "estimateDefaultIter") {
-      pending.resolve(data.estimate);
     } else {
       pending.reject(new Error(data.type === "referenceError" ? data.message : "Reference worker returned mismatched response"));
     }
@@ -220,29 +163,15 @@ export class ReferenceClient {
       const pending = this.queue.shift();
       if (!worker || !pending) break;
       this.inFlight.set(worker, pending);
-      if (pending.type === "computeReference") {
-        worker.postMessage({
-          type: "computeReference",
-          requestId: pending.requestId,
-          centerRe: pending.centerRe,
-          centerIm: pending.centerIm,
-          scale: pending.scale,
-          maxIter: pending.maxIter,
-          minPrecisionBits: pending.minPrecisionBits
-        });
-      } else {
-        worker.postMessage({
-          type: "estimateDefaultIter",
-          requestId: pending.requestId,
-          re: pending.re,
-          im: pending.im,
-          scale: pending.scale,
-          width: pending.width,
-          height: pending.height,
-          baseline: pending.baseline,
-          phase: pending.phase
-        });
-      }
+      worker.postMessage({
+        type: "computeReference",
+        requestId: pending.requestId,
+        centerRe: pending.centerRe,
+        centerIm: pending.centerIm,
+        scale: pending.scale,
+        maxIter: pending.maxIter,
+        minPrecisionBits: pending.minPrecisionBits
+      });
     }
   }
 }

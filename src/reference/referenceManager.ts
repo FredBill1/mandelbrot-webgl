@@ -1,5 +1,5 @@
 import { REFERENCE_CACHE_SOFT_BYTES, type ReferenceSnapshot, type RuntimeView, type TileDescriptor } from "../types";
-import { ReferenceClient, type DefaultIterEstimate, type DefaultIterProbePhase, type ReferenceWorkOptions } from "./referenceClient";
+import { ReferenceClient, type ReferenceWorkOptions } from "./referenceClient";
 
 interface ReferenceKey {
   centerRe: string;
@@ -136,15 +136,6 @@ export class ReferenceManager {
       }
     }
     return best?.reference;
-  }
-
-  estimateDefaultIter(
-    input: { re: string; im: string; scale: string; width: number; height: number; baseline: number },
-    revision?: number,
-    phase: DefaultIterProbePhase = "fast",
-    priority = phase === "fast" ? 1 : 100
-  ): Promise<DefaultIterEstimate> {
-    return this.client.estimateDefaultIter(input, { revision, priority, kind: "defaultIter", phase });
   }
 
   cancelObsoleteWork(currentRevision: number): void {

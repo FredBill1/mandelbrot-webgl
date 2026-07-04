@@ -18,7 +18,7 @@ const SCENARIOS = [
     baselineComparable: false
   },
   {
-    name: "adaptive-minibrot-no-iter",
+    name: "formula-minibrot-default-iter",
     timeoutMs: 60_000,
     url:
       "/?re=-1.86218386106848814866255662032946766557147909268160285449153596892015358185587196752405928e0&im=-8.91958180579457042174917493448619417836512436679850805730351156013941456934818546457269994e-19&scale=4.09038297932601834386390656422009272275389505396597529784561331345048745338146708772415699e16",
@@ -42,7 +42,7 @@ const SCENARIOS = [
     baselineComparable: false
   },
   {
-    name: "auto-iter-spiral-zoom",
+    name: "formula-spiral-zoom",
     timeoutMs: 90_000,
     url:
       "/?re=-1.62435019809546661070130019418231791153586270765513841889153748878747854609210523965333931e0&im=-8.70990139262991039797754745425909141471890180110054912433964752401916327424577690764088027e-6&scale=8.86316876451934830810292246958438816831789504029136970599989761034201331636675547812932958e7",
@@ -50,13 +50,12 @@ const SCENARIOS = [
     postInteractionStable: true,
     requirements: {
       stable: true,
-      maxHudIter: 5000,
-      maxIterChangedAfterFinal: 0
+      maxHudIter: 5000
     },
     baselineComparable: false
   },
   {
-    name: "auto-iter-zoom-out-reset",
+    name: "formula-zoom-out-reset",
     timeoutMs: 90_000,
     url:
       "/?re=-1.86218386106848814866255662032946766557147909268160285449153596892015358185587196752405928e0&im=-8.91958180579457042174917493448619417836512436679850805730351156013941456934818546457269994e-19&scale=4.09038297932601834386390656422009272275389505396597529784561331345048745338146708772415699e16",
@@ -92,19 +91,7 @@ const SCENARIOS = [
       maxFirstVisualChangeMs: 100,
       maxNewRevisionQueuedMs: 100,
       maxFirstNewTileDoneMs: 1000,
-      maxOldRevisionTileDoneAfterInput: 0,
-      maxIterProbeFastDoneMs: 180,
-      maxIterChangedAfterFinal: 0
-    },
-    baselineComparable: false
-  },
-  {
-    name: "deep-button-probe",
-    timeoutMs: 180_000,
-    url: undefined,
-    requirements: {
-      stable: true,
-      minIterProbeFastDoneCount: 1
+      maxOldRevisionTileDoneAfterInput: 0
     },
     baselineComparable: false
   },
@@ -258,15 +245,6 @@ function projectMetrics(scenario, raw) {
     newRevisionQueuedMs: raw.interactive?.newRevisionQueuedMs ?? null,
     firstNewTileDoneMs: raw.interactive?.firstNewTileDoneMs ?? null,
     oldRevisionTileDoneAfterInput: raw.interactive?.oldRevisionTileDoneAfterInput ?? 0,
-    iterProbeFastDoneMs: raw.interactive?.iterProbeFastDoneMs ?? regression.iterProbeFastDoneMs ?? raw.probe?.firstFastDoneMs ?? null,
-    iterProbeFastDoneCount: regression.iterProbeFastDoneCount ?? raw.probe?.fastDoneCount ?? 0,
-    iterChangedBeforeFinal: regression.iterChangedBeforeFinal ?? raw.probe?.iterChangedBeforeFinal ?? 0,
-    iterChangedAfterFinal: raw.interactive?.iterChangedAfterFinal ?? regression.iterChangedAfterFinal ?? raw.probe?.iterChangedAfterFinal ?? 0,
-    renderIterIncreaseCount: regression.renderIterIncreaseCount ?? raw.renderIter?.increaseCount ?? 0,
-    renderIterDecreaseCount: regression.renderIterDecreaseCount ?? raw.renderIter?.decreaseCount ?? 0,
-    seedProbeConfirmedClusters: regression.seedProbeConfirmedClusters ?? raw.probe?.firstFastConfirmedClusters ?? 0,
-    capHitBoundaryPixels: regression.capHitBoundaryPixels ?? raw.renderIter?.capHitBoundaryPixels ?? 0,
-    nearCapEscapedPixels: regression.nearCapEscapedPixels ?? raw.renderIter?.nearCapEscapedPixels ?? 0,
     scenario: scenario.name
   };
 }
@@ -306,15 +284,6 @@ function checkRequirements(requirements, metrics) {
   if (requirements.maxOldRevisionTileDoneAfterInput !== undefined && metrics.oldRevisionTileDoneAfterInput > requirements.maxOldRevisionTileDoneAfterInput) {
     failures.push(`oldRevisionTileDoneAfterInput ${metrics.oldRevisionTileDoneAfterInput} > ${requirements.maxOldRevisionTileDoneAfterInput}`);
   }
-  if (requirements.maxIterProbeFastDoneMs !== undefined && (metrics.iterProbeFastDoneMs === null || metrics.iterProbeFastDoneMs > requirements.maxIterProbeFastDoneMs)) {
-    failures.push(`iterProbeFastDoneMs ${metrics.iterProbeFastDoneMs} > ${requirements.maxIterProbeFastDoneMs}`);
-  }
-  if (requirements.minIterProbeFastDoneCount !== undefined && metrics.iterProbeFastDoneCount < requirements.minIterProbeFastDoneCount) {
-    failures.push(`iterProbeFastDoneCount ${metrics.iterProbeFastDoneCount} < ${requirements.minIterProbeFastDoneCount}`);
-  }
-  if (requirements.maxIterChangedAfterFinal !== undefined && metrics.iterChangedAfterFinal > requirements.maxIterChangedAfterFinal) {
-    failures.push(`iterChangedAfterFinal ${metrics.iterChangedAfterFinal} > ${requirements.maxIterChangedAfterFinal}`);
-  }
   return failures;
 }
 
@@ -348,11 +317,7 @@ function baselineMetrics(result) {
     refs: result.refs,
     firstVisualChangeMs: result.firstVisualChangeMs,
     newRevisionQueuedMs: result.newRevisionQueuedMs,
-    firstNewTileDoneMs: result.firstNewTileDoneMs,
-    iterProbeFastDoneMs: result.iterProbeFastDoneMs,
-    iterChangedAfterFinal: result.iterChangedAfterFinal,
-    renderIterIncreaseCount: result.renderIterIncreaseCount,
-    renderIterDecreaseCount: result.renderIterDecreaseCount
+    firstNewTileDoneMs: result.firstNewTileDoneMs
   };
 }
 
