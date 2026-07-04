@@ -85,7 +85,11 @@ export async function renderPerturbationTileWasm(message: RenderTileMessage): Pr
     refIds,
     message.seriesDegree,
     message.renderMode,
-    message.sampleStep
+    message.sampleStep,
+    message.refinementBaseRgba ? new Uint8Array(message.refinementBaseRgba) : new Uint8Array(),
+    message.refinementUnresolvedMask ? new Uint8Array(message.refinementUnresolvedMask) : new Uint8Array(),
+    message.refinementSmoothValues ? new Float32Array(message.refinementSmoothValues) : new Float32Array(),
+    message.refinementEscapedMask ? new Uint8Array(message.refinementEscapedMask) : new Uint8Array()
   ) as TileDoneMessage;
 
   const rgba = normalizeRgbaBuffer(raw.rgba);
@@ -93,6 +97,8 @@ export async function renderPerturbationTileWasm(message: RenderTileMessage): Pr
     ...raw,
     rgba,
     unresolvedMask: normalizeOptionalBuffer(raw.unresolvedMask),
+    refinementSmoothValues: normalizeOptionalBuffer(raw.refinementSmoothValues),
+    refinementEscapedMask: normalizeOptionalBuffer(raw.refinementEscapedMask),
     stats: {
       ...raw.stats,
       maxEscapedIter: raw.stats.maxEscapedIter ?? 0,

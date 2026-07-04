@@ -60,6 +60,7 @@ const REPORTED_INTERIOR_PERFORMANCE_VIEWS = [
 ] as const;
 const REPORTED_DEEP_PERFORMANCE_VIEW =
   "/?re=-7.46883943431692760541919532714409859232606639886333750701092541165643808224287821342188522092587382149759799587046156756309863566112516698524311312263708365547443519e-1&im=-1.00525982411215876752593698920114371641511074291356983067885243750788193219078894211160534174388216978954526887172496458449660477900264112017850945405489228557321858e-1&scale=1e100";
+const ALT_REPORTED_DEEP_PERFORMANCE_VIEW = `/?re=${ALT_DEEP_PRESET.re}&im=${ALT_DEEP_PRESET.im}&scale=${ALT_DEEP_PRESET.scale}`;
 const UNSAFE_ACCELERATION_TILE_REGRESSIONS = [
   {
     url:
@@ -549,6 +550,31 @@ test("stabilizes the reported e100 deep view under five seconds", async ({ page 
 
   const started = Date.now();
   await page.goto(REPORTED_DEEP_PERFORMANCE_VIEW);
+  await expect(page.locator("#readStatus")).toHaveText("stable", { timeout: 5_000 });
+  const stableMs = Date.now() - started;
+  expect(stableMs).toBeLessThan(5_000);
+
+  const tileCounts = await readTileCounts(page);
+  expect(tileCounts.completed).toBe(tileCounts.total);
+  const probe = await readInteractionWorkerProbe(page);
+  expect(probe.renderMessages.filter((message) => message.mode === "exact")).toHaveLength(0);
+  for (const [x, y] of [
+    [0.25, 0.25],
+    [0.5, 0.5],
+    [0.75, 0.75]
+  ] as const) {
+    const pixel = await readCanvasPixel(page, x, y);
+    expect(pixel[3]).toBe(255);
+  }
+});
+
+test("stabilizes the alternate reported e100 deep view under five seconds", async ({ page }) => {
+  test.setTimeout(30_000);
+  await installInteractionWorkerProbe(page);
+  await page.setViewportSize({ width: 1912, height: 948 });
+
+  const started = Date.now();
+  await page.goto(ALT_REPORTED_DEEP_PERFORMANCE_VIEW);
   await expect(page.locator("#readStatus")).toHaveText("stable", { timeout: 5_000 });
   const stableMs = Date.now() - started;
   expect(stableMs).toBeLessThan(5_000);

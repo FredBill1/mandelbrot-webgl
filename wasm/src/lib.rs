@@ -1,5 +1,5 @@
 use astro_float::{BigFloat, RoundingMode, Sign};
-use js_sys::{Array, Float64Array, Int32Array, Object, Reflect, Uint8Array, Uint8ClampedArray};
+use js_sys::{Array, Float32Array, Float64Array, Int32Array, Object, Reflect, Uint8Array, Uint8ClampedArray};
 use serde::{Deserialize, Serialize};
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -825,6 +825,10 @@ pub fn render_tile_cached(
     series_degree: u32,
     render_mode: &str,
     sample_step: f64,
+    refinement_base_rgba: Uint8Array,
+    refinement_mask: Uint8Array,
+    refinement_smooth_values: Float32Array,
+    refinement_escaped_mask: Uint8Array,
 ) -> Result<JsValue, JsValue> {
     let started = js_sys::Date::now();
     let rect = Rect64 {
@@ -842,8 +846,30 @@ pub fn render_tile_cached(
     let height = ((rect.height / normalized_sample_step).ceil().max(1.0)) as usize;
     let mut contexts = build_render_contexts(rect, pixel_span, &ref_ids)?;
     let palette = create_render_palette();
-    let mut rgba = vec![0u8; width * height * 4];
-    let mut certified_interior_mask = if render_mode == "final" {
+    let refinement_input = if render_mode == "final" {
+        prepare_refinement_input(
+            width,
+            height,
+            refinement_base_rgba,
+            refinement_mask,
+            refinement_smooth_values,
+            refinement_escaped_mask,
+        )
+    } else {
+        None
+    };
+    let using_refinement_mask = refinement_input.is_some();
+    let (mut rgba, refinement_mask, refinement_smooth_values, refinement_escaped_mask) = if let Some(input) = refinement_input {
+        (
+            input.rgba,
+            Some(input.mask),
+            Some(input.smooth_values),
+            Some(input.escaped_mask),
+        )
+    } else {
+        (vec![0u8; width * height * 4], None, None, None)
+    };
+    let mut certified_interior_mask = if render_mode == "final" && !using_refinement_mask {
         Some(vec![0u8; width * height])
     } else {
         None
@@ -870,7 +896,7 @@ pub fn render_tile_cached(
     let mut clusters = create_render_cluster_accumulators(rect);
     let mut unresolved_mask = vec![0u8; width * height];
     let mut escaped_mask = if render_mode == "final" {
-        Some(vec![0u8; width * height])
+        Some(refinement_escaped_mask.unwrap_or_else(|| vec![0u8; width * height]))
     } else {
         None
     };
@@ -880,7 +906,7 @@ pub fn render_tile_cached(
         None
     };
     let mut smooth_values = if render_mode == "final" {
-        Some(vec![0f32; width * height])
+        Some(refinement_smooth_values.unwrap_or_else(|| vec![0f32; width * height]))
     } else {
         None
     };
@@ -917,6 +943,12 @@ pub fn render_tile_cached(
         let screen_y = screen_ys[py];
         for px in 0..width {
             let pixel_index = py * width + px;
+            if refinement_mask
+                .as_ref()
+                .is_some_and(|mask| mask[pixel_index] == 0)
+            {
+                continue;
+            }
             if certified_interior_mask
                 .as_ref()
                 .is_some_and(|mask| mask[pixel_index] != 0)
@@ -1033,6 +1065,16 @@ pub fn render_tile_cached(
     } else {
         None
     };
+    let refinement_smooth_values_output = if render_mode == "final" && unresolved_count > 0 {
+        smooth_values.clone()
+    } else {
+        None
+    };
+    let refinement_escaped_mask_output = if render_mode == "final" && unresolved_count > 0 {
+        escaped_mask.clone()
+    } else {
+        None
+    };
 
     if unresolved_count > 0 {
         fill_render_unresolved_preview(&mut rgba, &mut unresolved_mask, width, height);
@@ -1059,6 +1101,8 @@ pub fn render_tile_cached(
         height,
         rgba,
         unresolved_mask_output,
+        refinement_smooth_values_output,
+        refinement_escaped_mask_output,
         unresolved_clusters,
         elapsed_ms,
         glitch_count,
@@ -1182,6 +1226,8 @@ pub fn render_tile_exact(
         height,
         rgba,
         None,
+        None,
+        None,
         Vec::new(),
         js_sys::Date::now() - started,
         0,
@@ -1208,6 +1254,13 @@ struct ExactInput {
     mask: Option<Vec<u8>>,
 }
 
+struct RefinementInput {
+    rgba: Vec<u8>,
+    mask: Vec<u8>,
+    smooth_values: Vec<f32>,
+    escaped_mask: Vec<u8>,
+}
+
 fn prepare_exact_input(width: usize, height: usize, base_rgba: Uint8Array, exact_mask: Uint8Array) -> ExactInput {
     let pixel_count = width * height;
     let rgba = if base_rgba.length() as usize == pixel_count * 4 {
@@ -1221,6 +1274,30 @@ fn prepare_exact_input(width: usize, height: usize, base_rgba: Uint8Array, exact
         None
     };
     ExactInput { rgba, mask }
+}
+
+fn prepare_refinement_input(
+    width: usize,
+    height: usize,
+    base_rgba: Uint8Array,
+    refinement_mask: Uint8Array,
+    refinement_smooth_values: Float32Array,
+    refinement_escaped_mask: Uint8Array,
+) -> Option<RefinementInput> {
+    let pixel_count = width * height;
+    if base_rgba.length() as usize != pixel_count * 4
+        || refinement_mask.length() as usize != pixel_count
+        || refinement_smooth_values.length() as usize != pixel_count
+        || refinement_escaped_mask.length() as usize != pixel_count
+    {
+        return None;
+    }
+    Some(RefinementInput {
+        rgba: base_rgba.to_vec(),
+        mask: refinement_mask.to_vec(),
+        smooth_values: refinement_smooth_values.to_vec(),
+        escaped_mask: refinement_escaped_mask.to_vec(),
+    })
 }
 
 fn should_render_exact_pixel(mask: Option<&[u8]>, pixel_index: usize) -> bool {
@@ -1864,6 +1941,8 @@ fn build_render_tile_value(
     height: usize,
     rgba: Vec<u8>,
     unresolved_mask: Option<Vec<u8>>,
+    refinement_smooth_values: Option<Vec<f32>>,
+    refinement_escaped_mask: Option<Vec<u8>>,
     unresolved_clusters: Vec<UnresolvedCluster64>,
     elapsed_ms: f64,
     glitch_count: u32,
@@ -1895,6 +1974,14 @@ fn build_render_tile_value(
     if let Some(mask) = unresolved_mask {
         let mask_array = Uint8Array::from(mask.as_slice());
         set_js_property(&object, "unresolvedMask", &mask_array.buffer().into())?;
+    }
+    if let Some(values) = refinement_smooth_values {
+        let values_array = Float32Array::from(values.as_slice());
+        set_js_property(&object, "refinementSmoothValues", &values_array.buffer().into())?;
+    }
+    if let Some(mask) = refinement_escaped_mask {
+        let mask_array = Uint8Array::from(mask.as_slice());
+        set_js_property(&object, "refinementEscapedMask", &mask_array.buffer().into())?;
     }
     set_js_property(
         &object,

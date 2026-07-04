@@ -178,5 +178,5 @@ export class ReferenceClient {
 }
 
 export function resolveReferenceWorkerCount(hardwareConcurrency = globalThis.navigator?.hardwareConcurrency ?? 4): number {
-  return Math.min(8, Math.max(1, Math.floor(hardwareConcurrency / 2)));
+  return Math.min(12, Math.max(1, Math.floor(hardwareConcurrency * 0.75)));
 }

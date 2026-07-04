@@ -78,6 +78,10 @@ interface TileWorkState {
   createdFromPatch: boolean;
   exactBaseRgba: ArrayBuffer | undefined;
   exactUnresolvedMask: ArrayBuffer | undefined;
+  refinementBaseRgba: ArrayBuffer | undefined;
+  refinementUnresolvedMask: ArrayBuffer | undefined;
+  refinementSmoothValues: ArrayBuffer | undefined;
+  refinementEscapedMask: ArrayBuffer | undefined;
 }
 
 type TileShell = Omit<TileDescriptor, "centerRe" | "centerIm">;
@@ -525,7 +529,11 @@ export async function startApp(root: HTMLElement): Promise<void> {
       exactFallback: false,
       createdFromPatch: false,
       exactBaseRgba: undefined,
-      exactUnresolvedMask: undefined
+      exactUnresolvedMask: undefined,
+      refinementBaseRgba: undefined,
+      refinementUnresolvedMask: undefined,
+      refinementSmoothValues: undefined,
+      refinementEscapedMask: undefined
     };
     tileStates.set(tile.id, state);
     pendingTileIds.add(tile.id);
@@ -644,7 +652,11 @@ export async function startApp(root: HTMLElement): Promise<void> {
           renderMode: state.forceExact ? "exact" : "final",
           sampleStep: 1,
           exactBaseRgba: state.exactBaseRgba,
-          exactUnresolvedMask: state.exactUnresolvedMask
+          exactUnresolvedMask: state.exactUnresolvedMask,
+          refinementBaseRgba: state.forceExact ? undefined : state.refinementBaseRgba,
+          refinementUnresolvedMask: state.forceExact ? undefined : state.refinementUnresolvedMask,
+          refinementSmoothValues: state.forceExact ? undefined : state.refinementSmoothValues,
+          refinementEscapedMask: state.forceExact ? undefined : state.refinementEscapedMask
         },
         priority
       );
@@ -669,6 +681,10 @@ export async function startApp(root: HTMLElement): Promise<void> {
       if (result.stats.unresolvedCount > 0) {
         renderer.uploadTile(result);
         state.previewUploaded = true;
+        state.refinementBaseRgba = result.rgba.slice(0);
+        state.refinementUnresolvedMask = result.unresolvedMask?.slice(0);
+        state.refinementSmoothValues = result.refinementSmoothValues?.slice(0);
+        state.refinementEscapedMask = result.refinementEscapedMask?.slice(0);
         state.lastReferencePressure = unresolvedPressure(state, result.stats.unresolvedCount);
         state.stalledRefinementRounds = nextStalledRefinementRounds(
           state.lastUnresolvedCount,
@@ -686,7 +702,10 @@ export async function startApp(root: HTMLElement): Promise<void> {
           }
         }
 
+        if (shouldSplitUnresolvedTile(state, result) && scheduleSplitFallback(localRuntime, state, result)) return;
+
         if (state.refinementLevel >= maxReferenceRefinementRounds(localRuntime)) {
+          if (scheduleSplitFallback(localRuntime, state, result)) return;
           await scheduleExactFallback(localRuntime, state, result);
           return;
         }
@@ -698,15 +717,21 @@ export async function startApp(root: HTMLElement): Promise<void> {
           return;
         }
         if (state.stalledRefinementRounds >= STALLED_ROUNDS_BEFORE_EXACT || !canRequestMoreReferences(state, localRuntime)) {
+          if (scheduleSplitFallback(localRuntime, state, result)) return;
           await scheduleExactFallback(localRuntime, state, result);
           return;
         }
         if (requestCenterReference(localRuntime, state, highestPrecisionForState(state, localRuntime) + 64)) return;
+        if (scheduleSplitFallback(localRuntime, state, result)) return;
         await scheduleExactFallback(localRuntime, state, result);
         return;
       }
 
       renderer.uploadTile(result);
+      state.refinementBaseRgba = undefined;
+      state.refinementUnresolvedMask = undefined;
+      state.refinementSmoothValues = undefined;
+      state.refinementEscapedMask = undefined;
       state.completed = true;
       stats.completedTiles += 1;
       pendingTileIds.delete(state.tile.id);
@@ -789,7 +814,19 @@ export async function startApp(root: HTMLElement): Promise<void> {
 
   function maxRenderReferencesForState(state: TileWorkState): number {
     if (state.refinementLevel <= 1) return Math.min(2, MAX_RENDER_REFERENCES);
-    return Math.min(4, MAX_RENDER_REFERENCES);
+    if (state.refinementLevel <= 4) return Math.min(4, MAX_RENDER_REFERENCES);
+    if (state.refinementLevel <= 8) return Math.min(8, MAX_RENDER_REFERENCES);
+    return Math.min(12, MAX_RENDER_REFERENCES);
+  }
+
+  function shouldSplitUnresolvedTile(state: TileWorkState, result: TileDoneMessage): boolean {
+    if (state.splitLevel >= 4 || state.refinementLevel < 4 || result.stats.unresolvedCount <= 0) return false;
+    const pixelCount = Math.max(1, result.width * result.height);
+    if (result.stats.unresolvedCount / pixelCount > 0.15) return false;
+    const rects = exactPatchRects(state.tile.rect, result.stats.unresolvedClusters).filter((rect) => canUseSplitPatch(state.tile.rect, rect));
+    if (rects.length === 0) return false;
+    const patchArea = rects.reduce((sum, rect) => sum + rectArea(rect), 0);
+    return patchArea / Math.max(1, rectArea(state.tile.rect)) <= 0.6;
   }
 
   function queueClusterReferences(localRuntime: RuntimeView, state: TileWorkState, clusters: UnresolvedCluster[]): number {
@@ -909,6 +946,36 @@ export async function startApp(root: HTMLElement): Promise<void> {
     }
   }
 
+  function scheduleSplitFallback(localRuntime: RuntimeView, state: TileWorkState, result: TileDoneMessage): boolean {
+    const tile = state.tile;
+    if (tile.revision !== revision) return false;
+    const rects = exactPatchRects(tile.rect, result.stats.unresolvedClusters)
+      .filter((rect) => canUseSplitPatch(tile.rect, rect));
+    if (rects.length === 0 || patchTilesCreated + rects.length > patchTileLimit) return false;
+
+    pendingTileIds.delete(tile.id);
+    tileStates.delete(tile.id);
+    patchTilesCreated += rects.length;
+    stats.pending = pendingWorkCount();
+    stats.status = "splitting";
+
+    for (let index = 0; index < rects.length; index += 1) {
+      const patch = createPatchTile(localRuntime, tile, rects[index], `split:${index}`);
+      const child = createTileState(patch, state.referenceIds, state.splitLevel + 1);
+      child.createdFromPatch = true;
+      child.previewUploaded = true;
+      child.refinementLevel = Math.min(state.refinementLevel, 5);
+      child.refinementBaseRgba = undefined;
+      child.refinementUnresolvedMask = undefined;
+      child.refinementSmoothValues = undefined;
+      child.refinementEscapedMask = undefined;
+      child.lastUnresolvedCount = undefined;
+      void submitTile(localRuntime, child);
+    }
+    syncPinnedReferences();
+    return true;
+  }
+
   async function scheduleExactFallback(localRuntime: RuntimeView, state: TileWorkState, result: TileDoneMessage): Promise<void> {
     const tile = state.tile;
     if (tile.revision !== revision) return;
@@ -949,6 +1016,14 @@ export async function startApp(root: HTMLElement): Promise<void> {
       void submitTile(localRuntime, child);
     }
     syncPinnedReferences();
+  }
+
+  function canUseSplitPatch(tileRect: Rect, rect: Rect): boolean {
+    const tileArea = rectArea(tileRect);
+    const rectAreaValue = rectArea(rect);
+    if (rectAreaValue <= 0 || rectAreaValue >= tileArea) return false;
+    if (rect.width >= tileRect.width && rect.height >= tileRect.height) return false;
+    return rect.width >= 1 && rect.height >= 1;
   }
 
   function buildExactPatchInput(result: TileDoneMessage, rect: Rect): ExactPatchInput | undefined {
@@ -993,6 +1068,10 @@ export async function startApp(root: HTMLElement): Promise<void> {
   }
 
   function createExactPatchTile(localRuntime: RuntimeView, parent: TileDescriptor, rect: TileDescriptor["rect"], index: number): TileDescriptor {
+    return createPatchTile(localRuntime, parent, rect, `exact:${index}`);
+  }
+
+  function createPatchTile(localRuntime: RuntimeView, parent: TileDescriptor, rect: TileDescriptor["rect"], suffix: string): TileDescriptor {
     const centerScreenX = rect.x + rect.width * 0.5;
     const centerScreenY = rect.y + rect.height * 0.5;
     const center = pointToViewCenterNow(view, localRuntime.width, localRuntime.height, centerScreenX, centerScreenY);
@@ -1003,7 +1082,7 @@ export async function startApp(root: HTMLElement): Promise<void> {
       span: Math.max(1, Math.ceil(Math.max(rect.width, rect.height)))
     };
     return {
-      id: `${tileKeyToId(key, parent.revision)}:exact:${index}`,
+      id: `${tileKeyToId(key, parent.revision)}:${suffix}`,
       key,
       rect,
       centerScreenX,

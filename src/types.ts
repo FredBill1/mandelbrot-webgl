@@ -75,6 +75,10 @@ export interface RenderTileMessage {
   sampleStep: number;
   exactBaseRgba?: ArrayBuffer;
   exactUnresolvedMask?: ArrayBuffer;
+  refinementBaseRgba?: ArrayBuffer;
+  refinementUnresolvedMask?: ArrayBuffer;
+  refinementSmoothValues?: ArrayBuffer;
+  refinementEscapedMask?: ArrayBuffer;
 }
 
 export type FailureKind = "earlyReferenceEscape" | "cancellationGlitch" | "deltaOverflow" | "rebaseLimit" | "seriesUnsafe";
@@ -136,6 +140,8 @@ export interface TileDoneMessage {
   height: number;
   rgba: ArrayBuffer;
   unresolvedMask?: ArrayBuffer;
+  refinementSmoothValues?: ArrayBuffer;
+  refinementEscapedMask?: ArrayBuffer;
   stats: TileStats;
   needsReference: boolean;
 }
