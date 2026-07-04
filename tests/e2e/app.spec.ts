@@ -122,6 +122,71 @@ test("lets users switch between formula and fixed iteration controls", async ({ 
   expect(new URL(page.url()).searchParams.get("iter")).toBe("900");
 });
 
+test("docks controls vertically on desktop and toggles them offscreen", async ({ page }) => {
+  await page.setViewportSize({ width: 900, height: 360 });
+  await page.goto("/");
+  await expect(page.locator("#readStatus")).not.toHaveText("");
+
+  const visible = await readUiLayout(page);
+  expect(visible.rail.right).toBeLessThanOrEqual(900);
+  expect(visible.rail.left).toBeGreaterThan(450);
+  expect(visible.toolbar.top).toBeGreaterThan(visible.hud.bottom);
+  expect(visible.iter.top).toBeGreaterThan(visible.toolbar.bottom);
+  expect(visible.rail.scrollHeight).toBeGreaterThan(visible.rail.clientHeight);
+  expect(visible.rail.scrollWidth).toBe(visible.rail.clientWidth);
+  expect(visible.toggle.left).toBeGreaterThanOrEqual(0);
+
+  await page.locator("#uiToggle").click();
+  await expect(page.locator("#uiToggle")).toHaveAttribute("aria-expanded", "false");
+  await expect(page.locator("#uiRail")).toHaveAttribute("aria-hidden", "true");
+  expect(await page.locator("#uiRail").evaluate((element) => (element as HTMLElement).inert)).toBe(true);
+  await page.waitForTimeout(260);
+
+  const hidden = await readUiLayout(page);
+  expect(hidden.rail.left).toBeGreaterThanOrEqual(hidden.viewport.width);
+  expect(hidden.toggle.left).toBeGreaterThanOrEqual(0);
+  expect(hidden.toggle.right).toBeGreaterThanOrEqual(hidden.viewport.width - 1);
+  expect(hidden.toggle.right).toBeLessThanOrEqual(hidden.viewport.width);
+
+  await page.locator("#uiToggle").click();
+  await expect(page.locator("#uiToggle")).toHaveAttribute("aria-expanded", "true");
+  await expect(page.locator("#uiRail")).toHaveAttribute("aria-hidden", "false");
+});
+
+test("docks controls horizontally on small screens and keeps them scrollable", async ({ page }) => {
+  await page.setViewportSize({ width: 420, height: 760 });
+  await page.goto("/");
+  await expect(page.locator("#readStatus")).not.toHaveText("");
+
+  const visible = await readUiLayout(page);
+  expect(visible.rail.bottom).toBeLessThanOrEqual(760);
+  expect(visible.rail.top).toBeGreaterThan(420);
+  expect(visible.toolbar.left).toBeGreaterThan(visible.hud.right);
+  expect(visible.iter.left).toBeGreaterThan(visible.toolbar.right);
+  expect(visible.toolbar.width).toBeLessThan(120);
+  expect(visible.deep.top).toBeGreaterThan(visible.home.bottom);
+  expect(Math.abs(visible.hud.height - visible.toolbar.height)).toBeLessThanOrEqual(1);
+  expect(Math.abs(visible.hud.height - visible.iter.height)).toBeLessThanOrEqual(1);
+  expect(visible.rail.scrollWidth).toBeGreaterThan(visible.rail.clientWidth);
+  expect(visible.rail.scrollHeight).toBe(visible.rail.clientHeight);
+  expect(visible.toggle.top).toBeGreaterThan(0);
+
+  await page.locator("#uiToggle").click();
+  await expect(page.locator("#uiToggle")).toHaveAttribute("aria-expanded", "false");
+  await page.waitForTimeout(260);
+
+  const hidden = await readUiLayout(page);
+  expect(hidden.rail.top).toBeGreaterThanOrEqual(hidden.viewport.height);
+  expect(hidden.toggle.top).toBeGreaterThanOrEqual(0);
+  expect(hidden.toggle.bottom).toBeGreaterThanOrEqual(hidden.viewport.height - 1);
+  expect(hidden.toggle.bottom).toBeLessThanOrEqual(hidden.viewport.height);
+
+  await page.locator("#uiToggle").click();
+  await expect(page.locator("#uiToggle")).toHaveAttribute("aria-expanded", "true");
+  await page.locator("#deepButton").click();
+  await expect(page.locator("#readStatus")).toContainText(/rendering|stable/);
+});
+
 test("supports pinch zoom with two touch pointers", async ({ page, browserName }) => {
   test.skip(browserName !== "chromium", "CDP touch injection is Chromium-specific");
   await page.setViewportSize({ width: 800, height: 600 });
@@ -362,6 +427,42 @@ test("anti aliasing removes pepper noise on the reported edge view", async ({ pa
   );
   expect(speckleRatio).toBeLessThanOrEqual(0.04);
 });
+
+async function readUiLayout(page: import("@playwright/test").Page) {
+  return page.evaluate(() => {
+    const rect = (selector: string) => {
+      const element = document.querySelector<HTMLElement>(selector);
+      if (!element) throw new Error(`Missing ${selector}`);
+      const bounds = element.getBoundingClientRect();
+      return {
+        left: bounds.left,
+        top: bounds.top,
+        right: bounds.right,
+        bottom: bounds.bottom,
+        width: bounds.width,
+        height: bounds.height
+      };
+    };
+    const rail = document.querySelector<HTMLElement>("#uiRail");
+    if (!rail) throw new Error("Missing #uiRail");
+    return {
+      viewport: { width: window.innerWidth, height: window.innerHeight },
+      rail: {
+        ...rect("#uiRail"),
+        clientWidth: rail.clientWidth,
+        clientHeight: rail.clientHeight,
+        scrollWidth: rail.scrollWidth,
+        scrollHeight: rail.scrollHeight
+      },
+      toggle: rect("#uiToggle"),
+      hud: rect(".hud"),
+      toolbar: rect(".toolbar"),
+      home: rect("#homeButton"),
+      deep: rect("#deepButton"),
+      iter: rect(".iterPanel")
+    };
+  });
+}
 
 async function waitForNonBlankCanvas(page: import("@playwright/test").Page, timeout = 15_000): Promise<void> {
   await expect(page.locator("#readStatus")).toHaveText("stable", { timeout });

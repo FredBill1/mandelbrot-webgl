@@ -141,56 +141,73 @@ export async function startApp(root: HTMLElement): Promise<void> {
   root.innerHTML = `
     <main class="shell">
       <canvas id="fractal" aria-label="Mandelbrot deep zoom canvas"></canvas>
-      <section class="hud" aria-live="polite">
-        <div class="hudRow"><span>Re</span><strong id="readRe"></strong></div>
-        <div class="hudRow"><span>Im</span><strong id="readIm"></strong></div>
-        <div class="hudRow"><span>Scale</span><strong id="readScale"></strong></div>
-        <div class="hudRow"><span>Iter</span><strong id="readIter"></strong></div>
-        <div class="hudRow"><span>Workers</span><strong id="readWorkers"></strong></div>
-        <div class="hudRow"><span>Tiles</span><strong id="readTiles"></strong></div>
-        <div class="hudRow"><span>Refs</span><strong id="readRefs"></strong></div>
-        <div class="hudRow"><span>FPS</span><strong id="readFps"></strong></div>
-        <div class="hudRow"><span>Status</span><strong id="readStatus"></strong></div>
-      </section>
-      <div class="controls">
-        <nav class="toolbar" aria-label="View controls">
-          <button id="homeButton" title="Reset view">Home</button>
-          <button id="deepButton" title="Jump to a 1e100 validation location">1e100</button>
-        </nav>
-        <section class="iterPanel" aria-label="Iteration controls">
-          <div class="iterHeader">
-            <span>Iterations</span>
-            <div class="segmented" role="group" aria-label="Iteration mode">
-              <button id="iterDefaultMode" type="button">Formula</button>
-              <button id="iterFixedMode" type="button">Fixed</button>
+      <aside id="uiDock" class="uiDock" aria-label="Display controls">
+        <button
+          id="uiToggle"
+          class="uiToggle"
+          type="button"
+          aria-controls="uiRail"
+          aria-expanded="true"
+          aria-label="Hide controls"
+          title="Hide controls"
+        >
+          <span aria-hidden="true"></span>
+        </button>
+        <div id="uiRail" class="uiRail">
+          <section class="hud" aria-live="polite">
+            <div class="hudRow"><span>Re</span><strong id="readRe"></strong></div>
+            <div class="hudRow"><span>Im</span><strong id="readIm"></strong></div>
+            <div class="hudRow"><span>Scale</span><strong id="readScale"></strong></div>
+            <div class="hudRow"><span>Iter</span><strong id="readIter"></strong></div>
+            <div class="hudRow"><span>Workers</span><strong id="readWorkers"></strong></div>
+            <div class="hudRow"><span>Tiles</span><strong id="readTiles"></strong></div>
+            <div class="hudRow"><span>Refs</span><strong id="readRefs"></strong></div>
+            <div class="hudRow"><span>FPS</span><strong id="readFps"></strong></div>
+            <div class="hudRow"><span>Status</span><strong id="readStatus"></strong></div>
+          </section>
+          <nav class="toolbar" aria-label="View controls">
+            <button id="homeButton" title="Reset view">Home</button>
+            <button id="deepButton" title="Jump to a 1e100 validation location">1e100</button>
+          </nav>
+          <section class="iterPanel" aria-label="Iteration controls">
+            <div class="iterHeader">
+              <span>Iterations</span>
+              <div class="segmented" role="group" aria-label="Iteration mode">
+                <button id="iterDefaultMode" type="button">Formula</button>
+                <button id="iterFixedMode" type="button">Fixed</button>
+              </div>
             </div>
-          </div>
-          <label class="iterControl" data-mode="default">
-            <span>Base</span>
-            <input id="iterBaseRange" type="range" min="${ITER_MIN}" max="${ITER_MAX}" step="1" />
-            <input id="iterBaseInput" type="number" min="${ITER_MIN}" max="${ITER_MAX}" step="1" />
-          </label>
-          <label class="iterControl" data-mode="default">
-            <span>Slope</span>
-            <input id="iterSlopeRange" type="range" min="${ITER_SLOPE_MIN}" max="${ITER_SLOPE_MAX}" step="1" />
-            <input id="iterSlopeInput" type="number" min="${ITER_SLOPE_MIN}" max="${ITER_SLOPE_MAX}" step="1" />
-          </label>
-          <label class="iterControl" data-mode="default">
-            <span>Cap</span>
-            <input id="iterCapRange" type="range" min="${ITER_MIN}" max="${ITER_MAX}" step="1" />
-            <input id="iterCapInput" type="number" min="${ITER_MIN}" max="${ITER_MAX}" step="1" />
-          </label>
-          <label class="iterControl" data-mode="fixed">
-            <span>Fixed</span>
-            <input id="iterFixedRange" type="range" min="${ITER_MIN}" max="${ITER_MAX}" step="1" />
-            <input id="iterFixedInput" type="number" min="${ITER_MIN}" max="${ITER_MAX}" step="1" />
-          </label>
-        </section>
-      </div>
+            <label class="iterControl" data-mode="default">
+              <span>Base</span>
+              <input id="iterBaseRange" type="range" min="${ITER_MIN}" max="${ITER_MAX}" step="1" />
+              <input id="iterBaseInput" type="number" min="${ITER_MIN}" max="${ITER_MAX}" step="1" />
+            </label>
+            <label class="iterControl" data-mode="default">
+              <span>Slope</span>
+              <input id="iterSlopeRange" type="range" min="${ITER_SLOPE_MIN}" max="${ITER_SLOPE_MAX}" step="1" />
+              <input id="iterSlopeInput" type="number" min="${ITER_SLOPE_MIN}" max="${ITER_SLOPE_MAX}" step="1" />
+            </label>
+            <label class="iterControl" data-mode="default">
+              <span>Cap</span>
+              <input id="iterCapRange" type="range" min="${ITER_MIN}" max="${ITER_MAX}" step="1" />
+              <input id="iterCapInput" type="number" min="${ITER_MIN}" max="${ITER_MAX}" step="1" />
+            </label>
+            <label class="iterControl" data-mode="fixed">
+              <span>Fixed</span>
+              <input id="iterFixedRange" type="range" min="${ITER_MIN}" max="${ITER_MAX}" step="1" />
+              <input id="iterFixedInput" type="number" min="${ITER_MIN}" max="${ITER_MAX}" step="1" />
+            </label>
+          </section>
+        </div>
+      </aside>
     </main>
   `;
 
   const canvas = requireElement(root, "#fractal", HTMLCanvasElement);
+  const uiDock = requireElement(root, "#uiDock", HTMLElement);
+  const uiRail = requireElement(root, "#uiRail", HTMLElement);
+  const uiToggle = requireElement(root, "#uiToggle", HTMLButtonElement);
+  let uiHidden = false;
 
   await initWasm();
 
@@ -234,7 +251,13 @@ export async function startApp(root: HTMLElement): Promise<void> {
   renderToken += 1;
   bindIterControls();
   syncIterControls();
+  syncUiVisibility();
   scheduleTiles("initial", renderToken);
+
+  uiToggle.addEventListener("click", () => {
+    uiHidden = !uiHidden;
+    syncUiVisibility();
+  });
 
   root.querySelector<HTMLButtonElement>("#homeButton")?.addEventListener("click", () => {
     activateView(withResolvedIter(DEFAULT_VIEW), "home", { resetRetained: true });
@@ -308,6 +331,16 @@ export async function startApp(root: HTMLElement): Promise<void> {
     requestAnimationFrame(frame);
   }
   requestAnimationFrame(frame);
+
+  function syncUiVisibility(): void {
+    uiDock.classList.toggle("uiHidden", uiHidden);
+    uiToggle.setAttribute("aria-expanded", String(!uiHidden));
+    uiToggle.setAttribute("aria-label", uiHidden ? "Show controls" : "Hide controls");
+    uiToggle.title = uiHidden ? "Show controls" : "Hide controls";
+    uiRail.setAttribute("aria-hidden", String(uiHidden));
+    uiRail.inert = uiHidden;
+    if (uiHidden && uiRail.contains(document.activeElement)) uiToggle.focus();
+  }
 
   function activateView(next: ViewState, reason: string, options: ActivateViewOptions = {}): void {
     const previousRevision = revision;

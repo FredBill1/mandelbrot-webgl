@@ -44,11 +44,76 @@ button {
   cursor: grabbing;
 }
 
-.hud {
+.uiDock {
   position: fixed;
   top: 14px;
-  left: 14px;
-  width: min(360px, calc(100vw - 28px));
+  right: 14px;
+  bottom: 14px;
+  z-index: 10;
+  width: min(390px, calc(100vw - 70px));
+  pointer-events: none;
+  transform: translateX(0);
+  transition: transform 220ms ease;
+}
+
+.uiDock.uiHidden {
+  transform: translateX(calc(100% + 22px));
+}
+
+.uiRail {
+  display: grid;
+  gap: 8px;
+  max-height: 100%;
+  overflow-x: hidden;
+  overflow-y: auto;
+  padding-right: 2px;
+  overscroll-behavior: contain;
+  pointer-events: auto;
+  scrollbar-width: thin;
+  transition: opacity 180ms ease;
+}
+
+.uiDock.uiHidden .uiRail {
+  opacity: 0;
+  pointer-events: none;
+}
+
+.uiToggle {
+  position: absolute;
+  top: 0;
+  left: -42px;
+  display: grid;
+  width: 34px;
+  height: 42px;
+  place-items: center;
+  border: 1px solid rgba(220, 230, 240, 0.18);
+  border-radius: 8px;
+  background: rgba(8, 12, 18, 0.78);
+  backdrop-filter: blur(12px);
+  box-shadow: 0 10px 26px rgba(0, 0, 0, 0.24);
+  color: #eef3f8;
+  cursor: pointer;
+  pointer-events: auto;
+}
+
+.uiToggle:hover {
+  background: rgba(20, 28, 38, 0.86);
+}
+
+.uiToggle span {
+  display: block;
+  width: 14px;
+  height: 14px;
+  background: currentColor;
+  clip-path: polygon(30% 18%, 30% 82%, 80% 50%);
+}
+
+.uiDock.uiHidden .uiToggle span {
+  clip-path: polygon(70% 18%, 70% 82%, 20% 50%);
+}
+
+.hud {
+  width: 100%;
   padding: 10px 12px;
   border: 1px solid rgba(220, 230, 240, 0.14);
   border-radius: 8px;
@@ -80,18 +145,10 @@ button {
   white-space: nowrap;
 }
 
-.controls {
-  position: fixed;
-  right: 14px;
-  bottom: 14px;
-  display: grid;
-  width: min(390px, calc(100vw - 28px));
-  gap: 8px;
-}
-
 .toolbar {
   display: flex;
   gap: 8px;
+  width: 100%;
   padding: 8px;
   border: 1px solid rgba(220, 230, 240, 0.14);
   border-radius: 8px;
@@ -117,6 +174,7 @@ button {
 .iterPanel {
   display: grid;
   gap: 10px;
+  width: 100%;
   padding: 10px;
   border: 1px solid rgba(220, 230, 240, 0.14);
   border-radius: 8px;
@@ -211,22 +269,66 @@ button {
   color: #ffb7b7;
 }
 
-@media (max-width: 620px) {
-  .hud {
-    right: 10px;
-    left: 10px;
-    width: auto;
-  }
-
-  .controls {
+@media (max-width: 720px) {
+  .uiDock {
+    top: auto;
     right: 10px;
     bottom: 10px;
     left: 10px;
     width: auto;
+    transform: translateY(0);
+  }
+
+  .uiDock.uiHidden {
+    transform: translateY(calc(100% + 18px));
+  }
+
+  .uiRail {
+    display: flex;
+    align-items: stretch;
+    max-height: none;
+    max-width: 100%;
+    overflow-x: auto;
+    overflow-y: hidden;
+    padding-right: 0;
+    padding-bottom: 2px;
+  }
+
+  .uiToggle {
+    top: -42px;
+    right: 0;
+    left: auto;
+    width: 42px;
+    height: 34px;
+  }
+
+  .uiToggle span {
+    clip-path: polygon(18% 30%, 82% 30%, 50% 80%);
+  }
+
+  .uiDock.uiHidden .uiToggle span {
+    clip-path: polygon(18% 70%, 82% 70%, 50% 20%);
+  }
+
+  .hud {
+    flex: 0 0 330px;
+    width: 330px;
   }
 
   .toolbar {
-    justify-content: flex-end;
+    flex: 0 0 auto;
+    flex-direction: column;
+    align-items: stretch;
+    justify-content: flex-start;
+    width: max-content;
+  }
+
+  .toolbar button {
+    width: 74px;
+  }
+
+  .iterPanel {
+    flex: 0 0 min(390px, calc(100vw - 20px));
   }
 
   .iterControl {
