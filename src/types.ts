@@ -2,7 +2,7 @@ export const BASE_VIEW_WIDTH = 3.5;
 export const TILE_SIZE = 128;
 export const TEXTURE_CACHE_BYTES = 256 * 1024 * 1024;
 export const REFERENCE_CACHE_SOFT_BYTES = 128 * 1024 * 1024;
-export const SERIES_DEGREE = 4;
+export const SERIES_DEGREE = 12;
 
 export interface ViewState {
   re: string;
@@ -51,6 +51,7 @@ export interface ReferenceSnapshot {
   screenY: number;
   precisionBits: number;
   escapedAt: number;
+  interiorRadius: number;
   maxIter: number;
   revision: number;
   orbitRe: Float64Array;

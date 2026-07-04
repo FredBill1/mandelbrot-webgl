@@ -12,6 +12,7 @@ export interface Complex {
 
 const MAX_SERIES_TILE_RADIUS = 1e-3;
 const SERIES_ERROR_SCALE = 1e-7;
+const SERIES_SKIP_SATURATION = 0.7;
 
 export function buildSeriesPlan(
   orbitRe: ArrayLike<number>,
@@ -22,6 +23,35 @@ export function buildSeriesPlan(
   probes: readonly Complex[] = [{ re: 0, im: 0 }]
 ): SeriesPlan {
   const normalizedDegree = Math.max(0, Math.floor(degree));
+  if (normalizedDegree > 2) {
+    let best = buildSeriesPlanForDegree(orbitRe, orbitIm, 2, maxSkip, tileRadius, probes);
+    if (isSeriesSkipSaturated(best.skip, maxSkip, orbitRe, orbitIm)) return best;
+    for (const candidateDegree of [4, 8, 12]) {
+      if (candidateDegree > normalizedDegree) break;
+      const candidate = buildSeriesPlanForDegree(orbitRe, orbitIm, candidateDegree, maxSkip, tileRadius, probes);
+      if (candidate.skip > best.skip || (candidate.skip === best.skip && candidate.degree < best.degree)) {
+        best = candidate;
+      }
+      if (isSeriesSkipSaturated(best.skip, maxSkip, orbitRe, orbitIm)) break;
+    }
+    return best;
+  }
+  return buildSeriesPlanForDegree(orbitRe, orbitIm, normalizedDegree, maxSkip, tileRadius, probes);
+}
+
+function isSeriesSkipSaturated(skip: number, maxSkip: number, orbitRe: ArrayLike<number>, orbitIm: ArrayLike<number>): boolean {
+  const availableSkip = Math.max(0, Math.min(Math.floor(maxSkip), orbitRe.length - 1, orbitIm.length - 1));
+  return availableSkip > 0 && skip >= Math.ceil(availableSkip * SERIES_SKIP_SATURATION);
+}
+
+function buildSeriesPlanForDegree(
+  orbitRe: ArrayLike<number>,
+  orbitIm: ArrayLike<number>,
+  normalizedDegree: number,
+  maxSkip: number,
+  tileRadius: number,
+  probes: readonly Complex[]
+): SeriesPlan {
   const coeffRe = new Float64Array(normalizedDegree + 1);
   const coeffIm = new Float64Array(normalizedDegree + 1);
   if (

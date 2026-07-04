@@ -553,7 +553,7 @@ export async function startApp(root: HTMLElement): Promise<void> {
           renderMode: "preview",
           sampleStep: previewSampleStep(state.tile)
         },
-        0
+        previewRenderPriority()
       );
       state.previewInFlight = false;
       if (result.revision !== revision || state.tile.revision !== revision) return;
@@ -578,6 +578,15 @@ export async function startApp(root: HTMLElement): Promise<void> {
             updateWorkStatus("refining");
             return;
           }
+        }
+      }
+      if (shouldRequestInteriorCenterReference(state, result)) {
+        const precisionBits = highestPrecisionForState(state, activeRuntime);
+        if (requestCenterReference(activeRuntime, state, precisionBits)) {
+          stats.pending = pendingWorkCount();
+          stats.status = "refining";
+          updateWorkStatus("refining");
+          return;
         }
       }
       updateWorkStatus("rendering");
@@ -652,11 +661,6 @@ export async function startApp(root: HTMLElement): Promise<void> {
           state.stalledRefinementRounds
         );
         state.lastUnresolvedCount = result.stats.unresolvedCount;
-
-        if (shouldUseExactFallbackNow(localRuntime, result)) {
-          await scheduleExactFallback(localRuntime, state, result);
-          return;
-        }
 
         if (shouldRequestCenterReferenceFirst(localRuntime, state, result.stats.referenceIdsUsed)) {
           const queuedCenter = requestCenterReference(localRuntime, state, highestPrecisionForState(state, localRuntime) + 32);
@@ -769,8 +773,8 @@ export async function startApp(root: HTMLElement): Promise<void> {
   }
 
   function maxRenderReferencesForState(state: TileWorkState): number {
-    void state;
-    return MAX_RENDER_REFERENCES;
+    if (state.refinementLevel <= 1) return Math.min(2, MAX_RENDER_REFERENCES);
+    return Math.min(4, MAX_RENDER_REFERENCES);
   }
 
   function queueClusterReferences(localRuntime: RuntimeView, state: TileWorkState, clusters: UnresolvedCluster[]): number {
@@ -1070,6 +1074,10 @@ export async function startApp(root: HTMLElement): Promise<void> {
     return 1;
   }
 
+  function previewRenderPriority(): number {
+    return pendingTileShells > 0 ? -3 : -0.5;
+  }
+
   function finalRenderPriority(state: TileWorkState): number {
     const previewCost = Math.min(300, Math.max(0, state.lastPreviewElapsedMs));
     const unresolvedCost = Math.min(200, state.lastPreviewUnresolvedCount * 0.2);
@@ -1101,7 +1109,7 @@ export async function startApp(root: HTMLElement): Promise<void> {
           renderMode: "preview",
           sampleStep: VIEWPORT_PREVIEW_SAMPLE_STEP
         },
-        -2
+        -4
       );
       if (token !== renderToken || result.revision !== revision) return;
       renderer.uploadTile(result);
@@ -1187,12 +1195,15 @@ export async function startApp(root: HTMLElement): Promise<void> {
     return decimalLog10(localRuntime.scale) >= 12 ? MAX_DEEP_REFERENCE_REFINEMENT_ROUNDS : MAX_REFERENCE_REFINEMENT_ROUNDS;
   }
 
-  function shouldUseExactFallbackNow(localRuntime: RuntimeView, result: TileDoneMessage): boolean {
-    if (!result.unresolvedMask || result.stats.unresolvedCount <= 0) return false;
-    const logScale = decimalLog10(localRuntime.scale);
-    if (logScale < 8) return false;
-    const threshold = logScale >= 12 ? 256 : 1024;
-    return result.stats.unresolvedCount <= threshold;
+  function shouldRequestInteriorCenterReference(state: TileWorkState, result: TileDoneMessage): boolean {
+    if (state.centerReferenceAttempted || state.localReferenceRequests > 0 || state.pendingReferences > 0) return false;
+    const pixelCount = Math.max(1, result.width * result.height);
+    const unresolvedPressure = result.stats.unresolvedCount / pixelCount;
+    return (
+      result.stats.escapedPixels === 0 &&
+      (result.stats.unresolvedCount === 0 || unresolvedPressure >= HIGH_REFERENCE_PRESSURE) &&
+      result.stats.periodicInteriorCount / pixelCount < 0.1
+    );
   }
 
   function referenceCellSizeForCluster(cluster: UnresolvedCluster): number {

@@ -134,7 +134,8 @@ export class TileWorkerPool {
 }
 
 export function resolveWorkerCount(hardwareConcurrency = globalThis.navigator?.hardwareConcurrency ?? 4): number {
-  return Math.max(1, Math.floor(hardwareConcurrency));
+  if (hardwareConcurrency <= 1) return 1;
+  return Math.max(1, Math.floor(hardwareConcurrency * 2));
 }
 
 function defaultPriority(message: RenderTileMessage): number {

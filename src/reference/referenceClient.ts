@@ -28,6 +28,7 @@ export interface RawReferenceResult {
   centerIm: string;
   precisionBits: number;
   escapedAt: number;
+  interiorRadius: number;
   orbitRe: Float64Array;
   orbitIm: Float64Array;
 }
@@ -177,5 +178,5 @@ export class ReferenceClient {
 }
 
 export function resolveReferenceWorkerCount(hardwareConcurrency = globalThis.navigator?.hardwareConcurrency ?? 4): number {
-  return Math.min(2, Math.max(1, Math.floor(hardwareConcurrency / 4)));
+  return Math.min(8, Math.max(1, Math.floor(hardwareConcurrency / 2)));
 }

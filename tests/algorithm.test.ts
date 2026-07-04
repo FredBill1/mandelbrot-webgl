@@ -1,6 +1,6 @@
 import { beforeAll, describe, expect, it } from "vitest";
 import { readFileSync } from "node:fs";
-import init, { apply_view_transform, compute_reference, compute_reference_3mul, compute_reference_sparse, direct_escape } from "../src/wasm/pkg/mandelbrot_wasm";
+import init, { apply_view_transform, compute_reference, compute_reference_3mul, compute_reference_sparse, direct_escape, estimate_reference_interior_radius } from "../src/wasm/pkg/mandelbrot_wasm";
 import { createVisibleTileShells } from "../src/tiles/tileKey";
 import { renderPerturbationTile } from "../src/workers/perturbation";
 import { renderPerturbationTileWasm, resetWasmPerturbationCacheForTests } from "../src/workers/wasmPerturbation";
@@ -469,6 +469,97 @@ describe("perturbation renderer", () => {
     expect(result.stats.aaSampleCount).toBeLessThanOrEqual(2560);
   });
 
+  it("does not certify the reported 1e27 false periodic sample in the WASM cached renderer", async () => {
+    const view = {
+      re: "4.3792424135946285718646361930043170565329095266291420488816260206742136590487596e-1",
+      im: "3.4189208433811610894511184773165189135789717878674952119590075744029026125433273e-1",
+      scale: "1.0835064437740330620649324308790033236032009031542860476819043611262629043597067e27",
+      maxIter: 2243
+    };
+    const screen = { x: 1111.7, y: 160.6 };
+    const point = highPrecisionPointAtScreen(view, screen.x, screen.y, 1912, 948);
+    const direct = direct_escape(point.re, point.im, view.maxIter, 4096);
+    const reference = makeReference(point.re, point.im, view.maxIter, 512, screen.x, screen.y);
+    const tile: TileDescriptor = {
+      id: "false-periodic-wasm",
+      key: { level: 0, x: 0, y: 0, span: 1 },
+      rect: { x: screen.x - 0.5, y: screen.y - 0.5, width: 1, height: 1 },
+      centerScreenX: screen.x,
+      centerScreenY: screen.y,
+      centerRe: point.re,
+      centerIm: point.im,
+      revision: 1
+    };
+
+    resetWasmPerturbationCacheForTests();
+    const result = await renderPerturbationTileWasm({
+      type: "renderTile",
+      tile,
+      canvasWidth: 1912,
+      canvasHeight: 948,
+      viewScale: view.scale,
+      pixelSpan: pixelSpan(view.scale, 1912),
+      maxIter: view.maxIter,
+      references: [reference],
+      seriesDegree: SERIES_DEGREE,
+      paletteId: "cosine",
+      refined: true,
+      refinementLevel: 1,
+      renderMode: "final",
+      sampleStep: 1
+    });
+
+    expect(direct).toBeLessThan(view.maxIter);
+    expect(result.stats.periodicInteriorCount).toBe(0);
+    expect(result.stats.unresolvedCount).toBe(0);
+    expect(result.stats.escapedPixels).toBe(1);
+  });
+
+  it("certifies reference-relative period-2 interior blocks in the WASM cached renderer", async () => {
+    const width = 32;
+    const height = 32;
+    const scale = "100";
+    const maxIter = 128;
+    const reference = makeReference("-1", "0", maxIter, 128, width * 0.5, height * 0.5);
+    const tile: TileDescriptor = {
+      id: "reference-certified-period-2",
+      key: { level: 0, x: 0, y: 0, span: width },
+      rect: { x: 0, y: 0, width, height },
+      centerScreenX: width * 0.5,
+      centerScreenY: height * 0.5,
+      centerRe: "-1",
+      centerIm: "0",
+      revision: 1
+    };
+
+    resetWasmPerturbationCacheForTests();
+    const result = await renderPerturbationTileWasm({
+      type: "renderTile",
+      tile,
+      canvasWidth: width,
+      canvasHeight: height,
+      viewScale: scale,
+      pixelSpan: pixelSpan(scale, width),
+      maxIter,
+      references: [reference],
+      seriesDegree: SERIES_DEGREE,
+      paletteId: "cosine",
+      refined: true,
+      refinementLevel: 1,
+      renderMode: "final",
+      sampleStep: 1
+    });
+
+    expect(result.stats.unresolvedCount).toBe(0);
+    expect(result.stats.escapedPixels).toBe(0);
+    expect(result.stats.periodicInteriorCount).toBe(width * height);
+    const bytes = new Uint8Array(result.rgba);
+    for (let offset = 0; offset < bytes.length; offset += 4 * 97) {
+      expect(bytes[offset] + bytes[offset + 1] + bytes[offset + 2]).toBeLessThanOrEqual(40);
+      expect(bytes[offset + 3]).toBe(255);
+    }
+  });
+
   it("resolves the 1912x948 deep interior sample without refinement", () => {
     const view = {
       re: "-1.5738375605512487151154265653948631632264711132220526532084658732407373266127815e0",
@@ -650,6 +741,8 @@ describe("perturbation renderer", () => {
 
 function makeReference(re: string, im: string, maxIter: number, precisionBits: number, screenX = 0.5, screenY = 0.5): ReferenceSnapshot {
   const raw = compute_reference(re, im, maxIter, precisionBits) as RawReference;
+  const orbitRe = raw.orbit_re instanceof Float64Array ? raw.orbit_re : new Float64Array(raw.orbit_re);
+  const orbitIm = raw.orbit_im instanceof Float64Array ? raw.orbit_im : new Float64Array(raw.orbit_im);
   return {
     id: "test-ref",
     centerRe: raw.center_re,
@@ -658,10 +751,11 @@ function makeReference(re: string, im: string, maxIter: number, precisionBits: n
     screenY,
     precisionBits: raw.precision_bits,
     escapedAt: raw.escaped_at,
+    interiorRadius: estimate_reference_interior_radius(raw.escaped_at, maxIter, orbitRe, orbitIm),
     maxIter,
     revision: 1,
-    orbitRe: raw.orbit_re instanceof Float64Array ? raw.orbit_re : new Float64Array(raw.orbit_re),
-    orbitIm: raw.orbit_im instanceof Float64Array ? raw.orbit_im : new Float64Array(raw.orbit_im)
+    orbitRe,
+    orbitIm
   };
 }
 

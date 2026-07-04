@@ -137,13 +137,14 @@ function putReference(numericId: number, reference: ReferenceSnapshot): void {
     reference.screenY,
     reference.escapedAt,
     reference.maxIter,
+    reference.interiorRadius,
     asFloat64(reference.orbitRe),
     asFloat64(reference.orbitIm)
   );
 }
 
 function referenceCacheKey(reference: ReferenceSnapshot): string {
-  return `${reference.revision}|${reference.id}|${reference.screenX}|${reference.screenY}|${reference.escapedAt}|${reference.maxIter}`;
+  return `${reference.revision}|${reference.id}|${reference.screenX}|${reference.screenY}|${reference.escapedAt}|${reference.maxIter}|${reference.interiorRadius}`;
 }
 
 function normalizeRgbaBuffer(value: unknown): ArrayBuffer {

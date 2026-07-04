@@ -45,6 +45,15 @@ const RAINBOW_NOISE_REGRESSION_URL =
   "/?re=-7.44743856455867584502971474051977658103817187893185200400939609851583632432852598231790469e-1&im=-1.35593942108114561959508453803647827165860206496504860209432696505792919260554145799490801e-1&scale=2.5723755590577444907048627502998122776921365543852726093737771835857766320092045519877944e2&iter=667";
 const ANTI_ALIASING_PEPPER_REGRESSION_URL =
   "/?re=-7.47689723441669939527017253976715439192679851461831874268821803604290203278587516851291729e-1&im=-7.22121932539053588116373452229159661989232396616246710140552835347280711817029504503225198e-2&scale=1.47647815655772413738325308653033716994542630984542066793843052404878099060420525511068532e4&iter=779";
+const TILE_EDGE_STRIPE_REGRESSION_URL =
+  "/?re=-7.47058923830677172637465716958601050178238459796401120563138311051740403989739537513387692e-1&im=-9.02333390881196912445043591041816477037301725271975723099794599405573445075541691219218423e-2&scale=5.95653801318458424494811292043527003967000942264323805684287564004180700059580065965587753e6";
+const REPORTED_INTERIOR_PERFORMANCE_VIEWS = [
+  "/?re=-1.1257397657301325439972230515997209520613044826021924611013993759582727462837647199843872e0&im=-2.63359294664505520032151212049212698578945273361152731968738849510276867533004652329837119e-1&scale=2.83557495047450223543249716015972746789962659367598078011974223737616687921440259198156578e3",
+  "/?re=-1.12600997907991589078966883643508860863586283945543450132120638790851859625175396984211583e0&im=-2.63568831182114856578871320311966693404083840260713337021920764797237400042112179495938257e-1&scale=1.55619652783714923159368677783330267864989296425986665680680538989238710992832234279105968e3",
+  "/?re=-1.24994804348634009008713229074114186140984825556477615904319367083118495401527859228143389e0&im=8.30455933847431207826151305922658218333400769507904154948862303126448066761146393258500679e-3&scale=5.40364937246687433931311901229167474670606863452761543450732353692065500910770831197666263e5"
+] as const;
+const REPORTED_DEEP_PERFORMANCE_VIEW =
+  "/?re=-7.46883943431692760541919532714409859232606639886333750701092541165643808224287821342188522092587382149759799587046156756309863566112516698524311312263708365547443519e-1&im=-1.00525982411215876752593698920114371641511074291356983067885243750788193219078894211160534174388216978954526887172496458449660477900264112017850945405489228557321858e-1&scale=1e100";
 const UNSAFE_ACCELERATION_TILE_REGRESSIONS = [
   {
     url:
@@ -457,6 +466,71 @@ test("anti aliasing removes pepper noise on the reported edge view", async ({ pa
   expect(speckleRatio).toBeLessThanOrEqual(0.04);
 });
 
+test("does not draw dark horizontal tile-edge bands on the reported view", async ({ page }) => {
+  test.setTimeout(90_000);
+  await page.setViewportSize({ width: 1912, height: 948 });
+  await page.goto(TILE_EDGE_STRIPE_REGRESSION_URL);
+  await waitForNonBlankCanvas(page, 75_000);
+
+  const tileCounts = await readTileCounts(page);
+  expect(tileCounts.completed).toBe(tileCounts.total);
+
+  const seam = await readHorizontalDarkSeamScore(page, 128);
+  expect(seam.maxDarkDropRatio).toBeLessThanOrEqual(0.08);
+});
+
+test("stabilizes the reported interior-heavy views under five seconds", async ({ page }) => {
+  test.setTimeout(30_000);
+  await installInteractionWorkerProbe(page);
+  await page.setViewportSize({ width: 1912, height: 948 });
+
+  for (const url of REPORTED_INTERIOR_PERFORMANCE_VIEWS) {
+    const started = Date.now();
+    await page.goto(url);
+    await expect(page.locator("#readStatus")).toHaveText("stable", { timeout: 5_000 });
+    const stableMs = Date.now() - started;
+    expect(stableMs).toBeLessThan(5_000);
+
+    const tileCounts = await readTileCounts(page);
+    expect(tileCounts.completed).toBe(tileCounts.total);
+    const probe = await readInteractionWorkerProbe(page);
+    expect(probe.renderMessages.filter((message) => message.mode === "exact")).toHaveLength(0);
+    for (const [x, y] of [
+      [0.25, 0.25],
+      [0.5, 0.5],
+      [0.75, 0.75]
+    ] as const) {
+      const pixel = await readCanvasPixel(page, x, y);
+      expect(pixel[3]).toBe(255);
+    }
+  }
+});
+
+test("stabilizes the reported e100 deep view under five seconds", async ({ page }) => {
+  test.setTimeout(30_000);
+  await installInteractionWorkerProbe(page);
+  await page.setViewportSize({ width: 1912, height: 948 });
+
+  const started = Date.now();
+  await page.goto(REPORTED_DEEP_PERFORMANCE_VIEW);
+  await expect(page.locator("#readStatus")).toHaveText("stable", { timeout: 5_000 });
+  const stableMs = Date.now() - started;
+  expect(stableMs).toBeLessThan(5_000);
+
+  const tileCounts = await readTileCounts(page);
+  expect(tileCounts.completed).toBe(tileCounts.total);
+  const probe = await readInteractionWorkerProbe(page);
+  expect(probe.renderMessages.filter((message) => message.mode === "exact")).toHaveLength(0);
+  for (const [x, y] of [
+    [0.25, 0.25],
+    [0.5, 0.5],
+    [0.75, 0.75]
+  ] as const) {
+    const pixel = await readCanvasPixel(page, x, y);
+    expect(pixel[3]).toBe(255);
+  }
+});
+
 async function readUiLayout(page: import("@playwright/test").Page) {
   return page.evaluate(() => {
     const rect = (selector: string) => {
@@ -687,6 +761,49 @@ async function readTileCounts(page: import("@playwright/test").Page): Promise<{ 
 async function readReferenceCount(page: import("@playwright/test").Page): Promise<number> {
   const text = await page.locator("#readRefs").textContent();
   return Number(text ?? Number.POSITIVE_INFINITY);
+}
+
+async function readHorizontalDarkSeamScore(
+  page: import("@playwright/test").Page,
+  tileSize: number
+): Promise<{ maxDarkDropRatio: number; row: number }> {
+  return page.evaluate((tileSize) => {
+    const canvas = document.querySelector<HTMLCanvasElement>("#fractal");
+    const gl = canvas?.getContext("webgl2", { alpha: false, antialias: false, preserveDrawingBuffer: true });
+    if (!canvas || !gl) return { maxDarkDropRatio: Number.POSITIVE_INFINITY, row: -1 };
+    const width = canvas.width;
+    const height = canvas.height;
+    const pixels = new Uint8Array(width * height * 4);
+    gl.readPixels(0, 0, width, height, gl.RGBA, gl.UNSIGNED_BYTE, pixels);
+    const lumaAt = (x: number, screenY: number) => {
+      const y = height - 1 - screenY;
+      const offset = (y * width + x) * 4;
+      return 0.2126 * pixels[offset] + 0.7152 * pixels[offset + 1] + 0.0722 * pixels[offset + 2];
+    };
+    let maxDarkDropRatio = 0;
+    let row = -1;
+    const sampleRight = Math.max(1, width - 96);
+    for (let screenY = tileSize; screenY < height - 2; screenY += tileSize) {
+      let darkDrops = 0;
+      let compared = 0;
+      for (let x = 0; x < sampleRight; x += 1) {
+        const seam = lumaAt(x, screenY);
+        const upper = lumaAt(x, screenY - 2);
+        const lower = lumaAt(x, screenY + 2);
+        const neighbor = (upper + lower) * 0.5;
+        if (neighbor > 75) {
+          compared += 1;
+          if (seam < 45 && neighbor - seam > 55) darkDrops += 1;
+        }
+      }
+      const ratio = darkDrops / Math.max(1, compared);
+      if (ratio > maxDarkDropRatio) {
+        maxDarkDropRatio = ratio;
+        row = screenY;
+      }
+    }
+    return { maxDarkDropRatio, row };
+  }, tileSize);
 }
 
 async function readCanvasSpeckleRatio(

@@ -14,6 +14,7 @@ describe("ReferenceManager", () => {
           centerIm,
           precisionBits: minPrecisionBits,
           escapedAt,
+          interiorRadius: 0,
           orbitRe: new Float64Array(escapedAt + 1),
           orbitIm: new Float64Array(escapedAt + 1)
         } satisfies RawReferenceResult;
@@ -102,9 +103,9 @@ describe("ReferenceManager", () => {
 
   it("caps reference worker count to a small CPU fraction", () => {
     expect(resolveReferenceWorkerCount(1)).toBe(1);
-    expect(resolveReferenceWorkerCount(8)).toBe(2);
-    expect(resolveReferenceWorkerCount(16)).toBe(2);
-    expect(resolveReferenceWorkerCount(64)).toBe(2);
+    expect(resolveReferenceWorkerCount(8)).toBe(4);
+    expect(resolveReferenceWorkerCount(16)).toBe(8);
+    expect(resolveReferenceWorkerCount(64)).toBe(8);
   });
 });
 
@@ -129,6 +130,7 @@ function makeRawReference(
     centerIm,
     precisionBits,
     escapedAt,
+    interiorRadius: 0,
     orbitRe: new Float64Array(escapedAt + 1),
     orbitIm: new Float64Array(escapedAt + 1)
   };

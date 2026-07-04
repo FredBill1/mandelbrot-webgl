@@ -1,4 +1,4 @@
-import init, { compute_reference, estimate_precision_bits } from "../wasm/pkg/mandelbrot_wasm";
+import init, { compute_reference, estimate_precision_bits, estimate_reference_interior_radius } from "../wasm/pkg/mandelbrot_wasm";
 
 interface ComputeReferenceIn {
   type: "computeReference";
@@ -28,6 +28,7 @@ self.onmessage = async (event: MessageEvent<ComputeReferenceIn>) => {
     };
     const orbitRe = raw.orbit_re instanceof Float64Array ? raw.orbit_re : new Float64Array(raw.orbit_re);
     const orbitIm = raw.orbit_im instanceof Float64Array ? raw.orbit_im : new Float64Array(raw.orbit_im);
+    const interiorRadius = estimate_reference_interior_radius(raw.escaped_at, event.data.maxIter, orbitRe, orbitIm);
     self.postMessage(
       {
         type: "referenceDone",
@@ -37,6 +38,7 @@ self.onmessage = async (event: MessageEvent<ComputeReferenceIn>) => {
           centerIm: raw.center_im,
           precisionBits: raw.precision_bits,
           escapedAt: raw.escaped_at,
+          interiorRadius,
           orbitRe,
           orbitIm
         }

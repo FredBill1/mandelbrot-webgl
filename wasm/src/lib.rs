@@ -576,8 +576,16 @@ struct CachedRenderReference {
     external_id: String,
     screen_x: f64,
     screen_y: f64,
+    escaped_at: u32,
+    max_iter: u32,
     orbit_re: Rc<Vec<f64>>,
     orbit_im: Rc<Vec<f64>>,
+    interior_certificate: Option<ReferenceInteriorCertificate64>,
+}
+
+#[derive(Clone, Copy)]
+struct ReferenceInteriorCertificate64 {
+    radius: f64,
 }
 
 struct RenderContext {
@@ -630,6 +638,15 @@ struct PeriodicScratch64 {
     checkpoint_re: [f64; 32],
     checkpoint_im: [f64; 32],
     checkpoint_iter: [u32; 32],
+}
+
+#[derive(Clone, Copy)]
+struct PeriodDerivatives64 {
+    z: Complex64,
+    dz_dz: Complex64,
+    dz_dc: Complex64,
+    d_dz_dz: Complex64,
+    d_dc_dz: Complex64,
 }
 
 #[derive(Clone)]
@@ -722,14 +739,15 @@ const RENDER_MAX_REBASES_PER_PIXEL: u32 = 64;
 const RENDER_SERIES_MAX_SKIP: usize = 8192;
 const RENDER_MAX_SERIES_TILE_RADIUS: f64 = 1e-3;
 const RENDER_SERIES_ERROR_SCALE: f64 = 1e-7;
+const RENDER_SERIES_SKIP_SATURATION: f64 = 0.7;
 const RENDER_SMOOTH_DELTA_LOW: f64 = 6.0;
 const RENDER_SMOOTH_DELTA_HIGH: f64 = 24.0;
 const RENDER_CLASSIFICATION_EDGE_BOOST: f64 = 0.35;
 const RENDER_AA_EDGE_THRESHOLD: f64 = 0.45;
-const RENDER_AA_PIXEL_CAP: usize = 512;
-const RENDER_AA_PIXEL_FRACTION: f64 = 0.04;
-const RENDER_AA_FOUR_SAMPLE_CAP: usize = 128;
-const RENDER_AA_FOUR_SAMPLE_FRACTION: f64 = 0.01;
+const RENDER_AA_PIXEL_CAP: usize = 96;
+const RENDER_AA_PIXEL_FRACTION: f64 = 0.01;
+const RENDER_AA_FOUR_SAMPLE_CAP: usize = 24;
+const RENDER_AA_FOUR_SAMPLE_FRACTION: f64 = 0.0025;
 const RENDER_MIN_EDGE_CHROMA_SCALE: f64 = 0.35;
 const RENDER_PALETTE_SIZE: usize = 2048;
 const RENDER_INV_LN2: f64 = std::f64::consts::LOG2_E;
@@ -741,6 +759,13 @@ const RENDER_FOUR_SAMPLE_OFFSETS: [(f64, f64); 4] = [
     (-0.125, 0.375),
     (0.375, 0.125),
 ];
+const RENDER_REFERENCE_INTERIOR_MAX_PERIOD: usize = 256;
+const RENDER_REFERENCE_INTERIOR_MAX_CANDIDATES: usize = 3;
+const RENDER_REFERENCE_INTERIOR_MAX_PERIOD_SCORE: f64 = 3e-6;
+const RENDER_REFERENCE_INTERIOR_MAX_C_VARIANCE: f64 = 1e-8;
+const RENDER_REFERENCE_INTERIOR_DISTANCE_SCALE: f64 = 0.25;
+const RENDER_REFERENCE_INTERIOR_RADIUS_SAFETY: f64 = 0.90;
+const RENDER_REFERENCE_INTERIOR_MIN_BLOCK_SIZE: usize = 16;
 
 #[wasm_bindgen]
 pub fn reset_render_cache(_revision: u32) {
@@ -753,17 +778,33 @@ pub fn put_render_reference(
     external_id: &str,
     screen_x: f64,
     screen_y: f64,
-    _escaped_at: u32,
-    _max_iter: u32,
+    escaped_at: u32,
+    max_iter: u32,
+    interior_radius: f64,
     orbit_re: Float64Array,
     orbit_im: Float64Array,
 ) {
+    let orbit_re = orbit_re.to_vec();
+    let orbit_im = orbit_im.to_vec();
+    let interior_certificate = if escaped_at >= max_iter
+        && interior_radius.is_finite()
+        && interior_radius > 0.0
+    {
+        Some(ReferenceInteriorCertificate64 {
+            radius: interior_radius,
+        })
+    } else {
+        None
+    };
     let reference = CachedRenderReference {
         external_id: external_id.to_string(),
         screen_x,
         screen_y,
-        orbit_re: Rc::new(orbit_re.to_vec()),
-        orbit_im: Rc::new(orbit_im.to_vec()),
+        escaped_at,
+        max_iter,
+        orbit_re: Rc::new(orbit_re),
+        orbit_im: Rc::new(orbit_im),
+        interior_certificate,
     };
     RENDER_REFERENCE_CACHE.with(|cache| {
         cache.borrow_mut().insert(numeric_id, reference);
@@ -802,6 +843,11 @@ pub fn render_tile_cached(
     let mut contexts = build_render_contexts(rect, pixel_span, &ref_ids)?;
     let palette = create_render_palette();
     let mut rgba = vec![0u8; width * height * 4];
+    let mut certified_interior_mask = if render_mode == "final" {
+        Some(vec![0u8; width * height])
+    } else {
+        None
+    };
     let mut scratch = PeriodicScratch64 {
         checkpoint_re: [0.0; 32],
         checkpoint_im: [0.0; 32],
@@ -838,6 +884,24 @@ pub fn render_tile_cached(
     } else {
         None
     };
+    if render_mode == "final" {
+        if let Some(mask) = certified_interior_mask.as_mut() {
+            periodic_interior_count += certify_render_blocks_from_references64(
+                mask,
+                &mut rgba,
+                smooth_values.as_deref_mut(),
+                &mut used_reference_indices,
+                width,
+                height,
+                rect,
+                normalized_sample_step,
+                pixel_span,
+                max_iter,
+                &contexts,
+                &palette,
+            );
+        }
+    }
     let screen_xs: Vec<f64> = (0..width)
         .map(|px| {
             (rect.x + rect.width - 0.5).min(rect.x + (px as f64 + 0.5) * normalized_sample_step)
@@ -853,6 +917,12 @@ pub fn render_tile_cached(
         let screen_y = screen_ys[py];
         for px in 0..width {
             let pixel_index = py * width + px;
+            if certified_interior_mask
+                .as_ref()
+                .is_some_and(|mask| mask[pixel_index] != 0)
+            {
+                continue;
+            }
             let screen_x = screen_xs[px];
             let selection = render_pixel_with_references64(
                 screen_x,
@@ -1047,31 +1117,6 @@ pub fn render_tile_exact(
     };
     let width = rect.width.ceil().max(1.0) as usize;
     let height = rect.height.ceil().max(1.0) as usize;
-    if let (Ok(scale_f64), Ok(center_re_f64), Ok(center_im_f64)) = (
-        scale.parse::<f64>(),
-        center_re.parse::<f64>(),
-        center_im.parse::<f64>(),
-    ) {
-        if scale_f64.is_finite() && scale_f64 > 0.0 && scale_f64 <= 1e12 {
-            return render_tile_exact_f64(
-                tile_id,
-                revision,
-                rect,
-                width,
-                height,
-                center_re_f64,
-                center_im_f64,
-                center_screen_x,
-                center_screen_y,
-                scale_f64,
-                canvas_width,
-                max_iter,
-                started,
-                base_rgba,
-                exact_mask,
-            );
-        }
-    }
     let bits = precision_bits
         .max(estimate_precision_bits(scale, max_iter))
         .max(128);
@@ -1158,99 +1203,6 @@ pub fn render_tile_exact(
     )
 }
 
-#[allow(clippy::too_many_arguments)]
-fn render_tile_exact_f64(
-    tile_id: &str,
-    revision: u32,
-    rect: Rect64,
-    width: usize,
-    height: usize,
-    center_re: f64,
-    center_im: f64,
-    center_screen_x: f64,
-    center_screen_y: f64,
-    scale: f64,
-    canvas_width: f64,
-    max_iter: u32,
-    started: f64,
-    base_rgba: Uint8Array,
-    exact_mask: Uint8Array,
-) -> Result<JsValue, JsValue> {
-    let pixel_span = BASE_VIEW_WIDTH / scale / canvas_width.max(1.0);
-    let palette = create_render_palette();
-    let exact_input = prepare_exact_input(width, height, base_rgba, exact_mask);
-    let mut rgba = exact_input.rgba;
-    let mask = exact_input.mask;
-    let mut escaped_pixels = 0u32;
-    let mut exact_pixels = 0u32;
-    let mut iter_stats = empty_render_iter_stats(max_iter);
-    let mut escaped_mask = vec![0u8; width * height];
-    let mut cap_hit_unknown_mask = vec![0u8; width * height];
-    let unresolved_mask = vec![0u8; width * height];
-
-    for py in 0..height {
-        let screen_y = (rect.y + rect.height - 0.5).min(rect.y + py as f64 + 0.5);
-        let ci = center_im + (screen_y - center_screen_y) * pixel_span;
-        for px in 0..width {
-            let pixel_index = py * width + px;
-            if !should_render_exact_pixel(mask.as_deref(), pixel_index) {
-                continue;
-            }
-            exact_pixels += 1;
-            let screen_x = (rect.x + rect.width - 0.5).min(rect.x + px as f64 + 0.5);
-            let cr = center_re + (screen_x - center_screen_x) * pixel_span;
-            let exact = run_exact_escape_f64(cr, ci, max_iter);
-            if exact.iter < max_iter {
-                escaped_pixels += 1;
-                record_render_escaped_iter(&mut iter_stats, exact.iter, max_iter);
-                escaped_mask[pixel_index] = 1;
-            } else {
-                iter_stats.cap_hit_unknown_count += 1;
-                cap_hit_unknown_mask[pixel_index] = 1;
-            }
-            let smooth = render_smooth_iteration(exact.iter, max_iter, exact.mag2);
-            write_render_color_for_smooth(
-                &mut rgba,
-                pixel_index * 4,
-                exact.iter >= max_iter,
-                smooth,
-                &palette,
-            );
-        }
-    }
-    iter_stats.cap_hit_boundary_count =
-        count_render_cap_hit_boundary(&cap_hit_unknown_mask, &escaped_mask, &unresolved_mask, width, height);
-    let iter_summary = summarize_render_iter_stats(iter_stats);
-
-    build_render_tile_value(
-        tile_id,
-        revision,
-        rect,
-        width,
-        height,
-        rgba,
-        None,
-        Vec::new(),
-        js_sys::Date::now() - started,
-        0,
-        0,
-        escaped_pixels,
-        0,
-        iter_summary,
-        0,
-        0,
-        0,
-        0,
-        0,
-        empty_render_boundary_stats(),
-        Vec::new(),
-        None,
-        None,
-        "exact",
-        exact_pixels,
-    )
-}
-
 struct ExactInput {
     rgba: Vec<u8>,
     mask: Option<Vec<u8>>,
@@ -1278,25 +1230,6 @@ fn should_render_exact_pixel(mask: Option<&[u8]>, pixel_index: usize) -> bool {
 struct ExactEscape64 {
     iter: u32,
     mag2: f64,
-}
-
-fn run_exact_escape_f64(cr: f64, ci: f64, max_iter: u32) -> ExactEscape64 {
-    let mut zr = 0.0;
-    let mut zi = 0.0;
-    for iter in 0..max_iter {
-        let mag2 = zr * zr + zi * zi;
-        if iter > 0 && mag2 > 4.0 {
-            return ExactEscape64 { iter, mag2 };
-        }
-        let next_re = zr * zr - zi * zi + cr;
-        let next_im = 2.0 * zr * zi + ci;
-        zr = next_re;
-        zi = next_im;
-    }
-    ExactEscape64 {
-        iter: max_iter,
-        mag2: zr * zr + zi * zi,
-    }
 }
 
 fn run_exact_escape_with_mag2(
@@ -1329,6 +1262,574 @@ fn run_exact_escape_with_mag2(
         iter: max_iter,
         mag2: bf_to_f64(&mag2),
     }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn certify_render_blocks_from_references64(
+    mask: &mut [u8],
+    rgba: &mut [u8],
+    mut smooth_values: Option<&mut [f32]>,
+    used_reference_indices: &mut [u8],
+    width: usize,
+    height: usize,
+    rect: Rect64,
+    sample_step: f64,
+    pixel_span: f64,
+    max_iter: u32,
+    contexts: &[RenderContext],
+    palette: &[u8],
+) -> u32 {
+    if width == 0 || height == 0 || contexts.is_empty() {
+        return 0;
+    }
+    let mut certified = 0u32;
+    certify_render_block_from_references64(
+        mask,
+        rgba,
+        &mut smooth_values,
+        used_reference_indices,
+        width,
+        rect,
+        sample_step,
+        pixel_span,
+        max_iter,
+        contexts,
+        palette,
+        0,
+        0,
+        width,
+        height,
+        &mut certified,
+    );
+    certified
+}
+
+#[allow(clippy::too_many_arguments)]
+fn certify_render_block_from_references64(
+    mask: &mut [u8],
+    rgba: &mut [u8],
+    smooth_values: &mut Option<&mut [f32]>,
+    used_reference_indices: &mut [u8],
+    stride: usize,
+    rect: Rect64,
+    sample_step: f64,
+    pixel_span: f64,
+    max_iter: u32,
+    contexts: &[RenderContext],
+    palette: &[u8],
+    x0: usize,
+    y0: usize,
+    block_width: usize,
+    block_height: usize,
+    certified: &mut u32,
+) {
+    if block_width == 0 || block_height == 0 {
+        return;
+    }
+
+    if let Some(reference_index) = certifying_reference_for_block64(
+        contexts,
+        rect,
+        sample_step,
+        pixel_span,
+        x0,
+        y0,
+        block_width,
+        block_height,
+    ) {
+        fill_certified_reference_block64(
+            mask,
+            rgba,
+            smooth_values,
+            stride,
+            x0,
+            y0,
+            block_width,
+            block_height,
+            max_iter,
+            palette,
+        );
+        if let Some(used) = used_reference_indices.get_mut(reference_index) {
+            *used = 1;
+        }
+        *certified += (block_width * block_height) as u32;
+        return;
+    }
+
+    if block_width <= RENDER_REFERENCE_INTERIOR_MIN_BLOCK_SIZE
+        && block_height <= RENDER_REFERENCE_INTERIOR_MIN_BLOCK_SIZE
+    {
+        return;
+    }
+
+    if block_width >= block_height && block_width > RENDER_REFERENCE_INTERIOR_MIN_BLOCK_SIZE {
+        let left_width = block_width / 2;
+        let right_width = block_width - left_width;
+        certify_render_block_from_references64(
+            mask,
+            rgba,
+            smooth_values,
+            used_reference_indices,
+            stride,
+            rect,
+            sample_step,
+            pixel_span,
+            max_iter,
+            contexts,
+            palette,
+            x0,
+            y0,
+            left_width,
+            block_height,
+            certified,
+        );
+        certify_render_block_from_references64(
+            mask,
+            rgba,
+            smooth_values,
+            used_reference_indices,
+            stride,
+            rect,
+            sample_step,
+            pixel_span,
+            max_iter,
+            contexts,
+            palette,
+            x0 + left_width,
+            y0,
+            right_width,
+            block_height,
+            certified,
+        );
+    } else if block_height > RENDER_REFERENCE_INTERIOR_MIN_BLOCK_SIZE {
+        let top_height = block_height / 2;
+        let bottom_height = block_height - top_height;
+        certify_render_block_from_references64(
+            mask,
+            rgba,
+            smooth_values,
+            used_reference_indices,
+            stride,
+            rect,
+            sample_step,
+            pixel_span,
+            max_iter,
+            contexts,
+            palette,
+            x0,
+            y0,
+            block_width,
+            top_height,
+            certified,
+        );
+        certify_render_block_from_references64(
+            mask,
+            rgba,
+            smooth_values,
+            used_reference_indices,
+            stride,
+            rect,
+            sample_step,
+            pixel_span,
+            max_iter,
+            contexts,
+            palette,
+            x0,
+            y0 + top_height,
+            block_width,
+            bottom_height,
+            certified,
+        );
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn certifying_reference_for_block64(
+    contexts: &[RenderContext],
+    rect: Rect64,
+    sample_step: f64,
+    pixel_span: f64,
+    x0: usize,
+    y0: usize,
+    block_width: usize,
+    block_height: usize,
+) -> Option<usize> {
+    let screen_x = rect.x + (x0 as f64 + block_width as f64 * 0.5) * sample_step;
+    let screen_y = rect.y + (y0 as f64 + block_height as f64 * 0.5) * sample_step;
+    let block_radius = (block_width as f64 * sample_step)
+        .hypot(block_height as f64 * sample_step)
+        * 0.5
+        * pixel_span;
+    if !screen_x.is_finite() || !screen_y.is_finite() || !block_radius.is_finite() {
+        return None;
+    }
+
+    let mut best: Option<(usize, f64)> = None;
+    for (index, context) in contexts.iter().enumerate() {
+        let reference = &context.reference;
+        if reference.escaped_at < reference.max_iter {
+            continue;
+        }
+        let Some(certificate) = reference.interior_certificate else {
+            continue;
+        };
+        let center_delta = (screen_x - reference.screen_x)
+            .hypot(screen_y - reference.screen_y)
+            * pixel_span;
+        let covered_radius = certificate.radius * RENDER_REFERENCE_INTERIOR_RADIUS_SAFETY;
+        if center_delta + block_radius <= covered_radius {
+            let slack = covered_radius - center_delta - block_radius;
+            if best.is_none_or(|(_, best_slack)| slack > best_slack) {
+                best = Some((index, slack));
+            }
+        }
+    }
+    best.map(|(index, _)| index)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn fill_certified_reference_block64(
+    mask: &mut [u8],
+    rgba: &mut [u8],
+    smooth_values: &mut Option<&mut [f32]>,
+    stride: usize,
+    x0: usize,
+    y0: usize,
+    block_width: usize,
+    block_height: usize,
+    max_iter: u32,
+    palette: &[u8],
+) {
+    let smooth = max_iter as f64;
+    for y in y0..(y0 + block_height) {
+        for x in x0..(x0 + block_width) {
+            let index = y * stride + x;
+            mask[index] = 1;
+            if let Some(values) = smooth_values.as_deref_mut() {
+                values[index] = smooth as f32;
+            }
+            write_render_color_for_smooth(rgba, index * 4, true, smooth, palette);
+        }
+    }
+}
+
+fn reference_interior_certificate64(
+    orbit_re: &[f64],
+    orbit_im: &[f64],
+    max_iter: u32,
+) -> Option<ReferenceInteriorCertificate64> {
+    let len = orbit_re.len().min(orbit_im.len());
+    if len < 16 {
+        return None;
+    }
+    let last_index = (max_iter as usize).min(len - 1);
+    if last_index < 16 {
+        return None;
+    }
+
+    let mut best_radius = 0.0;
+    for period in candidate_reference_periods64(orbit_re, orbit_im, last_index) {
+        if let Some(radius) = reference_interior_radius_for_period64(
+            orbit_re,
+            orbit_im,
+            last_index,
+            period,
+        ) {
+            if radius > best_radius {
+                best_radius = radius;
+            }
+        }
+    }
+    if best_radius.is_finite() && best_radius > 0.0 {
+        Some(ReferenceInteriorCertificate64 {
+            radius: best_radius,
+        })
+    } else {
+        None
+    }
+}
+
+#[wasm_bindgen]
+pub fn estimate_reference_interior_radius(
+    escaped_at: u32,
+    max_iter: u32,
+    orbit_re: Float64Array,
+    orbit_im: Float64Array,
+) -> f64 {
+    if escaped_at < max_iter {
+        return 0.0;
+    }
+    reference_interior_certificate64(&orbit_re.to_vec(), &orbit_im.to_vec(), max_iter)
+        .map(|certificate| certificate.radius)
+        .filter(|radius| radius.is_finite() && *radius > 0.0)
+        .unwrap_or(0.0)
+}
+
+fn candidate_reference_periods64(
+    orbit_re: &[f64],
+    orbit_im: &[f64],
+    last_index: usize,
+) -> Vec<usize> {
+    let max_period = RENDER_REFERENCE_INTERIOR_MAX_PERIOD
+        .min(last_index / 2)
+        .max(1);
+    let mut candidates: Vec<(usize, f64)> = Vec::with_capacity(max_period);
+    for period in 1..=max_period {
+        let d1 = complex_distance2_from_orbit64(orbit_re, orbit_im, last_index, last_index - period);
+        let d2 = if last_index >= period * 2 {
+            complex_distance2_from_orbit64(
+                orbit_re,
+                orbit_im,
+                last_index - period,
+                last_index - period * 2,
+            )
+        } else {
+            d1
+        };
+        let score = d1.max(d2);
+        if score.is_finite() && score <= RENDER_REFERENCE_INTERIOR_MAX_PERIOD_SCORE {
+            candidates.push((period, score));
+        }
+    }
+    candidates.sort_by(|a, b| a.1.total_cmp(&b.1).then_with(|| a.0.cmp(&b.0)));
+    candidates.truncate(RENDER_REFERENCE_INTERIOR_MAX_CANDIDATES);
+    candidates.into_iter().map(|(period, _)| period).collect()
+}
+
+fn reference_interior_radius_for_period64(
+    orbit_re: &[f64],
+    orbit_im: &[f64],
+    last_index: usize,
+    period: usize,
+) -> Option<f64> {
+    if period == 0 || last_index < period {
+        return None;
+    }
+    let start = last_index - period;
+    let (c, c_variance) = estimate_reference_parameter64(orbit_re, orbit_im, start, period)?;
+    if !complex_is_finite(c)
+        || !c_variance.is_finite()
+        || c_variance > RENDER_REFERENCE_INTERIOR_MAX_C_VARIANCE
+    {
+        return None;
+    }
+
+    let mut z = orbit_point64(orbit_re, orbit_im, start)?;
+    for _ in 0..16 {
+        let derivatives = iterate_period_derivatives64(z, c, period)?;
+        let residual = complex_sub(derivatives.z, z);
+        let jacobian = complex_sub(derivatives.dz_dz, Complex64 { re: 1.0, im: 0.0 });
+        if complex_abs(jacobian) <= 1e-14 {
+            return None;
+        }
+        let delta = complex_div(residual, jacobian)?;
+        if !complex_is_finite(delta) {
+            return None;
+        }
+        z = complex_sub(z, delta);
+        if complex_abs(delta) <= 1e-14 {
+            break;
+        }
+    }
+
+    let period = reduce_reference_period64(z, c, period);
+    let derivatives = iterate_period_derivatives64(z, c, period)?;
+    let residual = complex_abs(complex_sub(derivatives.z, z));
+    let multiplier = complex_abs(derivatives.dz_dz);
+    if residual > 1e-10 || !multiplier.is_finite() || multiplier >= 0.995 {
+        return None;
+    }
+
+    let one_minus_multiplier = complex_sub(Complex64 { re: 1.0, im: 0.0 }, derivatives.dz_dz);
+    let correction = complex_div(derivatives.dz_dc, one_minus_multiplier)?;
+    let denominator = complex_add(
+        derivatives.d_dc_dz,
+        complex_mul(derivatives.d_dz_dz, correction),
+    );
+    let denominator_abs = complex_abs(denominator);
+    if !denominator_abs.is_finite() || denominator_abs <= 1e-30 {
+        return None;
+    }
+
+    let distance_estimate = (1.0 - multiplier * multiplier) / denominator_abs;
+    let radius = distance_estimate * RENDER_REFERENCE_INTERIOR_DISTANCE_SCALE
+        - residual * 32.0
+        - c_variance * 8.0;
+    if radius.is_finite() && radius > 0.0 {
+        Some(radius)
+    } else {
+        None
+    }
+}
+
+fn estimate_reference_parameter64(
+    orbit_re: &[f64],
+    orbit_im: &[f64],
+    start: usize,
+    period: usize,
+) -> Option<(Complex64, f64)> {
+    let mut values = Vec::with_capacity(period);
+    let mut sum = Complex64 { re: 0.0, im: 0.0 };
+    for offset in 0..period {
+        let z = orbit_point64(orbit_re, orbit_im, start + offset)?;
+        let next = orbit_point64(orbit_re, orbit_im, start + offset + 1)?;
+        let c = complex_sub(next, complex_mul(z, z));
+        if !complex_is_finite(c) {
+            return None;
+        }
+        sum = complex_add(sum, c);
+        values.push(c);
+    }
+    let c = complex_scale(sum, 1.0 / period as f64);
+    let mut max_variance: f64 = 0.0;
+    for value in values {
+        max_variance = max_variance.max(complex_abs(complex_sub(value, c)));
+    }
+    Some((c, max_variance))
+}
+
+fn reduce_reference_period64(z: Complex64, c: Complex64, period: usize) -> usize {
+    for candidate in 1..period {
+        if period % candidate != 0 {
+            continue;
+        }
+        let Some(derivatives) = iterate_period_derivatives64(z, c, candidate) else {
+            continue;
+        };
+        if complex_abs(complex_sub(derivatives.z, z)) <= 1e-9 {
+            return candidate;
+        }
+    }
+    period
+}
+
+fn iterate_period_derivatives64(
+    mut z: Complex64,
+    c: Complex64,
+    period: usize,
+) -> Option<PeriodDerivatives64> {
+    let mut dz_dz = Complex64 { re: 1.0, im: 0.0 };
+    let mut dz_dc = Complex64 { re: 0.0, im: 0.0 };
+    let mut d_dz_dz = Complex64 { re: 0.0, im: 0.0 };
+    let mut d_dc_dz = Complex64 { re: 0.0, im: 0.0 };
+
+    for _ in 0..period {
+        if !complex_is_finite(z)
+            || !complex_is_finite(dz_dz)
+            || !complex_is_finite(dz_dc)
+            || !complex_is_finite(d_dz_dz)
+            || !complex_is_finite(d_dc_dz)
+        {
+            return None;
+        }
+        let two_z = complex_scale(z, 2.0);
+        let next_d_dc_dz = complex_add(
+            complex_scale(complex_mul(dz_dc, dz_dz), 2.0),
+            complex_mul(two_z, d_dc_dz),
+        );
+        let next_d_dz_dz = complex_add(
+            complex_scale(complex_mul(dz_dz, dz_dz), 2.0),
+            complex_mul(two_z, d_dz_dz),
+        );
+        let next_dz_dc = complex_add(complex_mul(two_z, dz_dc), Complex64 { re: 1.0, im: 0.0 });
+        let next_dz_dz = complex_mul(two_z, dz_dz);
+        z = complex_add(complex_mul(z, z), c);
+        dz_dz = next_dz_dz;
+        dz_dc = next_dz_dc;
+        d_dz_dz = next_d_dz_dz;
+        d_dc_dz = next_d_dc_dz;
+    }
+
+    if !complex_is_finite(z)
+        || !complex_is_finite(dz_dz)
+        || !complex_is_finite(dz_dc)
+        || !complex_is_finite(d_dz_dz)
+        || !complex_is_finite(d_dc_dz)
+    {
+        return None;
+    }
+
+    Some(PeriodDerivatives64 {
+        z,
+        dz_dz,
+        dz_dc,
+        d_dz_dz,
+        d_dc_dz,
+    })
+}
+
+fn orbit_point64(orbit_re: &[f64], orbit_im: &[f64], index: usize) -> Option<Complex64> {
+    let point = Complex64 {
+        re: *orbit_re.get(index)?,
+        im: *orbit_im.get(index)?,
+    };
+    if complex_is_finite(point) {
+        Some(point)
+    } else {
+        None
+    }
+}
+
+fn complex_distance2_from_orbit64(
+    orbit_re: &[f64],
+    orbit_im: &[f64],
+    a: usize,
+    b: usize,
+) -> f64 {
+    let re = orbit_re[a] - orbit_re[b];
+    let im = orbit_im[a] - orbit_im[b];
+    re * re + im * im
+}
+
+fn complex_add(a: Complex64, b: Complex64) -> Complex64 {
+    Complex64 {
+        re: a.re + b.re,
+        im: a.im + b.im,
+    }
+}
+
+fn complex_sub(a: Complex64, b: Complex64) -> Complex64 {
+    Complex64 {
+        re: a.re - b.re,
+        im: a.im - b.im,
+    }
+}
+
+fn complex_mul(a: Complex64, b: Complex64) -> Complex64 {
+    Complex64 {
+        re: a.re * b.re - a.im * b.im,
+        im: a.re * b.im + a.im * b.re,
+    }
+}
+
+fn complex_div(a: Complex64, b: Complex64) -> Option<Complex64> {
+    let denom = b.re * b.re + b.im * b.im;
+    if !denom.is_finite() || denom <= 0.0 {
+        return None;
+    }
+    Some(Complex64 {
+        re: (a.re * b.re + a.im * b.im) / denom,
+        im: (a.im * b.re - a.re * b.im) / denom,
+    })
+}
+
+fn complex_scale(a: Complex64, scale: f64) -> Complex64 {
+    Complex64 {
+        re: a.re * scale,
+        im: a.im * scale,
+    }
+}
+
+fn complex_abs2(a: Complex64) -> f64 {
+    a.re * a.re + a.im * a.im
+}
+
+fn complex_abs(a: Complex64) -> f64 {
+    complex_abs2(a).sqrt()
+}
+
+fn complex_is_finite(a: Complex64) -> bool {
+    a.re.is_finite() && a.im.is_finite()
 }
 
 fn build_render_contexts(
@@ -1943,6 +2444,72 @@ fn build_series_plan64(
     probes: &[Complex64],
 ) -> SeriesPlan64 {
     let normalized_degree = degree;
+    if normalized_degree > 2 {
+        let mut best = build_series_plan_for_degree64(
+            orbit_re,
+            orbit_im,
+            2,
+            max_skip,
+            tile_radius,
+            probes,
+        );
+        if is_series_skip_saturated64(best.skip, max_skip, orbit_re, orbit_im) {
+            return best;
+        }
+        for candidate_degree in [4usize, 8, 12] {
+            if candidate_degree > normalized_degree {
+                break;
+            }
+            let candidate = build_series_plan_for_degree64(
+                orbit_re,
+                orbit_im,
+                candidate_degree,
+                max_skip,
+                tile_radius,
+                probes,
+            );
+            if candidate.skip > best.skip
+                || (candidate.skip == best.skip && candidate.degree < best.degree)
+            {
+                best = candidate;
+            }
+            if is_series_skip_saturated64(best.skip, max_skip, orbit_re, orbit_im) {
+                break;
+            }
+        }
+        return best;
+    }
+    build_series_plan_for_degree64(
+        orbit_re,
+        orbit_im,
+        normalized_degree,
+        max_skip,
+        tile_radius,
+        probes,
+    )
+}
+
+fn is_series_skip_saturated64(
+    skip: usize,
+    max_skip: usize,
+    orbit_re: &[f64],
+    orbit_im: &[f64],
+) -> bool {
+    let available_skip = max_skip
+        .min(orbit_re.len().saturating_sub(1))
+        .min(orbit_im.len().saturating_sub(1));
+    available_skip > 0
+        && skip >= ((available_skip as f64) * RENDER_SERIES_SKIP_SATURATION).ceil() as usize
+}
+
+fn build_series_plan_for_degree64(
+    orbit_re: &[f64],
+    orbit_im: &[f64],
+    normalized_degree: usize,
+    max_skip: usize,
+    tile_radius: f64,
+    probes: &[Complex64],
+) -> SeriesPlan64 {
     let mut coeff_re = vec![0.0; normalized_degree + 1];
     let mut coeff_im = vec![0.0; normalized_degree + 1];
     if normalized_degree < 2
