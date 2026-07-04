@@ -8,14 +8,6 @@ interface ReferenceKey {
   precisionBits: number;
 }
 
-export interface ReferenceScreenTransform {
-  dx: number;
-  dy: number;
-  scale: number;
-  anchorX: number;
-  anchorY: number;
-}
-
 export class ReferenceManager {
   private readonly references = new Map<string, ReferenceSnapshot>();
   private readonly pendingReferences = new Map<string, Promise<ReferenceSnapshot>>();
@@ -143,34 +135,6 @@ export class ReferenceManager {
     this.trim(currentRevision);
   }
 
-  carryForwardReferences(fromRevision: number, toRevision: number, maxIter: number, transform: ReferenceScreenTransform): void {
-    const carried: ReferenceSnapshot[] = [];
-    for (const reference of this.references.values()) {
-      if (reference.revision !== fromRevision || reference.maxIter < maxIter) continue;
-      const screen = transformReferenceScreen(reference.screenX, reference.screenY, transform);
-      carried.push({
-        ...reference,
-        id: `ref-${++this.sequence}`,
-        screenX: screen.x,
-        screenY: screen.y,
-        maxIter,
-        revision: toRevision
-      });
-    }
-    for (const reference of carried) {
-      this.references.set(
-        referenceKey({
-          centerRe: reference.centerRe,
-          centerIm: reference.centerIm,
-          maxIter: reference.maxIter,
-          precisionBits: reference.precisionBits
-        }),
-        reference
-      );
-    }
-    this.trim(toRevision);
-  }
-
   dispose(): void {
     this.client.dispose();
   }
@@ -292,11 +256,4 @@ function referenceKey(key: ReferenceKey): string {
 
 function referenceBytes(reference: ReferenceSnapshot): number {
   return reference.orbitRe.byteLength + reference.orbitIm.byteLength;
-}
-
-function transformReferenceScreen(x: number, y: number, transform: ReferenceScreenTransform): { x: number; y: number } {
-  return {
-    x: transform.anchorX + (x - transform.anchorX) * transform.scale + transform.dx,
-    y: transform.anchorY + (y - transform.anchorY) * transform.scale + transform.dy
-  };
 }

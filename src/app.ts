@@ -116,7 +116,7 @@ interface PinchSample {
 interface ActivateViewOptions {
   resetRetained?: boolean;
   retainedTransform?: RetainedScreenTransform;
-  carryReferences?: boolean;
+  scheduleWork?: boolean;
 }
 
 const MAX_RENDER_REFERENCES = 24;
@@ -136,6 +136,7 @@ const MIN_EXACT_PATCH_SIZE = 8;
 const TILE_SCHEDULE_BATCH_MS = 6;
 const TILE_SCHEDULE_MIN_BATCH = 2;
 const ITER_CONTROL_DEBOUNCE_MS = 120;
+const WHEEL_RENDER_DEBOUNCE_MS = 80;
 
 export async function startApp(root: HTMLElement): Promise<void> {
   root.innerHTML = `
@@ -218,6 +219,8 @@ export async function startApp(root: HTMLElement): Promise<void> {
   let renderToken = 0;
   let scheduledUrlWrite = 0;
   let scheduledIterSettingsApply = 0;
+  let scheduledDeferredRenderWork = 0;
+  let pendingPointerWorkReason: string | undefined;
   const stats: Stats = {
     fps: 0,
     pending: 0,
@@ -290,7 +293,8 @@ export async function startApp(root: HTMLElement): Promise<void> {
     if (Math.abs(dx) + Math.abs(dy) < 0.5) return;
     const transform = screenTransform(dx, dy, 1, runtime.width * 0.5, runtime.height * 0.5);
     const next = transformViewNow(view, runtime.width, runtime.height, dx, dy, 1, transform.anchorX, transform.anchorY);
-    activateView(withResolvedIter(next), "pan", { resetRetained: false, retainedTransform: transform });
+    pendingPointerWorkReason = "pan";
+    activateView(withResolvedIter(next), "pan", { resetRetained: false, retainedTransform: transform, scheduleWork: false });
   });
   canvas.addEventListener("pointerup", (event) => {
     finishPointer(event);
@@ -301,6 +305,7 @@ export async function startApp(root: HTMLElement): Promise<void> {
   canvas.addEventListener("lostpointercapture", (event) => {
     activePointers.delete(event.pointerId);
     resetPinchBaseline();
+    schedulePendingPointerWorkIfComplete();
   });
   canvas.addEventListener(
     "wheel",
@@ -312,13 +317,14 @@ export async function startApp(root: HTMLElement): Promise<void> {
       const factor = Math.exp(-event.deltaY * 0.0015);
       const transform = screenTransform(0, 0, factor, anchorX, anchorY);
       const next = transformViewNow(view, runtime.width, runtime.height, 0, 0, factor, anchorX, anchorY);
-      activateView(withResolvedIter(next), "zoom", { resetRetained: false, retainedTransform: transform });
+      activateView(withResolvedIter(next), "zoom", { resetRetained: false, retainedTransform: transform, scheduleWork: false });
+      scheduleDeferredRenderWork("zoom", WHEEL_RENDER_DEBOUNCE_MS);
     },
     { passive: false }
   );
   window.addEventListener("resize", () => {
     resize();
-    activateView(withResolvedIter(view), "resize", { resetRetained: false, carryReferences: false });
+    activateView(withResolvedIter(view), "resize", { resetRetained: false });
   });
 
   let lastFrame = performance.now();
@@ -343,26 +349,27 @@ export async function startApp(root: HTMLElement): Promise<void> {
   }
 
   function activateView(next: ViewState, reason: string, options: ActivateViewOptions = {}): void {
-    const previousRevision = revision;
     view = next;
     revision += 1;
     renderToken += 1;
     const token = renderToken;
     runtime = currentRuntimeView();
+    window.clearTimeout(scheduledDeferredRenderWork);
+    scheduledDeferredRenderWork = 0;
     references.cancelObsoleteWork(revision);
     pool.clearQueueForOldRevisions(revision);
+    resetRenderWorkState();
     renderer.setActiveRevision(revision);
     if (options.resetRetained ?? true) {
       renderer.pruneRetainedWhenActiveCoverage(0);
     } else {
       if (options.retainedTransform) renderer.applyRetainedTransform(options.retainedTransform);
-      if (options.retainedTransform && options.carryReferences !== false) {
-        references.carryForwardReferences(previousRevision, revision, view.maxIter, options.retainedTransform);
-      }
     }
+    if (options.scheduleWork === false) stats.status = `navigating ${reason}`;
     renderer.render(true);
     updateHud();
     scheduleUrlSync();
+    if (options.scheduleWork === false) return;
     const schedule = () => {
       if (token !== renderToken) return;
       scheduleTiles(reason, token);
@@ -374,9 +381,17 @@ export async function startApp(root: HTMLElement): Promise<void> {
     }
   }
 
-  function scheduleTiles(reason: string, token: number): void {
-    const localRuntime = currentRuntimeView();
-    stats.status = `rendering ${reason}`;
+  function scheduleDeferredRenderWork(reason: string, delayMs: number): void {
+    window.clearTimeout(scheduledDeferredRenderWork);
+    const token = renderToken;
+    scheduledDeferredRenderWork = window.setTimeout(() => {
+      scheduledDeferredRenderWork = 0;
+      if (token !== renderToken) return;
+      scheduleTiles(reason, token);
+    }, delayMs);
+  }
+
+  function resetRenderWorkState(): void {
     stats.pending = 0;
     stats.completedTiles = 0;
     stats.glitches = 0;
@@ -390,6 +405,13 @@ export async function startApp(root: HTMLElement): Promise<void> {
     patchTilesCreated = 0;
     patchTileLimit = 512;
     pendingTileShells = 0;
+    references.setPinnedReferenceIds([]);
+  }
+
+  function scheduleTiles(reason: string, token: number): void {
+    const localRuntime = currentRuntimeView();
+    stats.status = `rendering ${reason}`;
+    resetRenderWorkState();
 
     startViewReference(localRuntime, token);
     void submitViewportPreview(localRuntime, token);
@@ -1313,6 +1335,7 @@ export async function startApp(root: HTMLElement): Promise<void> {
     activePointers.delete(event.pointerId);
     if (canvas.hasPointerCapture(event.pointerId)) canvas.releasePointerCapture(event.pointerId);
     resetPinchBaseline();
+    schedulePendingPointerWorkIfComplete();
   }
 
   function resetPinchBaseline(): void {
@@ -1349,7 +1372,15 @@ export async function startApp(root: HTMLElement): Promise<void> {
 
     const transform = screenTransform(dx, dy, factor, previous.centerX, previous.centerY);
     const next = transformViewNow(view, runtime.width, runtime.height, dx, dy, factor, previous.centerX, previous.centerY);
-    activateView(withResolvedIter(next), "pinch", { resetRetained: false, retainedTransform: transform });
+    pendingPointerWorkReason = "pinch";
+    activateView(withResolvedIter(next), "pinch", { resetRetained: false, retainedTransform: transform, scheduleWork: false });
+  }
+
+  function schedulePendingPointerWorkIfComplete(): void {
+    if (activePointers.size > 0 || !pendingPointerWorkReason) return;
+    const reason = pendingPointerWorkReason;
+    pendingPointerWorkReason = undefined;
+    scheduleDeferredRenderWork(reason, 0);
   }
 
   function screenTransform(dx: number, dy: number, scale: number, anchorX: number, anchorY: number): RetainedScreenTransform {
@@ -1432,7 +1463,7 @@ export async function startApp(root: HTMLElement): Promise<void> {
       scheduleUrlSync();
       return;
     }
-    activateView(next, reason, { resetRetained: true, carryReferences: false });
+    activateView(next, reason, { resetRetained: true });
   }
 
   function syncIterControls(): void {

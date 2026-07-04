@@ -305,6 +305,35 @@ test("keeps rendered deep tiles responsive during pan and zoom", async ({ page }
   await expect(page.locator("#readStatus")).not.toHaveText(/reference zoom/i);
 });
 
+test("defers render work while pan and wheel zoom inputs are still changing", async ({ page }) => {
+  test.setTimeout(45_000);
+  await installInteractionWorkerProbe(page);
+  await page.setViewportSize({ width: 1912, height: 948 });
+  await page.goto("/");
+  await waitForNonBlankCanvas(page, 30_000);
+
+  const initialProbe = await readInteractionWorkerProbe(page);
+  const pan = await dispatchContinuousPan(page);
+  expect(pan.renderMessagesBeforePointerUp).toBe(0);
+  await expect.poll(async () => (await readInteractionWorkerProbe(page)).renderMessages.length, { timeout: 5_000 })
+    .toBeGreaterThan(pan.renderMessageCountBeforeInput);
+  await expect(page.locator("#readStatus")).toHaveText("stable", { timeout: 30_000 });
+
+  const afterPanProbe = await readInteractionWorkerProbe(page);
+  expect(afterPanProbe.tileWorkers).toBe(initialProbe.tileWorkers);
+  expect(afterPanProbe.referenceWorkers).toBe(initialProbe.referenceWorkers);
+
+  const zoom = await dispatchContinuousWheelZoom(page);
+  expect(zoom.renderMessagesDuringWheel).toBe(0);
+  await expect.poll(async () => (await readInteractionWorkerProbe(page)).renderMessages.length, { timeout: 5_000 })
+    .toBeGreaterThan(zoom.renderMessageCountBeforeInput);
+  await expect(page.locator("#readStatus")).toHaveText("stable", { timeout: 30_000 });
+
+  const afterZoomProbe = await readInteractionWorkerProbe(page);
+  expect(afterZoomProbe.tileWorkers).toBe(initialProbe.tileWorkers);
+  expect(afterZoomProbe.referenceWorkers).toBe(initialProbe.referenceWorkers);
+});
+
 test("does not leave false periodic disks black at 1e27", async ({ page }) => {
   test.setTimeout(90_000);
   await page.setViewportSize({ width: 1912, height: 948 });
@@ -509,6 +538,143 @@ async function hasRetainedFrameAfter(page: import("@playwright/test").Page, star
     }).__mandelbrotLastRetainedFrame;
     return typeof frame?.now === "number" && frame.now >= startedAt && (frame.retainedCount ?? 0) > 0;
   }, started);
+}
+
+interface InteractionWorkerProbe {
+  tileWorkers: number;
+  referenceWorkers: number;
+  unknownWorkers: number;
+  renderMessages: Array<{ revision: number; mode: string; at: number }>;
+}
+
+async function installInteractionWorkerProbe(page: import("@playwright/test").Page): Promise<void> {
+  await page.addInitScript(() => {
+    const originalWorker = window.Worker;
+    const probe: InteractionWorkerProbe = {
+      tileWorkers: 0,
+      referenceWorkers: 0,
+      unknownWorkers: 0,
+      renderMessages: []
+    };
+    (globalThis as unknown as { __interactionWorkerProbe: InteractionWorkerProbe }).__interactionWorkerProbe = probe;
+
+    const patchedWorker = function Worker(url: string | URL, options?: WorkerOptions): Worker {
+      const worker = new originalWorker(url, options);
+      const urlText = String(url);
+      if (urlText.includes("tileWorker")) probe.tileWorkers += 1;
+      else if (urlText.includes("referenceWorker")) probe.referenceWorkers += 1;
+      else probe.unknownWorkers += 1;
+
+      const postMessage = worker.postMessage.bind(worker) as (message: unknown, transferOrOptions?: Transferable[] | StructuredSerializeOptions) => void;
+      worker.postMessage = ((message: unknown, transferOrOptions?: Transferable[] | StructuredSerializeOptions) => {
+        if (
+          message &&
+          typeof message === "object" &&
+          (message as { type?: unknown }).type === "renderTile"
+        ) {
+          const renderMessage = message as { tile?: { revision?: unknown }; renderMode?: unknown };
+          probe.renderMessages.push({
+            revision: typeof renderMessage.tile?.revision === "number" ? renderMessage.tile.revision : -1,
+            mode: typeof renderMessage.renderMode === "string" ? renderMessage.renderMode : "",
+            at: performance.now()
+          });
+        }
+        postMessage(message, transferOrOptions);
+      }) as Worker["postMessage"];
+
+      return worker;
+    } as unknown as typeof Worker;
+    patchedWorker.prototype = originalWorker.prototype;
+    window.Worker = patchedWorker;
+  });
+}
+
+async function readInteractionWorkerProbe(page: import("@playwright/test").Page): Promise<InteractionWorkerProbe> {
+  return page.evaluate(() => {
+    const probe = (globalThis as unknown as { __interactionWorkerProbe?: InteractionWorkerProbe }).__interactionWorkerProbe;
+    if (!probe) throw new Error("Missing interaction worker probe");
+    return {
+      tileWorkers: probe.tileWorkers,
+      referenceWorkers: probe.referenceWorkers,
+      unknownWorkers: probe.unknownWorkers,
+      renderMessages: [...probe.renderMessages]
+    };
+  });
+}
+
+async function dispatchContinuousPan(page: import("@playwright/test").Page): Promise<{
+  renderMessageCountBeforeInput: number;
+  renderMessagesBeforePointerUp: number;
+}> {
+  return page.evaluate(async () => {
+    const probe = (globalThis as unknown as { __interactionWorkerProbe?: InteractionWorkerProbe }).__interactionWorkerProbe;
+    const canvas = document.querySelector<HTMLCanvasElement>("#fractal");
+    if (!probe || !canvas) throw new Error("Missing pan probe target");
+    const rect = canvas.getBoundingClientRect();
+    const startX = rect.left + rect.width * 0.25;
+    const startY = rect.top + rect.height * 0.5;
+    const distance = rect.width * 0.5;
+    const steps = 24;
+    const renderMessageCountBeforeInput = probe.renderMessages.length;
+    const init = {
+      bubbles: true,
+      cancelable: true,
+      pointerId: 1,
+      pointerType: "mouse",
+      isPrimary: true,
+      buttons: 1
+    };
+
+    canvas.dispatchEvent(new PointerEvent("pointerdown", { ...init, clientX: startX, clientY: startY }));
+    for (let step = 1; step <= steps; step += 1) {
+      canvas.dispatchEvent(new PointerEvent("pointermove", {
+        ...init,
+        clientX: startX + distance * step / steps,
+        clientY: startY
+      }));
+      await new Promise((resolve) => window.setTimeout(resolve, 16));
+    }
+
+    const renderMessagesBeforePointerUp = probe.renderMessages.length - renderMessageCountBeforeInput;
+    canvas.dispatchEvent(new PointerEvent("pointerup", {
+      ...init,
+      buttons: 0,
+      clientX: startX + distance,
+      clientY: startY
+    }));
+    return { renderMessageCountBeforeInput, renderMessagesBeforePointerUp };
+  });
+}
+
+async function dispatchContinuousWheelZoom(page: import("@playwright/test").Page): Promise<{
+  renderMessageCountBeforeInput: number;
+  renderMessagesDuringWheel: number;
+}> {
+  return page.evaluate(async () => {
+    const probe = (globalThis as unknown as { __interactionWorkerProbe?: InteractionWorkerProbe }).__interactionWorkerProbe;
+    const canvas = document.querySelector<HTMLCanvasElement>("#fractal");
+    if (!probe || !canvas) throw new Error("Missing wheel probe target");
+    const rect = canvas.getBoundingClientRect();
+    const clientX = rect.left + rect.width * 0.5;
+    const clientY = rect.top + rect.height * 0.5;
+    const renderMessageCountBeforeInput = probe.renderMessages.length;
+
+    for (let step = 0; step < 8; step += 1) {
+      canvas.dispatchEvent(new WheelEvent("wheel", {
+        bubbles: true,
+        cancelable: true,
+        clientX,
+        clientY,
+        deltaY: -180
+      }));
+      await new Promise((resolve) => window.setTimeout(resolve, 16));
+    }
+
+    return {
+      renderMessageCountBeforeInput,
+      renderMessagesDuringWheel: probe.renderMessages.length - renderMessageCountBeforeInput
+    };
+  });
 }
 
 async function readTileCounts(page: import("@playwright/test").Page): Promise<{ completed: number; total: number }> {

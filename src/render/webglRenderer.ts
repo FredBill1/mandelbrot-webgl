@@ -79,7 +79,7 @@ export class WebglTileRenderer {
       }
     }
     this.activeRevision = revision;
-    this.retainedTransforms.set(previousRevision, identityTransform());
+    if (retainedCount > 0) this.retainedTransforms.set(previousRevision, identityTransform());
     recordDeepBench({ type: "activeRevisionChanged", previousRevision, revision, retainedCount });
   }
 
