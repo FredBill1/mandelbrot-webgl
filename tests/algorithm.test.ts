@@ -2,7 +2,12 @@ import { beforeAll, describe, expect, it } from "vitest";
 import { readFileSync } from "node:fs";
 import init, { apply_view_transform, compute_reference, compute_reference_3mul, compute_reference_sparse, direct_escape, estimate_reference_interior_radius } from "../src/wasm/pkg/mandelbrot_wasm";
 import { createVisibleTileShells } from "../src/tiles/tileKey";
-import { renderPerturbationTile } from "../src/workers/perturbation";
+import { evaluateSeriesWithDerivative, type SeriesPlan } from "../src/math/series";
+import {
+  paletteFilterWeightForTests,
+  renderPerturbationTile,
+  sampleIntegratedPaletteForTests
+} from "../src/workers/perturbation";
 import { renderPerturbationTileWasm, resetWasmPerturbationCacheForTests } from "../src/workers/wasmPerturbation";
 import { SERIES_DEGREE, type ReferenceSnapshot, type RenderTileMessage, type TileDescriptor } from "../src/types";
 
@@ -12,6 +17,42 @@ beforeAll(async () => {
 });
 
 describe("perturbation renderer", () => {
+  it("evaluates series derivatives close to finite differences", () => {
+    const plan: SeriesPlan = {
+      skip: 12,
+      degree: 4,
+      coeffRe: Float64Array.from([0, 0.84, -0.37, 0.19, -0.031]),
+      coeffIm: Float64Array.from([0, -0.22, 0.41, 0.071, -0.025])
+    };
+    const cRe = 0.0017;
+    const cIm = -0.0023;
+    const h = 1e-7;
+    const evaluated = evaluateSeriesWithDerivative(plan, cRe, cIm);
+    const plus = evaluateSeriesWithDerivative(plan, cRe + h, cIm).value;
+    const minus = evaluateSeriesWithDerivative(plan, cRe - h, cIm).value;
+
+    expect(evaluated.derivative.re).toBeCloseTo((plus.re - minus.re) / (2 * h), 8);
+    expect(evaluated.derivative.im).toBeCloseTo((plus.im - minus.im) / (2 * h), 8);
+  });
+
+  it("integrates the periodic palette across wraps and complete cycles", () => {
+    const cycleInSmoothUnits = 1 / 0.018;
+    const wrapped = sampleIntegratedPaletteForTests(81.25, 0.75);
+    const nextCycle = sampleIntegratedPaletteForTests(81.25 + cycleInSmoothUnits, 0.75);
+    expect(nextCycle).toEqual(wrapped);
+
+    const fullCycleA = sampleIntegratedPaletteForTests(12.5, 1);
+    const fullCycleB = sampleIntegratedPaletteForTests(43.75, 1);
+    expect(fullCycleB).toEqual(fullCycleA);
+  });
+
+  it("uses a continuous Nyquist transition for palette filtering", () => {
+    expect(paletteFilterWeightForTests(0.25)).toBe(0);
+    expect(paletteFilterWeightForTests(0.5)).toBe(1);
+    expect(paletteFilterWeightForTests(0.375)).toBeCloseTo(0.5, 12);
+    expect(paletteFilterWeightForTests(0.3749)).toBeLessThan(paletteFilterWeightForTests(0.3751));
+  });
+
   it.each([
     ["shallow", "3e-1", "5e-1", 128, 128],
     ["1e100", "-7.43643887037158704752191506114774e-1", "1.31825904205311970493132056385139e-1", 512, 512],
@@ -48,7 +89,7 @@ describe("perturbation renderer", () => {
 
   it.each([
     [
-      "shallow completed final AA",
+      "shallow completed final bandlimit",
       { re: "-7.5e-1", im: "1e-1", scale: "1", maxIter: 128 },
       { x: 960, y: 448 },
       { x: 960, y: 448 },
@@ -122,9 +163,10 @@ describe("perturbation renderer", () => {
       expect(wasmResult.stats.rebaseCount).toBe(tsResult.stats.rebaseCount);
       expect(wasmResult.stats.rebaseLimitCount).toBe(tsResult.stats.rebaseLimitCount);
       expect(wasmResult.stats.seriesSkip).toBe(tsResult.stats.seriesSkip);
-      expect(wasmResult.stats.boundaryDampenedCount).toBe(tsResult.stats.boundaryDampenedCount);
-      expect(wasmResult.stats.aaPixelCount).toBe(tsResult.stats.aaPixelCount);
-      expect(wasmResult.stats.aaSampleCount).toBe(tsResult.stats.aaSampleCount);
+      expect(wasmResult.stats.distanceEstimatedCount).toBe(tsResult.stats.distanceEstimatedCount);
+      expect(wasmResult.stats.paletteFilteredCount).toBe(tsResult.stats.paletteFilteredCount);
+      expect(wasmResult.stats.boundaryCoverageCount).toBe(tsResult.stats.boundaryCoverageCount);
+      expect(wasmResult.stats.maxPaletteFootprint).toBeCloseTo(tsResult.stats.maxPaletteFootprint, 5);
       expect(wasmResult.stats.referenceIdsUsed).toEqual(tsResult.stats.referenceIdsUsed);
       expect(wasmResult.stats.unresolvedClusters.map(legacyClusterFields)).toEqual(tsResult.stats.unresolvedClusters.map(legacyClusterFields));
       if (wasmResult.stats.unresolvedClusters.length > 0) {
@@ -228,7 +270,7 @@ describe("perturbation renderer", () => {
     expect(result.stats.escapedPixels).toBe(0);
   });
 
-  it("skips final AA while a tile is still an unresolved refinement candidate", () => {
+  it("keeps unresolved pixels out of final bandlimiting", () => {
     const view = {
       re: "-7.549229970244027197908742917925261755751044636618703913223906199716382497449534e-1",
       im: "5.320534885440088329282320858070240068704121711152834282354886837408395062921113e-2",
@@ -266,8 +308,7 @@ describe("perturbation renderer", () => {
     });
 
     expect(result.stats.unresolvedCount).toBeGreaterThan(0);
-    expect(result.stats.aaPixelCount).toBe(0);
-    expect(result.stats.aaSampleCount).toBe(0);
+    expect(result.stats.distanceEstimatedCount).toBeLessThanOrEqual(result.width * result.height - result.stats.unresolvedCount);
   });
 
   it("resolves the early-reference regression pixel after rebasing to that location", () => {
@@ -324,6 +365,48 @@ describe("perturbation renderer", () => {
     const resolved = renderSinglePixelWithReferences(view, point, screen.x, screen.y, [centerReference, pointReference], 1);
     expect(resolved.stats.unresolvedCount).toBe(0);
     expect(resolved.stats.escapedPixels).toBe(direct < view.maxIter ? 1 : 0);
+  });
+
+  it("matches one-pass bandlimiting after masked WASM refinement", async () => {
+    const view = {
+      re: "-1.7195312667941079545586189454398113271069746647515813505680542504632787025805573e0",
+      im: "6.5505858903810377100204901499228868589789948177206009920848026920443700420219874e-4",
+      scale: "1.4879731724872819376827096167093147183191284045682361153628693061499318199119286e1",
+      maxIter: 588
+    };
+    const screen = { x: 624, y: 624 };
+    const point = pointAtScreen(view, screen.x, screen.y);
+    const centerReference = makeReference(view.re, view.im, view.maxIter, 224, 956, 474);
+    const pointReference = makeReference(point.re, point.im, view.maxIter, 224, screen.x, screen.y);
+    const base = makeTileMessage(view, point, screen.x, screen.y, 1, 1, [centerReference], "final", 1);
+
+    resetWasmPerturbationCacheForTests();
+    const unresolved = await renderPerturbationTileWasm({ ...base, refined: false, refinementLevel: 0 });
+    expect(unresolved.stats.unresolvedCount).toBe(1);
+    expect(unresolved.stats.paletteFilteredCount).toBe(0);
+
+    const refined = await renderPerturbationTileWasm({
+      ...base,
+      references: [centerReference, pointReference],
+      refined: true,
+      refinementLevel: 1,
+      refinementBaseRgba: unresolved.rgba.slice(0),
+      refinementUnresolvedMask: unresolved.unresolvedMask?.slice(0),
+      refinementSmoothValues: unresolved.refinementSmoothValues?.slice(0),
+      refinementDistanceValues: unresolved.refinementDistanceValues?.slice(0),
+      refinementEscapedMask: unresolved.refinementEscapedMask?.slice(0)
+    });
+    const onePass = await renderPerturbationTileWasm({
+      ...base,
+      references: [centerReference, pointReference],
+      refined: false,
+      refinementLevel: 0
+    });
+
+    expect(refined.stats.unresolvedCount).toBe(0);
+    expect(new Uint8Array(refined.rgba)).toEqual(new Uint8Array(onePass.rgba));
+    expect(refined.stats.paletteFilteredCount).toBe(onePass.stats.paletteFilteredCount);
+    expect(refined.stats.boundaryCoverageCount).toBe(onePass.stats.boundaryCoverageCount);
   });
 
   it("uses safe series or adaptive unresolved clusters for the 1170x784 near-real performance regression", () => {
@@ -412,21 +495,16 @@ describe("perturbation renderer", () => {
 
     expect(final.stats.escapedPixels).toBe(preview.stats.escapedPixels);
     expect(final.stats.unresolvedCount).toBe(preview.stats.unresolvedCount);
-    expect(preview.stats.boundaryDampenedCount).toBe(0);
-    expect(preview.stats.aaPixelCount).toBe(0);
+    expect(preview.stats.distanceEstimatedCount).toBe(0);
+    expect(preview.stats.paletteFilteredCount).toBe(0);
     if (final.stats.unresolvedCount > 0) {
-      expect(final.stats.boundaryDampenedCount).toBe(0);
-      expect(final.stats.aaPixelCount).toBe(0);
-      expect(final.stats.aaSampleCount).toBe(0);
+      expect(final.stats.distanceEstimatedCount).toBeLessThanOrEqual(final.width * final.height - final.stats.unresolvedCount);
     } else {
-      expect(final.stats.boundaryDampenedCount).toBeGreaterThan(0);
-      expect(final.stats.aaPixelCount).toBeGreaterThan(0);
-      expect(final.stats.aaPixelCount).toBeLessThanOrEqual(1024);
-      expect(final.stats.aaSampleCount).toBeLessThanOrEqual(2560);
+      expect(final.stats.distanceEstimatedCount).toBeGreaterThan(0);
     }
   });
 
-  it("keeps boundary smoothing and AA for completed final tiles", () => {
+  it("keeps distance-estimator bandlimiting for completed final tiles", () => {
     const view = {
       re: "-7.5e-1",
       im: "1e-1",
@@ -464,9 +542,8 @@ describe("perturbation renderer", () => {
     expect(result.stats.unresolvedCount).toBe(0);
     expect(result.stats.escapedPixels).toBeGreaterThan(0);
     expect(result.stats.escapedPixels).toBeLessThan(result.width * result.height);
-    expect(result.stats.boundaryDampenedCount).toBeGreaterThan(0);
-    expect(result.stats.aaPixelCount).toBeGreaterThan(0);
-    expect(result.stats.aaSampleCount).toBeLessThanOrEqual(2560);
+    expect(result.stats.distanceEstimatedCount).toBeGreaterThan(0);
+    expect(result.stats.boundaryCoverageCount).toBeGreaterThan(0);
   });
 
   it("does not certify the reported 1e27 false periodic sample in the WASM cached renderer", async () => {

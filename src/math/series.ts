@@ -10,6 +10,11 @@ export interface Complex {
   im: number;
 }
 
+export interface SeriesEvaluation {
+  value: Complex;
+  derivative: Complex;
+}
+
 const MAX_SERIES_TILE_RADIUS = 1e-3;
 const SERIES_ERROR_SCALE = 1e-7;
 const SERIES_SKIP_SATURATION = 0.7;
@@ -123,6 +128,33 @@ export function evaluateSeries(plan: SeriesPlan, cRe: number, cIm: number): Comp
   return {
     re: zr * cRe - zi * cIm,
     im: zr * cIm + zi * cRe
+  };
+}
+
+export function evaluateSeriesWithDerivative(plan: SeriesPlan, cRe: number, cIm: number): SeriesEvaluation {
+  let zr = 0;
+  let zi = 0;
+  let dr = 0;
+  let di = 0;
+  for (let k = plan.degree; k >= 1; k -= 1) {
+    const nextDr = dr * cRe - di * cIm + zr;
+    const nextDi = dr * cIm + di * cRe + zi;
+    const pr = zr * cRe - zi * cIm + plan.coeffRe[k];
+    const pi = zr * cIm + zi * cRe + plan.coeffIm[k];
+    dr = nextDr;
+    di = nextDi;
+    zr = pr;
+    zi = pi;
+  }
+  return {
+    value: {
+      re: zr * cRe - zi * cIm,
+      im: zr * cIm + zi * cRe
+    },
+    derivative: {
+      re: dr * cRe - di * cIm + zr,
+      im: dr * cIm + di * cRe + zi
+    }
   };
 }
 

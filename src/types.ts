@@ -78,6 +78,7 @@ export interface RenderTileMessage {
   refinementBaseRgba?: ArrayBuffer;
   refinementUnresolvedMask?: ArrayBuffer;
   refinementSmoothValues?: ArrayBuffer;
+  refinementDistanceValues?: ArrayBuffer;
   refinementEscapedMask?: ArrayBuffer;
 }
 
@@ -117,10 +118,10 @@ export interface TileStats {
   blaStepCount: number;
   referenceCacheMissCount: number;
   seriesSkip: number;
-  boundaryDampenedCount: number;
-  aaPixelCount: number;
-  aaSampleCount: number;
-  aaFallbackCount: number;
+  distanceEstimatedCount: number;
+  paletteFilteredCount: number;
+  boundaryCoverageCount: number;
+  maxPaletteFootprint: number;
   referenceId: string;
   referenceIdsUsed: string[];
   unresolvedScreenX: number | undefined;
@@ -141,6 +142,7 @@ export interface TileDoneMessage {
   rgba: ArrayBuffer;
   unresolvedMask?: ArrayBuffer;
   refinementSmoothValues?: ArrayBuffer;
+  refinementDistanceValues?: ArrayBuffer;
   refinementEscapedMask?: ArrayBuffer;
   stats: TileStats;
   needsReference: boolean;

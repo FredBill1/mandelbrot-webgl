@@ -81,6 +81,7 @@ interface TileWorkState {
   refinementBaseRgba: ArrayBuffer | undefined;
   refinementUnresolvedMask: ArrayBuffer | undefined;
   refinementSmoothValues: ArrayBuffer | undefined;
+  refinementDistanceValues: ArrayBuffer | undefined;
   refinementEscapedMask: ArrayBuffer | undefined;
 }
 
@@ -533,6 +534,7 @@ export async function startApp(root: HTMLElement): Promise<void> {
       refinementBaseRgba: undefined,
       refinementUnresolvedMask: undefined,
       refinementSmoothValues: undefined,
+      refinementDistanceValues: undefined,
       refinementEscapedMask: undefined
     };
     tileStates.set(tile.id, state);
@@ -656,6 +658,7 @@ export async function startApp(root: HTMLElement): Promise<void> {
           refinementBaseRgba: state.forceExact ? undefined : state.refinementBaseRgba,
           refinementUnresolvedMask: state.forceExact ? undefined : state.refinementUnresolvedMask,
           refinementSmoothValues: state.forceExact ? undefined : state.refinementSmoothValues,
+          refinementDistanceValues: state.forceExact ? undefined : state.refinementDistanceValues,
           refinementEscapedMask: state.forceExact ? undefined : state.refinementEscapedMask
         },
         priority
@@ -684,6 +687,7 @@ export async function startApp(root: HTMLElement): Promise<void> {
         state.refinementBaseRgba = result.rgba.slice(0);
         state.refinementUnresolvedMask = result.unresolvedMask?.slice(0);
         state.refinementSmoothValues = result.refinementSmoothValues?.slice(0);
+        state.refinementDistanceValues = result.refinementDistanceValues?.slice(0);
         state.refinementEscapedMask = result.refinementEscapedMask?.slice(0);
         state.lastReferencePressure = unresolvedPressure(state, result.stats.unresolvedCount);
         state.stalledRefinementRounds = nextStalledRefinementRounds(
@@ -731,6 +735,7 @@ export async function startApp(root: HTMLElement): Promise<void> {
       state.refinementBaseRgba = undefined;
       state.refinementUnresolvedMask = undefined;
       state.refinementSmoothValues = undefined;
+      state.refinementDistanceValues = undefined;
       state.refinementEscapedMask = undefined;
       state.completed = true;
       stats.completedTiles += 1;
@@ -968,6 +973,7 @@ export async function startApp(root: HTMLElement): Promise<void> {
       child.refinementBaseRgba = undefined;
       child.refinementUnresolvedMask = undefined;
       child.refinementSmoothValues = undefined;
+      child.refinementDistanceValues = undefined;
       child.refinementEscapedMask = undefined;
       child.lastUnresolvedCount = undefined;
       void submitTile(localRuntime, child);
