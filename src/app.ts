@@ -186,7 +186,7 @@ export async function startApp(root: HTMLElement): Promise<void> {
             <div class="iterHeader">
               <span>Iterations</span>
               <div class="segmented" role="group" aria-label="Iteration mode">
-                <button id="iterDefaultMode" type="button">Formula</button>
+                <button id="iterDefaultMode" type="button">Auto</button>
                 <button id="iterFixedMode" type="button">Fixed</button>
               </div>
             </div>
