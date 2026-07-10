@@ -361,7 +361,10 @@ function installWorkerProbe() {
       completedFinals: 0,
       maxRefsUsed: 0,
       maxSeriesSkip: 0,
-      totalAaSamples: 0,
+      distanceEstimatedCount: 0,
+      paletteFilteredCount: 0,
+      boundaryCoverageCount: 0,
+      maxPaletteFootprint: 0,
       totalGlitches: 0,
       totalRebases: 0,
       totalPeriodicInterior: 0,
@@ -478,7 +481,13 @@ function installWorkerProbe() {
           else bench.waves.completedFinals += 1;
           bench.waves.maxRefsUsed = Math.max(bench.waves.maxRefsUsed, data.stats.referenceIdsUsed.length);
           bench.waves.maxSeriesSkip = Math.max(bench.waves.maxSeriesSkip, data.stats.seriesSkip);
-          bench.waves.totalAaSamples += data.stats.aaSampleCount;
+          bench.waves.distanceEstimatedCount += data.stats.distanceEstimatedCount ?? 0;
+          bench.waves.paletteFilteredCount += data.stats.paletteFilteredCount ?? 0;
+          bench.waves.boundaryCoverageCount += data.stats.boundaryCoverageCount ?? 0;
+          bench.waves.maxPaletteFootprint = Math.max(
+            bench.waves.maxPaletteFootprint,
+            data.stats.maxPaletteFootprint ?? 0
+          );
           bench.waves.totalGlitches += data.stats.glitchCount;
           bench.waves.totalRebases += data.stats.rebaseCount;
           bench.waves.totalPeriodicInterior += data.stats.periodicInteriorCount;
@@ -497,7 +506,10 @@ function installWorkerProbe() {
             glitches: data.stats.glitchCount,
             rebases: data.stats.rebaseCount,
             periodicInterior: data.stats.periodicInteriorCount,
-            aaSamples: data.stats.aaSampleCount,
+            distanceEstimated: data.stats.distanceEstimatedCount,
+            paletteFiltered: data.stats.paletteFilteredCount,
+            boundaryCoverage: data.stats.boundaryCoverageCount,
+            maxPaletteFootprint: data.stats.maxPaletteFootprint,
             refsUsed: data.stats.referenceIdsUsed.length,
             clusters: data.stats.unresolvedClusters.length
           });
@@ -528,7 +540,10 @@ function installWorkerProbe() {
               glitches: data.stats.glitchCount,
               rebases: data.stats.rebaseCount,
               periodicInterior: data.stats.periodicInteriorCount,
-              aaSamples: data.stats.aaSampleCount,
+              distanceEstimated: data.stats.distanceEstimatedCount,
+              paletteFiltered: data.stats.paletteFilteredCount,
+              boundaryCoverage: data.stats.boundaryCoverageCount,
+              maxPaletteFootprint: data.stats.maxPaletteFootprint,
               refsUsed: data.stats.referenceIdsUsed.length,
               clusters: data.stats.unresolvedClusters.length
             }
@@ -547,7 +562,10 @@ function installWorkerProbe() {
             glitches: data.stats.glitchCount,
             rebases: data.stats.rebaseCount,
             periodicInterior: data.stats.periodicInteriorCount,
-            aaSamples: data.stats.aaSampleCount,
+            distanceEstimated: data.stats.distanceEstimatedCount,
+            paletteFiltered: data.stats.paletteFilteredCount,
+            boundaryCoverage: data.stats.boundaryCoverageCount,
+            maxPaletteFootprint: data.stats.maxPaletteFootprint,
             refsUsed: data.stats.referenceIdsUsed.length,
             clusters: data.stats.unresolvedClusters.length
           };

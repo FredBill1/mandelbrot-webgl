@@ -603,9 +603,16 @@ struct SeriesPlan64 {
 }
 
 #[derive(Clone, Copy)]
+struct SeriesEvaluation64 {
+    value: Complex64,
+    derivative: Complex64,
+}
+
+#[derive(Clone, Copy)]
 struct PixelResult64 {
     iter: u32,
     mag2: f64,
+    distance_px: f64,
     glitch: bool,
     unresolved: bool,
     failure_kind: FailureKind64,
@@ -684,18 +691,25 @@ struct UnresolvedCluster64 {
 }
 
 #[derive(Clone, Copy)]
-struct Color64 {
-    r: u8,
-    g: u8,
-    b: u8,
+struct LinearColor64 {
+    r: f64,
+    g: f64,
+    b: f64,
 }
 
 #[derive(Clone, Copy)]
 struct BoundaryStats64 {
-    boundary_dampened_count: u32,
-    aa_pixel_count: u32,
-    aa_sample_count: u32,
-    aa_fallback_count: u32,
+    distance_estimated_count: u32,
+    palette_filtered_count: u32,
+    boundary_coverage_count: u32,
+    max_palette_footprint: f64,
+}
+
+struct RenderPaletteCache {
+    colors: Vec<u8>,
+    linear_colors: Vec<f64>,
+    linear_prefix: Vec<f64>,
+    srgb_to_linear: Vec<f64>,
 }
 
 #[derive(Clone)]
@@ -716,21 +730,15 @@ struct RenderIterSummary64 {
     cap_hit_boundary_count: u32,
 }
 
-#[derive(Clone, Copy)]
-struct BoundaryCandidate64 {
-    index: usize,
-    edge_strength: f64,
-    classification_change: bool,
-}
-
-#[derive(Clone, Copy)]
-struct RenderEdgeInfo64 {
-    edge_strength: f64,
-    classification_change: bool,
-}
-
 thread_local! {
     static RENDER_REFERENCE_CACHE: RefCell<HashMap<u32, CachedRenderReference>> = RefCell::new(HashMap::new());
+    static RENDER_PALETTE_CACHE: Rc<RenderPaletteCache> = {
+        let colors = create_render_palette();
+        let srgb_to_linear = create_render_srgb_to_linear_lut();
+        let linear_colors: Vec<f64> = colors.iter().map(|value| srgb_to_linear[*value as usize]).collect();
+        let linear_prefix = create_render_palette_linear_prefix(&linear_colors);
+        Rc::new(RenderPaletteCache { colors, linear_colors, linear_prefix, srgb_to_linear })
+    };
 }
 
 const RENDER_MIN_PIXEL_SPAN_FOR_PERIODIC_INTERIOR: f64 = 1e-18;
@@ -740,25 +748,22 @@ const RENDER_SERIES_MAX_SKIP: usize = 8192;
 const RENDER_MAX_SERIES_TILE_RADIUS: f64 = 1e-3;
 const RENDER_SERIES_ERROR_SCALE: f64 = 1e-7;
 const RENDER_SERIES_SKIP_SATURATION: f64 = 0.7;
-const RENDER_SMOOTH_DELTA_LOW: f64 = 6.0;
-const RENDER_SMOOTH_DELTA_HIGH: f64 = 24.0;
-const RENDER_CLASSIFICATION_EDGE_BOOST: f64 = 0.35;
-const RENDER_AA_EDGE_THRESHOLD: f64 = 0.45;
-const RENDER_AA_PIXEL_CAP: usize = 96;
-const RENDER_AA_PIXEL_FRACTION: f64 = 0.01;
-const RENDER_AA_FOUR_SAMPLE_CAP: usize = 24;
-const RENDER_AA_FOUR_SAMPLE_FRACTION: f64 = 0.0025;
+const RENDER_DISTANCE_EXTRA_ITERATIONS: u32 = 1;
 const RENDER_MIN_EDGE_CHROMA_SCALE: f64 = 0.35;
+const RENDER_DISTANCE_CHROMA_FULL_PX: f64 = 0.5;
+const RENDER_DISTANCE_CHROMA_NONE_PX: f64 = 2.0;
+const RENDER_DISTANCE_COVERAGE_FULL_PX: f64 = 0.25;
+const RENDER_DISTANCE_COVERAGE_NONE_PX: f64 = 0.75;
+const RENDER_DISTANCE_COVERAGE_STRENGTH: f64 = 0.75;
+const RENDER_INTERIOR_R: u8 = 4;
+const RENDER_INTERIOR_G: u8 = 8;
+const RENDER_INTERIOR_B: u8 = 16;
 const RENDER_PALETTE_SIZE: usize = 2048;
+const RENDER_PALETTE_CYCLE_SCALE: f64 = 0.018;
+const RENDER_PALETTE_FILTER_LOW: f64 = 0.25;
+const RENDER_PALETTE_FILTER_HIGH: f64 = 0.5;
 const RENDER_INV_LN2: f64 = std::f64::consts::LOG2_E;
 const RENDER_SMOOTH_LOG_SCALE: f64 = 0.5 * std::f64::consts::LOG2_E;
-const RENDER_TWO_SAMPLE_OFFSETS: [(f64, f64); 2] = [(-0.25, -0.25), (0.25, 0.25)];
-const RENDER_FOUR_SAMPLE_OFFSETS: [(f64, f64); 4] = [
-    (-0.375, -0.125),
-    (0.125, -0.375),
-    (-0.125, 0.375),
-    (0.375, 0.125),
-];
 const RENDER_REFERENCE_INTERIOR_MAX_PERIOD: usize = 256;
 const RENDER_REFERENCE_INTERIOR_MAX_CANDIDATES: usize = 3;
 const RENDER_REFERENCE_INTERIOR_MAX_PERIOD_SCORE: f64 = 3e-6;
@@ -828,6 +833,7 @@ pub fn render_tile_cached(
     refinement_base_rgba: Uint8Array,
     refinement_mask: Uint8Array,
     refinement_smooth_values: Float32Array,
+    refinement_distance_values: Float32Array,
     refinement_escaped_mask: Uint8Array,
 ) -> Result<JsValue, JsValue> {
     let started = js_sys::Date::now();
@@ -845,7 +851,7 @@ pub fn render_tile_cached(
     let width = ((rect.width / normalized_sample_step).ceil().max(1.0)) as usize;
     let height = ((rect.height / normalized_sample_step).ceil().max(1.0)) as usize;
     let mut contexts = build_render_contexts(rect, pixel_span, &ref_ids)?;
-    let palette = create_render_palette();
+    let palette = RENDER_PALETTE_CACHE.with(Rc::clone);
     let refinement_input = if render_mode == "final" {
         prepare_refinement_input(
             width,
@@ -853,21 +859,30 @@ pub fn render_tile_cached(
             refinement_base_rgba,
             refinement_mask,
             refinement_smooth_values,
+            refinement_distance_values,
             refinement_escaped_mask,
         )
     } else {
         None
     };
     let using_refinement_mask = refinement_input.is_some();
-    let (mut rgba, refinement_mask, refinement_smooth_values, refinement_escaped_mask) = if let Some(input) = refinement_input {
+    let inline_distance = render_mode == "final" && !using_refinement_mask;
+    let (
+        mut rgba,
+        refinement_mask,
+        refinement_smooth_values,
+        refinement_distance_values,
+        refinement_escaped_mask,
+    ) = if let Some(input) = refinement_input {
         (
             input.rgba,
             Some(input.mask),
             Some(input.smooth_values),
+            Some(input.distance_values),
             Some(input.escaped_mask),
         )
     } else {
-        (vec![0u8; width * height * 4], None, None, None)
+        (vec![0u8; width * height * 4], None, None, None, None)
     };
     let mut certified_interior_mask = if render_mode == "final" && !using_refinement_mask {
         Some(vec![0u8; width * height])
@@ -910,6 +925,11 @@ pub fn render_tile_cached(
     } else {
         None
     };
+    let mut distance_values = if render_mode == "final" {
+        Some(refinement_distance_values.unwrap_or_else(|| vec![-1f32; width * height]))
+    } else {
+        None
+    };
     if render_mode == "final" {
         if let Some(mask) = certified_interior_mask.as_mut() {
             periodic_interior_count += certify_render_blocks_from_references64(
@@ -924,7 +944,7 @@ pub fn render_tile_cached(
                 pixel_span,
                 max_iter,
                 &contexts,
-                &palette,
+                palette.colors.as_slice(),
             );
         }
     }
@@ -938,7 +958,6 @@ pub fn render_tile_cached(
             (rect.y + rect.height - 0.5).min(rect.y + (py as f64 + 0.5) * normalized_sample_step)
         })
         .collect();
-
     for py in 0..height {
         let screen_y = screen_ys[py];
         for px in 0..width {
@@ -964,6 +983,7 @@ pub fn render_tile_cached(
                 series_degree as usize,
                 &mut contexts,
                 &mut scratch,
+                inline_distance,
             );
             let result = selection.result;
             let offset = pixel_index * 4;
@@ -1023,31 +1043,60 @@ pub fn render_tile_cached(
             if let Some(values) = smooth_values.as_mut() {
                 values[pixel_index] = smooth as f32;
             }
+            if let Some(values) = distance_values.as_mut() {
+                values[pixel_index] = result.distance_px as f32;
+            }
             write_render_color_for_smooth(
                 &mut rgba,
                 offset,
                 result.iter >= max_iter,
                 smooth,
-                &palette,
+                palette.colors.as_slice(),
             );
         }
     }
 
-    let boundary_stats = if render_mode == "final" && unresolved_count == 0 {
-        apply_render_boundary_smoothing(
+    if render_mode == "final" && !inline_distance {
+        for py in 0..height {
+            for px in 0..width {
+                let pixel_index = py * width + px;
+                if refinement_mask
+                    .as_ref()
+                    .is_some_and(|mask| mask[pixel_index] == 0)
+                    || unresolved_mask[pixel_index] != 0
+                    || escaped_mask.as_ref().unwrap()[pixel_index] == 0
+                {
+                    continue;
+                }
+                let result = render_pixel_with_references64(
+                    screen_xs[px],
+                    screen_ys[py],
+                    pixel_span,
+                    max_iter,
+                    series_degree as usize,
+                    &mut contexts,
+                    &mut scratch,
+                    true,
+                )
+                .result;
+                if !result.unresolved && result.iter < max_iter {
+                    distance_values.as_mut().unwrap()[pixel_index] = result.distance_px as f32;
+                }
+            }
+        }
+    }
+
+    let boundary_stats = if render_mode == "final" {
+        apply_render_bandlimited_shading(
             &mut rgba,
             smooth_values.as_ref().unwrap(),
+            distance_values.as_ref().unwrap(),
             escaped_mask.as_ref().unwrap(),
             &unresolved_mask,
+            refinement_mask.as_deref(),
             width,
             height,
-            rect,
-            pixel_span,
-            max_iter,
-            series_degree as usize,
-            &mut contexts,
-            &mut scratch,
-            &palette,
+            palette.as_ref(),
         )
     } else {
         empty_render_boundary_stats()
@@ -1067,6 +1116,11 @@ pub fn render_tile_cached(
     };
     let refinement_smooth_values_output = if render_mode == "final" && unresolved_count > 0 {
         smooth_values.clone()
+    } else {
+        None
+    };
+    let refinement_distance_values_output = if render_mode == "final" && unresolved_count > 0 {
+        distance_values.clone()
     } else {
         None
     };
@@ -1102,6 +1156,7 @@ pub fn render_tile_cached(
         rgba,
         unresolved_mask_output,
         refinement_smooth_values_output,
+        refinement_distance_values_output,
         refinement_escaped_mask_output,
         unresolved_clusters,
         elapsed_ms,
@@ -1171,7 +1226,8 @@ pub fn render_tile_exact(
     let pixel_span = bf_from_f64(BASE_VIEW_WIDTH, bits)
         .div(&scale, p, RM)
         .div(&bf_from_f64(canvas_width.max(1.0), bits), p, RM);
-    let palette = create_render_palette();
+    let pixel_span_f64 = bf_to_f64(&pixel_span).abs();
+    let palette = RENDER_PALETTE_CACHE.with(Rc::clone);
     let exact_input = prepare_exact_input(width, height, base_rgba, exact_mask);
     let mut rgba = exact_input.rgba;
     let mask = exact_input.mask;
@@ -1181,6 +1237,8 @@ pub fn render_tile_exact(
     let mut escaped_mask = vec![0u8; width * height];
     let mut cap_hit_unknown_mask = vec![0u8; width * height];
     let unresolved_mask = vec![0u8; width * height];
+    let mut smooth_values = vec![0f32; width * height];
+    let mut distance_values = vec![-1f32; width * height];
 
     for py in 0..height {
         let screen_y = (rect.y + rect.height - 0.5).min(rect.y + py as f64 + 0.5);
@@ -1195,27 +1253,40 @@ pub fn render_tile_exact(
             let screen_x = (rect.x + rect.width - 0.5).min(rect.x + px as f64 + 0.5);
             let dx = bf_from_f64(screen_x - center_screen_x, bits);
             let cr = center_re.add(&pixel_span.mul(&dx, p, RM), p, RM);
-            let exact = run_exact_escape_with_mag2(&cr, &ci, max_iter, p);
+            let exact = run_exact_escape_with_mag2(&cr, &ci, max_iter, p, pixel_span_f64);
             if exact.iter < max_iter {
                 escaped_pixels += 1;
                 record_render_escaped_iter(&mut iter_stats, exact.iter, max_iter);
                 escaped_mask[pixel_index] = 1;
+                distance_values[pixel_index] = exact.distance_px as f32;
             } else {
                 iter_stats.cap_hit_unknown_count += 1;
                 cap_hit_unknown_mask[pixel_index] = 1;
             }
             let smooth = render_smooth_iteration(exact.iter, max_iter, exact.mag2);
+            smooth_values[pixel_index] = smooth as f32;
             write_render_color_for_smooth(
                 &mut rgba,
                 pixel_index * 4,
                 exact.iter >= max_iter,
                 smooth,
-                &palette,
+                palette.colors.as_slice(),
             );
         }
     }
     iter_stats.cap_hit_boundary_count =
         count_render_cap_hit_boundary(&cap_hit_unknown_mask, &escaped_mask, &unresolved_mask, width, height);
+    let boundary_stats = apply_render_bandlimited_shading(
+        &mut rgba,
+        &smooth_values,
+        &distance_values,
+        &escaped_mask,
+        &unresolved_mask,
+        mask.as_deref(),
+        width,
+        height,
+        palette.as_ref(),
+    );
     let iter_summary = summarize_render_iter_stats(iter_stats);
 
     build_render_tile_value(
@@ -1225,6 +1296,7 @@ pub fn render_tile_exact(
         width,
         height,
         rgba,
+        None,
         None,
         None,
         None,
@@ -1240,7 +1312,7 @@ pub fn render_tile_exact(
         0,
         0,
         0,
-        empty_render_boundary_stats(),
+        boundary_stats,
         Vec::new(),
         None,
         None,
@@ -1258,6 +1330,7 @@ struct RefinementInput {
     rgba: Vec<u8>,
     mask: Vec<u8>,
     smooth_values: Vec<f32>,
+    distance_values: Vec<f32>,
     escaped_mask: Vec<u8>,
 }
 
@@ -1282,6 +1355,7 @@ fn prepare_refinement_input(
     base_rgba: Uint8Array,
     refinement_mask: Uint8Array,
     refinement_smooth_values: Float32Array,
+    refinement_distance_values: Float32Array,
     refinement_escaped_mask: Uint8Array,
 ) -> Option<RefinementInput> {
     let pixel_count = width * height;
@@ -1296,6 +1370,11 @@ fn prepare_refinement_input(
         rgba: base_rgba.to_vec(),
         mask: refinement_mask.to_vec(),
         smooth_values: refinement_smooth_values.to_vec(),
+        distance_values: if refinement_distance_values.length() as usize == pixel_count {
+            refinement_distance_values.to_vec()
+        } else {
+            vec![-1f32; pixel_count]
+        },
         escaped_mask: refinement_escaped_mask.to_vec(),
     })
 }
@@ -1307,6 +1386,7 @@ fn should_render_exact_pixel(mask: Option<&[u8]>, pixel_index: usize) -> bool {
 struct ExactEscape64 {
     iter: u32,
     mag2: f64,
+    distance_px: f64,
 }
 
 fn run_exact_escape_with_mag2(
@@ -1314,30 +1394,54 @@ fn run_exact_escape_with_mag2(
     ci: &BigFloat,
     max_iter: u32,
     p: usize,
+    pixel_span: f64,
 ) -> ExactEscape64 {
     let mut zr = BigFloat::from_word(0, p);
     let mut zi = BigFloat::from_word(0, p);
+    let mut derivative_re = 0.0;
+    let mut derivative_im = 0.0;
     let four = BigFloat::from_word(4, p);
 
     for iter in 0..max_iter {
         if iter > 0 {
             let mag2 = zr.mul(&zr, p, RM).add(&zi.mul(&zi, p, RM), p, RM);
             if mag2.cmp(&four).is_some_and(|v| v > 0) {
+                let mag2 = bf_to_f64(&mag2);
+                let z_re = bf_to_f64(&zr);
+                let z_im = bf_to_f64(&zi);
                 return ExactEscape64 {
                     iter,
-                    mag2: bf_to_f64(&mag2),
+                    mag2,
+                    distance_px: render_refined_distance_estimate_px(
+                        z_re,
+                        z_im,
+                        derivative_re,
+                        derivative_im,
+                        bf_to_f64(cr),
+                        bf_to_f64(ci),
+                        pixel_span,
+                    ),
                 };
             }
         }
+        let current_re = bf_to_f64(&zr);
+        let current_im = bf_to_f64(&zi);
+        let next_derivative_re =
+            2.0 * (current_re * derivative_re - current_im * derivative_im) + pixel_span;
+        let next_derivative_im =
+            2.0 * (current_re * derivative_im + current_im * derivative_re);
         let (next_re, next_im) = step_two_mul(&zr, &zi, cr, ci, p);
         zr = next_re;
         zi = next_im;
+        derivative_re = next_derivative_re;
+        derivative_im = next_derivative_im;
     }
 
     let mag2 = zr.mul(&zr, p, RM).add(&zi.mul(&zi, p, RM), p, RM);
     ExactEscape64 {
         iter: max_iter,
         mag2: bf_to_f64(&mag2),
+        distance_px: -1.0,
     }
 }
 
@@ -1942,6 +2046,7 @@ fn build_render_tile_value(
     rgba: Vec<u8>,
     unresolved_mask: Option<Vec<u8>>,
     refinement_smooth_values: Option<Vec<f32>>,
+    refinement_distance_values: Option<Vec<f32>>,
     refinement_escaped_mask: Option<Vec<u8>>,
     unresolved_clusters: Vec<UnresolvedCluster64>,
     elapsed_ms: f64,
@@ -1978,6 +2083,10 @@ fn build_render_tile_value(
     if let Some(values) = refinement_smooth_values {
         let values_array = Float32Array::from(values.as_slice());
         set_js_property(&object, "refinementSmoothValues", &values_array.buffer().into())?;
+    }
+    if let Some(values) = refinement_distance_values {
+        let values_array = Float32Array::from(values.as_slice());
+        set_js_property(&object, "refinementDistanceValues", &values_array.buffer().into())?;
     }
     if let Some(mask) = refinement_escaped_mask {
         let mask_array = Uint8Array::from(mask.as_slice());
@@ -2060,23 +2169,23 @@ fn build_render_tile_value(
     set_js_property(&stats, "seriesSkip", &JsValue::from_f64(series_skip as f64))?;
     set_js_property(
         &stats,
-        "boundaryDampenedCount",
-        &JsValue::from_f64(boundary_stats.boundary_dampened_count as f64),
+        "distanceEstimatedCount",
+        &JsValue::from_f64(boundary_stats.distance_estimated_count as f64),
     )?;
     set_js_property(
         &stats,
-        "aaPixelCount",
-        &JsValue::from_f64(boundary_stats.aa_pixel_count as f64),
+        "paletteFilteredCount",
+        &JsValue::from_f64(boundary_stats.palette_filtered_count as f64),
     )?;
     set_js_property(
         &stats,
-        "aaSampleCount",
-        &JsValue::from_f64(boundary_stats.aa_sample_count as f64),
+        "boundaryCoverageCount",
+        &JsValue::from_f64(boundary_stats.boundary_coverage_count as f64),
     )?;
     set_js_property(
         &stats,
-        "aaFallbackCount",
-        &JsValue::from_f64(boundary_stats.aa_fallback_count as f64),
+        "maxPaletteFootprint",
+        &JsValue::from_f64(boundary_stats.max_palette_footprint),
     )?;
     let used_ids = Array::new();
     for id in &reference_ids_used {
@@ -2192,6 +2301,7 @@ fn render_pixel_with_references64(
     series_degree: usize,
     contexts: &mut [RenderContext],
     scratch: &mut PeriodicScratch64,
+    compute_distance: bool,
 ) -> PixelSelection64 {
     let mut has_best_unresolved = false;
     let mut best_unresolved = failure_result64(
@@ -2217,11 +2327,13 @@ fn render_pixel_with_references64(
         let result = perturb64(
             c_re,
             c_im,
+            pixel_span,
             &contexts[index].reference.orbit_re,
             &contexts[index].reference.orbit_im,
             max_iter,
             series,
             allow_periodic_interior,
+            compute_distance,
             scratch,
         );
         max_skip = max_skip.max(series.skip);
@@ -2262,11 +2374,13 @@ fn ensure_render_series(context: &mut RenderContext, series_degree: usize) {
 fn perturb64(
     c_re: f64,
     c_im: f64,
+    pixel_span: f64,
     orbit_re: &[f64],
     orbit_im: &[f64],
     max_iter: u32,
     series: &SeriesPlan64,
     allow_periodic_interior: bool,
+    compute_distance: bool,
     scratch: &mut PeriodicScratch64,
 ) -> PixelResult64 {
     let mut dz_re = 0.0;
@@ -2274,6 +2388,8 @@ fn perturb64(
     let mut iter = 0u32;
     let mut ref_index = 0usize;
     let mut mag2 = 0.0;
+    let mut derivative_re = 0.0;
+    let mut derivative_im = 0.0;
     let mut glitch = false;
     let mut failure_kind = FailureKind64::EarlyReferenceEscape;
     let mut rebase_count = 0u32;
@@ -2284,9 +2400,17 @@ fn perturb64(
     let mut checkpoint_index = 0usize;
 
     if series.skip > 0 {
-        let dz = evaluate_series64(series, c_re, c_im);
-        dz_re = dz.re;
-        dz_im = dz.im;
+        if compute_distance {
+            let dz = evaluate_series_with_derivative64(series, c_re, c_im);
+            dz_re = dz.value.re;
+            dz_im = dz.value.im;
+            derivative_re = dz.derivative.re * pixel_span;
+            derivative_im = dz.derivative.im * pixel_span;
+        } else {
+            let dz = evaluate_series64(series, c_re, c_im);
+            dz_re = dz.re;
+            dz_im = dz.im;
+        }
         iter = series.skip as u32;
         ref_index = series.skip;
     }
@@ -2326,6 +2450,19 @@ fn perturb64(
             return success_result64(
                 iter,
                 mag2,
+                if compute_distance {
+                    render_refined_distance_estimate_px(
+                        z_re,
+                        z_im,
+                        derivative_re,
+                        derivative_im,
+                        orbit_re.get(1).copied().unwrap_or(0.0) + c_re,
+                        orbit_im.get(1).copied().unwrap_or(0.0) + c_im,
+                        pixel_span,
+                    )
+                } else {
+                    -1.0
+                },
                 glitch,
                 false,
                 rebase_count,
@@ -2338,6 +2475,7 @@ fn perturb64(
             return success_result64(
                 max_iter,
                 mag2,
+                -1.0,
                 false,
                 false,
                 rebase_count,
@@ -2361,6 +2499,7 @@ fn perturb64(
                     return success_result64(
                         max_iter,
                         mag2,
+                        -1.0,
                         false,
                         true,
                         rebase_count,
@@ -2425,12 +2564,24 @@ fn perturb64(
             break;
         }
 
+        let next_derivative_re = if compute_distance {
+            2.0 * (z_re * derivative_re - z_im * derivative_im) + pixel_span
+        } else {
+            0.0
+        };
+        let next_derivative_im = if compute_distance {
+            2.0 * (z_re * derivative_im + z_im * derivative_re)
+        } else {
+            0.0
+        };
         let dz2_re = dz_re * dz_re - dz_im * dz_im;
         let dz2_im = 2.0 * dz_re * dz_im;
         let two_ref_dz_re = 2.0 * (step_ref_re * dz_re - step_ref_im * dz_im);
         let two_ref_dz_im = 2.0 * (step_ref_re * dz_im + step_ref_im * dz_re);
         dz_re = two_ref_dz_re + dz2_re + c_re;
         dz_im = two_ref_dz_im + dz2_im + c_im;
+        derivative_re = next_derivative_re;
+        derivative_im = next_derivative_im;
         iter += 1;
         ref_index += 1;
 
@@ -2462,6 +2613,7 @@ fn perturb64(
     success_result64(
         max_iter,
         mag2,
+        -1.0,
         false,
         false,
         rebase_count,
@@ -2474,6 +2626,7 @@ fn perturb64(
 fn success_result64(
     iter: u32,
     mag2: f64,
+    distance_px: f64,
     glitch: bool,
     periodic_interior: bool,
     rebase_count: u32,
@@ -2484,6 +2637,7 @@ fn success_result64(
     PixelResult64 {
         iter,
         mag2,
+        distance_px,
         glitch,
         unresolved: false,
         failure_kind: FailureKind64::None,
@@ -2510,6 +2664,7 @@ fn failure_result64(
     PixelResult64 {
         iter,
         mag2,
+        distance_px: -1.0,
         glitch,
         unresolved: true,
         failure_kind,
@@ -2694,6 +2849,33 @@ fn evaluate_series64(plan: &SeriesPlan64, c_re: f64, c_im: f64) -> Complex64 {
     Complex64 {
         re: zr * c_re - zi * c_im,
         im: zr * c_im + zi * c_re,
+    }
+}
+
+fn evaluate_series_with_derivative64(plan: &SeriesPlan64, c_re: f64, c_im: f64) -> SeriesEvaluation64 {
+    let mut value_re = 0.0;
+    let mut value_im = 0.0;
+    let mut derivative_re = 0.0;
+    let mut derivative_im = 0.0;
+    for k in (1..=plan.degree).rev() {
+        let next_derivative_re = derivative_re * c_re - derivative_im * c_im + value_re;
+        let next_derivative_im = derivative_re * c_im + derivative_im * c_re + value_im;
+        let next_value_re = value_re * c_re - value_im * c_im + plan.coeff_re[k];
+        let next_value_im = value_re * c_im + value_im * c_re + plan.coeff_im[k];
+        derivative_re = next_derivative_re;
+        derivative_im = next_derivative_im;
+        value_re = next_value_re;
+        value_im = next_value_im;
+    }
+    SeriesEvaluation64 {
+        value: Complex64 {
+            re: value_re * c_re - value_im * c_im,
+            im: value_re * c_im + value_im * c_re,
+        },
+        derivative: Complex64 {
+            re: derivative_re * c_re - derivative_im * c_im + value_re,
+            im: derivative_re * c_im + derivative_im * c_re + value_im,
+        },
     }
 }
 
@@ -2959,161 +3141,107 @@ fn suggested_precision_bits_for_cluster(survived_iter: u32) -> u32 {
     (128 + orbit_margin).clamp(128, 4096)
 }
 
-#[allow(clippy::too_many_arguments)]
-fn apply_render_boundary_smoothing(
+fn apply_render_bandlimited_shading(
     buffer: &mut [u8],
     smooth_values: &[f32],
+    distance_values: &[f32],
     escaped_mask: &[u8],
     unresolved_mask: &[u8],
+    render_mask: Option<&[u8]>,
     width: usize,
     height: usize,
-    rect: Rect64,
-    pixel_span: f64,
-    max_iter: u32,
-    series_degree: usize,
-    contexts: &mut [RenderContext],
-    scratch: &mut PeriodicScratch64,
-    palette: &[u8],
+    palette: &RenderPaletteCache,
 ) -> BoundaryStats64 {
-    if width <= 1 || height <= 1 {
+    let pixel_count = width * height;
+    if pixel_count == 0
+        || smooth_values.len() < pixel_count
+        || distance_values.len() < pixel_count
+    {
         return empty_render_boundary_stats();
     }
-    let mut edge_strengths = vec![0f32; width * height];
-    let mut classification_changes = vec![0u8; width * height];
-    let mut candidates: Vec<BoundaryCandidate64> = Vec::new();
-    let mut boundary_dampened_count = 0u32;
-
-    for y in 0..height {
-        for x in 0..width {
-            let index = y * width + x;
-            if unresolved_mask[index] != 0 {
-                continue;
-            }
-            let edge = render_edge_strength_at(
-                index,
-                x,
-                y,
-                width,
-                height,
-                smooth_values,
-                escaped_mask,
-                unresolved_mask,
-            );
-            edge_strengths[index] = edge.edge_strength as f32;
-            if edge.classification_change {
-                classification_changes[index] = 1;
-            }
-            if edge.edge_strength >= RENDER_AA_EDGE_THRESHOLD {
-                candidates.push(BoundaryCandidate64 {
-                    index,
-                    edge_strength: edge.edge_strength,
-                    classification_change: edge.classification_change,
-                });
-            }
+    let mut distance_estimated_count = 0u32;
+    let mut palette_filtered_count = 0u32;
+    let mut boundary_coverage_count = 0u32;
+    let mut max_palette_footprint = 0.0f64;
+    for index in 0..pixel_count {
+        if render_mask.is_some_and(|mask| mask[index] == 0) {
+            continue;
         }
-    }
+        if unresolved_mask[index] != 0 || escaped_mask[index] == 0 {
+            continue;
+        }
+        let distance_px = distance_values[index] as f64;
+        if !distance_px.is_finite() || distance_px < 0.0 {
+            continue;
+        }
+        distance_estimated_count += 1;
+        let footprint = RENDER_PALETTE_CYCLE_SCALE
+            / (std::f64::consts::LN_2 * distance_px.max(f64::EPSILON));
+        max_palette_footprint = max_palette_footprint.max(footprint);
+        let offset = index * 4;
+        let mut color = LinearColor64 {
+            r: palette.srgb_to_linear[buffer[offset] as usize],
+            g: palette.srgb_to_linear[buffer[offset + 1] as usize],
+            b: palette.srgb_to_linear[buffer[offset + 2] as usize],
+        };
 
-    candidates.sort_by(|a, b| {
-        b.classification_change
-            .cmp(&a.classification_change)
-            .then_with(|| b.edge_strength.total_cmp(&a.edge_strength))
-            .then_with(|| a.index.cmp(&b.index))
-    });
-    let aa_limit = candidates
-        .len()
-        .min(RENDER_AA_PIXEL_CAP)
-        .min(((width * height) as f64 * RENDER_AA_PIXEL_FRACTION).ceil() as usize);
-    let four_sample_limit = aa_limit
-        .min(RENDER_AA_FOUR_SAMPLE_CAP)
-        .min(((width * height) as f64 * RENDER_AA_FOUR_SAMPLE_FRACTION).ceil() as usize);
-    let mut aa_pixel_count = 0u32;
-    let mut aa_sample_count = 0u32;
-    let mut aa_fallback_count = 0u32;
-    let mut supersampled_mask = vec![0u8; width * height];
-
-    if !contexts.is_empty() {
-        let pixel_step_x = rect.width / width as f64;
-        let pixel_step_y = rect.height / height as f64;
-        for candidate_index in 0..aa_limit {
-            let candidate = candidates[candidate_index];
-            let x = candidate.index % width;
-            let y = candidate.index / width;
-            let screen_x = (rect.x + rect.width - 0.5 * pixel_step_x)
-                .min(rect.x + (x as f64 + 0.5) * pixel_step_x);
-            let screen_y = (rect.y + rect.height - 0.5 * pixel_step_y)
-                .min(rect.y + (y as f64 + 0.5) * pixel_step_y);
-            let offsets: &[(f64, f64)] = if candidate_index < four_sample_limit {
-                &RENDER_FOUR_SAMPLE_OFFSETS
-            } else {
-                &RENDER_TWO_SAMPLE_OFFSETS
-            };
-            let fallbacks = render_supersample_pixel(
-                buffer,
-                candidate.index,
-                screen_x,
-                screen_y,
-                pixel_step_x,
-                pixel_step_y,
-                offsets,
-                pixel_span,
-                max_iter,
-                series_degree,
-                contexts,
-                scratch,
+        let filter_amount = smoothstep(
+            RENDER_PALETTE_FILTER_LOW,
+            RENDER_PALETTE_FILTER_HIGH,
+            footprint,
+        );
+        if filter_amount > 0.0 {
+            let filtered = integrated_render_palette_linear_color(
+                smooth_values[index] as f64,
+                footprint,
                 palette,
             );
-            aa_pixel_count += 1;
-            aa_sample_count += offsets.len() as u32;
-            aa_fallback_count += fallbacks;
-            supersampled_mask[candidate.index] = 1;
+            color = blend_render_linear_color(color, filtered, filter_amount);
+            palette_filtered_count += 1;
         }
-    }
 
-    for index in 0..edge_strengths.len() {
-        let edge_strength = edge_strengths[index] as f64;
-        if edge_strength <= 0.0 || unresolved_mask[index] != 0 || supersampled_mask[index] != 0 {
-            continue;
-        }
-        if escaped_mask[index] == 0 {
-            if classification_changes[index] == 0 {
-                continue;
-            }
-            if blend_render_interior_boundary_from_neighbors(
-                buffer,
-                index,
-                width,
-                height,
-                escaped_mask,
-                unresolved_mask,
-            ) {
-                boundary_dampened_count += 1;
-            }
-            continue;
-        }
-        let offset = index * 4;
-        let color = Color64 {
-            r: buffer[offset],
-            g: buffer[offset + 1],
-            b: buffer[offset + 2],
-        };
-        write_render_color(buffer, offset, dampen_render_chroma(color, edge_strength));
-        boundary_dampened_count += 1;
-    }
+        let chroma_recovery = smoothstep(
+            RENDER_DISTANCE_CHROMA_FULL_PX,
+            RENDER_DISTANCE_CHROMA_NONE_PX,
+            distance_px,
+        );
+        color = dampen_render_linear_chroma(color, 1.0 - chroma_recovery);
 
+        let coverage = RENDER_DISTANCE_COVERAGE_STRENGTH
+            * (1.0
+                - smoothstep(
+                    RENDER_DISTANCE_COVERAGE_FULL_PX,
+                    RENDER_DISTANCE_COVERAGE_NONE_PX,
+                    distance_px,
+                ));
+        if coverage > 0.0 {
+            color = blend_render_linear_color(
+                color,
+                LinearColor64 {
+                    r: palette.srgb_to_linear[RENDER_INTERIOR_R as usize],
+                    g: palette.srgb_to_linear[RENDER_INTERIOR_G as usize],
+                    b: palette.srgb_to_linear[RENDER_INTERIOR_B as usize],
+                },
+                coverage,
+            );
+            boundary_coverage_count += 1;
+        }
+        write_render_linear_color(buffer, offset, color);
+    }
     BoundaryStats64 {
-        boundary_dampened_count,
-        aa_pixel_count,
-        aa_sample_count,
-        aa_fallback_count,
+        distance_estimated_count,
+        palette_filtered_count,
+        boundary_coverage_count,
+        max_palette_footprint,
     }
 }
 
 fn empty_render_boundary_stats() -> BoundaryStats64 {
     BoundaryStats64 {
-        boundary_dampened_count: 0,
-        aa_pixel_count: 0,
-        aa_sample_count: 0,
-        aa_fallback_count: 0,
+        distance_estimated_count: 0,
+        palette_filtered_count: 0,
+        boundary_coverage_count: 0,
+        max_palette_footprint: 0.0,
     }
 }
 
@@ -3187,181 +3315,6 @@ fn count_render_cap_hit_boundary(
     count
 }
 
-fn render_edge_strength_at(
-    index: usize,
-    x: usize,
-    y: usize,
-    width: usize,
-    height: usize,
-    smooth_values: &[f32],
-    escaped_mask: &[u8],
-    unresolved_mask: &[u8],
-) -> RenderEdgeInfo64 {
-    let escaped = escaped_mask[index] != 0;
-    let smooth = smooth_values[index] as f64;
-    let mut max_smooth_delta = 0.0;
-    let mut classification_change = false;
-    for (dx, dy) in [(1isize, 0isize), (-1, 0), (0, 1), (0, -1)] {
-        let nx = x as isize + dx;
-        let ny = y as isize + dy;
-        if nx < 0 || ny < 0 || nx >= width as isize || ny >= height as isize {
-            continue;
-        }
-        let neighbor_index = ny as usize * width + nx as usize;
-        if unresolved_mask[neighbor_index] != 0 {
-            continue;
-        }
-        let neighbor_escaped = escaped_mask[neighbor_index] != 0;
-        if neighbor_escaped != escaped {
-            classification_change = true;
-        }
-        if neighbor_escaped && escaped {
-            max_smooth_delta = f64::max(
-                max_smooth_delta,
-                (smooth - smooth_values[neighbor_index] as f64).abs(),
-            );
-        } else if neighbor_escaped || escaped {
-            max_smooth_delta = f64::max(max_smooth_delta, RENDER_SMOOTH_DELTA_HIGH);
-        }
-    }
-    let smooth_edge = clamp01(
-        (max_smooth_delta - RENDER_SMOOTH_DELTA_LOW)
-            / (RENDER_SMOOTH_DELTA_HIGH - RENDER_SMOOTH_DELTA_LOW),
-    );
-    RenderEdgeInfo64 {
-        edge_strength: clamp01(
-            smooth_edge
-                + if classification_change {
-                    RENDER_CLASSIFICATION_EDGE_BOOST
-                } else {
-                    0.0
-                },
-        ),
-        classification_change,
-    }
-}
-
-#[allow(clippy::too_many_arguments)]
-fn render_supersample_pixel(
-    buffer: &mut [u8],
-    pixel_index: usize,
-    screen_x: f64,
-    screen_y: f64,
-    pixel_step_x: f64,
-    pixel_step_y: f64,
-    offsets: &[(f64, f64)],
-    pixel_span: f64,
-    max_iter: u32,
-    series_degree: usize,
-    contexts: &mut [RenderContext],
-    scratch: &mut PeriodicScratch64,
-    palette: &[u8],
-) -> u32 {
-    let base_offset = pixel_index * 4;
-    let mut linear_r = srgb_to_linear(buffer[base_offset] as f64 / 255.0);
-    let mut linear_g = srgb_to_linear(buffer[base_offset + 1] as f64 / 255.0);
-    let mut linear_b = srgb_to_linear(buffer[base_offset + 2] as f64 / 255.0);
-    let mut fallbacks = 0u32;
-
-    for (offset_x, offset_y) in offsets {
-        let selection = render_pixel_with_references64(
-            screen_x + offset_x * pixel_step_x,
-            screen_y + offset_y * pixel_step_y,
-            pixel_span,
-            max_iter,
-            series_degree,
-            contexts,
-            scratch,
-        );
-        let color = if selection.result.unresolved {
-            fallbacks += 1;
-            Color64 {
-                r: buffer[base_offset],
-                g: buffer[base_offset + 1],
-                b: buffer[base_offset + 2],
-            }
-        } else {
-            color_for_render_result(
-                selection.result.iter,
-                max_iter,
-                selection.result.mag2,
-                palette,
-            )
-        };
-        linear_r += srgb_to_linear(color.r as f64 / 255.0);
-        linear_g += srgb_to_linear(color.g as f64 / 255.0);
-        linear_b += srgb_to_linear(color.b as f64 / 255.0);
-    }
-
-    let divisor = offsets.len() as f64 + 1.0;
-    write_render_color(
-        buffer,
-        base_offset,
-        Color64 {
-            r: clamp_byte((linear_to_srgb(linear_r / divisor) * 255.0).round()),
-            g: clamp_byte((linear_to_srgb(linear_g / divisor) * 255.0).round()),
-            b: clamp_byte((linear_to_srgb(linear_b / divisor) * 255.0).round()),
-        },
-    );
-    fallbacks
-}
-
-fn blend_render_interior_boundary_from_neighbors(
-    buffer: &mut [u8],
-    pixel_index: usize,
-    width: usize,
-    height: usize,
-    escaped_mask: &[u8],
-    unresolved_mask: &[u8],
-) -> bool {
-    let x = pixel_index % width;
-    let y = pixel_index / width;
-    let base_offset = pixel_index * 4;
-    let mut linear_r = srgb_to_linear(buffer[base_offset] as f64 / 255.0);
-    let mut linear_g = srgb_to_linear(buffer[base_offset + 1] as f64 / 255.0);
-    let mut linear_b = srgb_to_linear(buffer[base_offset + 2] as f64 / 255.0);
-    let mut total_weight = 1.0;
-    let mut escaped_neighbors = 0u32;
-
-    for dy in -1isize..=1 {
-        for dx in -1isize..=1 {
-            if dx == 0 && dy == 0 {
-                continue;
-            }
-            let nx = x as isize + dx;
-            let ny = y as isize + dy;
-            if nx < 0 || ny < 0 || nx >= width as isize || ny >= height as isize {
-                continue;
-            }
-            let neighbor_index = ny as usize * width + nx as usize;
-            if unresolved_mask[neighbor_index] != 0 || escaped_mask[neighbor_index] == 0 {
-                continue;
-            }
-            let neighbor_offset = neighbor_index * 4;
-            let weight = if dx == 0 || dy == 0 { 1.0 } else { 0.5 };
-            linear_r += srgb_to_linear(buffer[neighbor_offset] as f64 / 255.0) * weight;
-            linear_g += srgb_to_linear(buffer[neighbor_offset + 1] as f64 / 255.0) * weight;
-            linear_b += srgb_to_linear(buffer[neighbor_offset + 2] as f64 / 255.0) * weight;
-            total_weight += weight;
-            escaped_neighbors += 1;
-        }
-    }
-
-    if escaped_neighbors == 0 {
-        return false;
-    }
-
-    write_render_color(
-        buffer,
-        base_offset,
-        Color64 {
-            r: clamp_byte((linear_to_srgb(linear_r / total_weight) * 255.0).round()),
-            g: clamp_byte((linear_to_srgb(linear_g / total_weight) * 255.0).round()),
-            b: clamp_byte((linear_to_srgb(linear_b / total_weight) * 255.0).round()),
-        },
-    );
-    true
-}
 
 fn fill_render_unresolved_preview(
     buffer: &mut [u8],
@@ -3468,19 +3421,6 @@ fn render_tile_probe_offsets(
     .collect()
 }
 
-fn color_for_render_result(iter: u32, max_iter: u32, mag2: f64, palette: &[u8]) -> Color64 {
-    if iter >= max_iter {
-        return Color64 { r: 4, g: 8, b: 16 };
-    }
-    let smooth = render_smooth_iteration(iter, max_iter, mag2);
-    let offset = render_palette_index(smooth) * 3;
-    Color64 {
-        r: palette[offset],
-        g: palette[offset + 1],
-        b: palette[offset + 2],
-    }
-}
-
 fn write_render_color_for_smooth(
     buffer: &mut [u8],
     offset: usize,
@@ -3489,9 +3429,9 @@ fn write_render_color_for_smooth(
     palette: &[u8],
 ) {
     if interior {
-        buffer[offset] = 4;
-        buffer[offset + 1] = 8;
-        buffer[offset + 2] = 16;
+        buffer[offset] = RENDER_INTERIOR_R;
+        buffer[offset + 1] = RENDER_INTERIOR_G;
+        buffer[offset + 2] = RENDER_INTERIOR_B;
         buffer[offset + 3] = 255;
         return;
     }
@@ -3515,8 +3455,62 @@ fn create_render_palette() -> Vec<u8> {
     palette
 }
 
+fn create_render_srgb_to_linear_lut() -> Vec<f64> {
+    (0..=255).map(|value| srgb_to_linear(value as f64 / 255.0)).collect()
+}
+
+fn create_render_palette_linear_prefix(linear_palette: &[f64]) -> Vec<f64> {
+    let mut prefix = vec![0.0; (RENDER_PALETTE_SIZE + 1) * 3];
+    for index in 0..RENDER_PALETTE_SIZE {
+        let source = index * 3;
+        let previous = index * 3;
+        let next = (index + 1) * 3;
+        prefix[next] = prefix[previous] + linear_palette[source] / RENDER_PALETTE_SIZE as f64;
+        prefix[next + 1] =
+            prefix[previous + 1] + linear_palette[source + 1] / RENDER_PALETTE_SIZE as f64;
+        prefix[next + 2] =
+            prefix[previous + 2] + linear_palette[source + 2] / RENDER_PALETTE_SIZE as f64;
+    }
+    prefix
+}
+
+fn integrated_render_palette_linear_color(
+    smooth: f64,
+    footprint: f64,
+    palette: &RenderPaletteCache,
+) -> LinearColor64 {
+    let width = footprint.max(f64::EPSILON);
+    let center = smooth * RENDER_PALETTE_CYCLE_SCALE;
+    let low = center - width * 0.5;
+    let high = center + width * 0.5;
+    let linear_r = (render_palette_integral(high, 0, palette)
+        - render_palette_integral(low, 0, palette))
+        / width;
+    let linear_g = (render_palette_integral(high, 1, palette)
+        - render_palette_integral(low, 1, palette))
+        / width;
+    let linear_b = (render_palette_integral(high, 2, palette)
+        - render_palette_integral(low, 2, palette))
+        / width;
+    LinearColor64 { r: linear_r, g: linear_g, b: linear_b }
+}
+
+fn render_palette_integral(position: f64, channel: usize, palette: &RenderPaletteCache) -> f64 {
+    let cycle = position.floor();
+    let fraction = position - cycle;
+    let scaled = fraction * RENDER_PALETTE_SIZE as f64;
+    let index = (scaled.floor() as usize).min(RENDER_PALETTE_SIZE - 1);
+    let remainder = scaled - index as f64;
+    let cycle_integral = palette.linear_prefix[RENDER_PALETTE_SIZE * 3 + channel];
+    let prefix = palette.linear_prefix[index * 3 + channel];
+    let sample = palette.linear_colors[index * 3 + channel];
+    cycle * cycle_integral
+        + prefix
+        + sample * remainder / RENDER_PALETTE_SIZE as f64
+}
+
 fn render_palette_index(smooth: f64) -> usize {
-    let value = smooth * 0.018;
+    let value = smooth * RENDER_PALETTE_CYCLE_SCALE;
     let fraction = value - value.floor();
     ((fraction * RENDER_PALETTE_SIZE as f64).floor().max(0.0) as usize).min(RENDER_PALETTE_SIZE - 1)
 }
@@ -3532,24 +3526,85 @@ fn render_smooth_iteration(iter: u32, max_iter: u32, mag2: f64) -> f64 {
             * RENDER_INV_LN2
 }
 
-fn dampen_render_chroma(color: Color64, edge_strength: f64) -> Color64 {
-    let chroma_scale = 1.0 - (1.0 - RENDER_MIN_EDGE_CHROMA_SCALE) * clamp01(edge_strength);
-    let linear_r = srgb_to_linear(color.r as f64 / 255.0);
-    let linear_g = srgb_to_linear(color.g as f64 / 255.0);
-    let linear_b = srgb_to_linear(color.b as f64 / 255.0);
-    let luma = 0.2126 * linear_r + 0.7152 * linear_g + 0.0722 * linear_b;
-    Color64 {
-        r: clamp_byte((linear_to_srgb(luma + (linear_r - luma) * chroma_scale) * 255.0).round()),
-        g: clamp_byte((linear_to_srgb(luma + (linear_g - luma) * chroma_scale) * 255.0).round()),
-        b: clamp_byte((linear_to_srgb(luma + (linear_b - luma) * chroma_scale) * 255.0).round()),
+fn render_distance_estimate_px(mag2: f64, derivative_re: f64, derivative_im: f64) -> f64 {
+    if !mag2.is_finite() || mag2 <= 4.0 {
+        return -1.0;
+    }
+    let z_abs = mag2.sqrt();
+    let derivative_abs = derivative_re.hypot(derivative_im);
+    if !z_abs.is_finite() || !derivative_abs.is_finite() || derivative_abs <= 0.0 {
+        return -1.0;
+    }
+    let distance = z_abs * z_abs.ln() / derivative_abs;
+    if distance.is_finite() && distance >= 0.0 {
+        distance
+    } else {
+        -1.0
     }
 }
 
-fn write_render_color(buffer: &mut [u8], offset: usize, color: Color64) {
-    buffer[offset] = color.r;
-    buffer[offset + 1] = color.g;
-    buffer[offset + 2] = color.b;
+fn render_refined_distance_estimate_px(
+    mut z_re: f64,
+    mut z_im: f64,
+    mut derivative_re: f64,
+    mut derivative_im: f64,
+    c_re: f64,
+    c_im: f64,
+    pixel_span: f64,
+) -> f64 {
+    let mut mag2 = z_re * z_re + z_im * z_im;
+    if !mag2.is_finite() || !c_re.is_finite() || !c_im.is_finite() {
+        return render_distance_estimate_px(mag2, derivative_re, derivative_im);
+    }
+    for _ in 0..RENDER_DISTANCE_EXTRA_ITERATIONS {
+        let next_derivative_re = 2.0 * (z_re * derivative_re - z_im * derivative_im) + pixel_span;
+        let next_derivative_im = 2.0 * (z_re * derivative_im + z_im * derivative_re);
+        let next_z_re = z_re * z_re - z_im * z_im + c_re;
+        let next_z_im = 2.0 * z_re * z_im + c_im;
+        let next_mag2 = next_z_re * next_z_re + next_z_im * next_z_im;
+        if !next_mag2.is_finite() || !next_derivative_re.is_finite() || !next_derivative_im.is_finite() {
+            break;
+        }
+        z_re = next_z_re;
+        z_im = next_z_im;
+        derivative_re = next_derivative_re;
+        derivative_im = next_derivative_im;
+        mag2 = next_mag2;
+        if mag2 > 1e64 {
+            break;
+        }
+    }
+    render_distance_estimate_px(mag2, derivative_re, derivative_im)
+}
+
+fn dampen_render_linear_chroma(color: LinearColor64, edge_strength: f64) -> LinearColor64 {
+    let chroma_scale = 1.0 - (1.0 - RENDER_MIN_EDGE_CHROMA_SCALE) * clamp01(edge_strength);
+    let luma = 0.2126 * color.r + 0.7152 * color.g + 0.0722 * color.b;
+    LinearColor64 {
+        r: luma + (color.r - luma) * chroma_scale,
+        g: luma + (color.g - luma) * chroma_scale,
+        b: luma + (color.b - luma) * chroma_scale,
+    }
+}
+
+fn blend_render_linear_color(from: LinearColor64, to: LinearColor64, amount: f64) -> LinearColor64 {
+    let t = clamp01(amount);
+    LinearColor64 {
+        r: from.r + (to.r - from.r) * t,
+        g: from.g + (to.g - from.g) * t,
+        b: from.b + (to.b - from.b) * t,
+    }
+}
+
+fn write_render_linear_color(buffer: &mut [u8], offset: usize, color: LinearColor64) {
+    buffer[offset] = linear_channel_to_byte(color.r);
+    buffer[offset + 1] = linear_channel_to_byte(color.g);
+    buffer[offset + 2] = linear_channel_to_byte(color.b);
     buffer[offset + 3] = 255;
+}
+
+fn linear_channel_to_byte(value: f64) -> u8 {
+    clamp_byte(linear_to_srgb(value) * 255.0)
 }
 
 fn srgb_to_linear(value: f64) -> f64 {
@@ -3574,6 +3629,14 @@ fn clamp01(value: f64) -> f64 {
         return 0.0;
     }
     value.max(0.0).min(1.0)
+}
+
+fn smoothstep(low: f64, high: f64, value: f64) -> f64 {
+    if high <= low {
+        return if value >= high { 1.0 } else { 0.0 };
+    }
+    let t = clamp01((value - low) / (high - low));
+    t * t * (3.0 - 2.0 * t)
 }
 
 fn clamp_byte(value: f64) -> u8 {

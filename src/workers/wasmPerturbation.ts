@@ -50,6 +50,10 @@ export async function renderPerturbationTileWasm(message: RenderTileMessage): Pr
         nearCapEscapedCount: raw.stats.nearCapEscapedCount ?? 0,
         capHitUnknownCount: raw.stats.capHitUnknownCount ?? 0,
         capHitBoundaryCount: raw.stats.capHitBoundaryCount ?? 0,
+        distanceEstimatedCount: raw.stats.distanceEstimatedCount ?? 0,
+        paletteFilteredCount: raw.stats.paletteFilteredCount ?? 0,
+        boundaryCoverageCount: raw.stats.boundaryCoverageCount ?? 0,
+        maxPaletteFootprint: raw.stats.maxPaletteFootprint ?? 0,
         referenceCacheMissCount: 0,
         exactFallbackPixels: raw.stats.exactFallbackPixels ?? raw.width * raw.height
       }
@@ -89,6 +93,7 @@ export async function renderPerturbationTileWasm(message: RenderTileMessage): Pr
     message.refinementBaseRgba ? new Uint8Array(message.refinementBaseRgba) : new Uint8Array(),
     message.refinementUnresolvedMask ? new Uint8Array(message.refinementUnresolvedMask) : new Uint8Array(),
     message.refinementSmoothValues ? new Float32Array(message.refinementSmoothValues) : new Float32Array(),
+    message.refinementDistanceValues ? new Float32Array(message.refinementDistanceValues) : new Float32Array(),
     message.refinementEscapedMask ? new Uint8Array(message.refinementEscapedMask) : new Uint8Array()
   ) as TileDoneMessage;
 
@@ -98,6 +103,7 @@ export async function renderPerturbationTileWasm(message: RenderTileMessage): Pr
     rgba,
     unresolvedMask: normalizeOptionalBuffer(raw.unresolvedMask),
     refinementSmoothValues: normalizeOptionalBuffer(raw.refinementSmoothValues),
+    refinementDistanceValues: normalizeOptionalBuffer(raw.refinementDistanceValues),
     refinementEscapedMask: normalizeOptionalBuffer(raw.refinementEscapedMask),
     stats: {
       ...raw.stats,
@@ -106,6 +112,10 @@ export async function renderPerturbationTileWasm(message: RenderTileMessage): Pr
       nearCapEscapedCount: raw.stats.nearCapEscapedCount ?? 0,
       capHitUnknownCount: raw.stats.capHitUnknownCount ?? 0,
       capHitBoundaryCount: raw.stats.capHitBoundaryCount ?? 0,
+      distanceEstimatedCount: raw.stats.distanceEstimatedCount ?? 0,
+      paletteFilteredCount: raw.stats.paletteFilteredCount ?? 0,
+      boundaryCoverageCount: raw.stats.boundaryCoverageCount ?? 0,
+      maxPaletteFootprint: raw.stats.maxPaletteFootprint ?? 0,
       referenceCacheMissCount: (raw.stats.referenceCacheMissCount ?? 0) + cacheMisses,
       exactFallbackPixels: raw.stats.exactFallbackPixels ?? 0
     }
