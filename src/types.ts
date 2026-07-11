@@ -120,6 +120,7 @@ export interface TileStats {
   seriesSkip: number;
   distanceEstimatedCount: number;
   paletteFilteredCount: number;
+  distanceColorizedCount: number;
   boundaryCoverageCount: number;
   maxPaletteFootprint: number;
   referenceId: string;

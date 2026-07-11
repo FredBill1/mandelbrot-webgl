@@ -363,6 +363,7 @@ function installWorkerProbe() {
       maxSeriesSkip: 0,
       distanceEstimatedCount: 0,
       paletteFilteredCount: 0,
+      distanceColorizedCount: 0,
       boundaryCoverageCount: 0,
       maxPaletteFootprint: 0,
       totalGlitches: 0,
@@ -483,6 +484,7 @@ function installWorkerProbe() {
           bench.waves.maxSeriesSkip = Math.max(bench.waves.maxSeriesSkip, data.stats.seriesSkip);
           bench.waves.distanceEstimatedCount += data.stats.distanceEstimatedCount ?? 0;
           bench.waves.paletteFilteredCount += data.stats.paletteFilteredCount ?? 0;
+          bench.waves.distanceColorizedCount += data.stats.distanceColorizedCount ?? 0;
           bench.waves.boundaryCoverageCount += data.stats.boundaryCoverageCount ?? 0;
           bench.waves.maxPaletteFootprint = Math.max(
             bench.waves.maxPaletteFootprint,
@@ -508,6 +510,7 @@ function installWorkerProbe() {
             periodicInterior: data.stats.periodicInteriorCount,
             distanceEstimated: data.stats.distanceEstimatedCount,
             paletteFiltered: data.stats.paletteFilteredCount,
+            distanceColorized: data.stats.distanceColorizedCount,
             boundaryCoverage: data.stats.boundaryCoverageCount,
             maxPaletteFootprint: data.stats.maxPaletteFootprint,
             refsUsed: data.stats.referenceIdsUsed.length,
@@ -542,6 +545,7 @@ function installWorkerProbe() {
               periodicInterior: data.stats.periodicInteriorCount,
               distanceEstimated: data.stats.distanceEstimatedCount,
               paletteFiltered: data.stats.paletteFilteredCount,
+              distanceColorized: data.stats.distanceColorizedCount,
               boundaryCoverage: data.stats.boundaryCoverageCount,
               maxPaletteFootprint: data.stats.maxPaletteFootprint,
               refsUsed: data.stats.referenceIdsUsed.length,
@@ -564,6 +568,7 @@ function installWorkerProbe() {
             periodicInterior: data.stats.periodicInteriorCount,
             distanceEstimated: data.stats.distanceEstimatedCount,
             paletteFiltered: data.stats.paletteFilteredCount,
+            distanceColorized: data.stats.distanceColorizedCount,
             boundaryCoverage: data.stats.boundaryCoverageCount,
             maxPaletteFootprint: data.stats.maxPaletteFootprint,
             refsUsed: data.stats.referenceIdsUsed.length,

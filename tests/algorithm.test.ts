@@ -4,9 +4,13 @@ import init, { apply_view_transform, compute_reference, compute_reference_3mul, 
 import { createVisibleTileShells } from "../src/tiles/tileKey";
 import { evaluateSeriesWithDerivative, type SeriesPlan } from "../src/math/series";
 import {
+  boundaryCoverageWeightForTests,
+  distanceColorWeightForTests,
   paletteFilterWeightForTests,
   renderPerturbationTile,
-  sampleIntegratedPaletteForTests
+  sampleIntegratedPaletteForTests,
+  samplePaletteForTests,
+  shadeBoundaryPixelForTests
 } from "../src/workers/perturbation";
 import { renderPerturbationTileWasm, resetWasmPerturbationCacheForTests } from "../src/workers/wasmPerturbation";
 import { SERIES_DEGREE, type ReferenceSnapshot, type RenderTileMessage, type TileDescriptor } from "../src/types";
@@ -51,6 +55,35 @@ describe("perturbation renderer", () => {
     expect(paletteFilterWeightForTests(0.5)).toBe(1);
     expect(paletteFilterWeightForTests(0.375)).toBeCloseTo(0.5, 12);
     expect(paletteFilterWeightForTests(0.3749)).toBeLessThan(paletteFilterWeightForTests(0.3751));
+  });
+
+  it("uses a continuous super-Nyquist transition for distance color", () => {
+    expect(distanceColorWeightForTests(0.5)).toBe(0);
+    expect(distanceColorWeightForTests(1)).toBe(1);
+    expect(distanceColorWeightForTests(0.75)).toBeCloseTo(0.5, 12);
+    expect(distanceColorWeightForTests(0.7499)).toBeLessThan(distanceColorWeightForTests(0.7501));
+  });
+
+  it("turns the former desaturated distance band into a smooth color contour", () => {
+    expect(distanceColorWeightForTests(0, 0.5)).toBe(1);
+    expect(distanceColorWeightForTests(0, 2)).toBe(0);
+    expect(distanceColorWeightForTests(0, 1.25)).toBeCloseTo(0.5, 12);
+  });
+
+  it("limits exterior-pixel interior coverage to one half", () => {
+    expect(boundaryCoverageWeightForTests(0)).toBe(0.5);
+    expect(boundaryCoverageWeightForTests(0.75)).toBe(0);
+    expect(boundaryCoverageWeightForTests(0.375)).toBeCloseTo(0.25, 12);
+    expect(boundaryCoverageWeightForTests(1)).toBe(0);
+  });
+
+  it("preserves resolved palette colors and keeps super-Nyquist pixels chromatic", () => {
+    const smooth = 37.25;
+    expect(shadeBoundaryPixelForTests(smooth, 10)).toEqual(samplePaletteForTests(smooth));
+
+    const colorized = shadeBoundaryPixelForTests(smooth, 1e-6);
+    const chroma = Math.max(...colorized) - Math.min(...colorized);
+    expect(chroma).toBeGreaterThanOrEqual(80);
   });
 
   it.each([
@@ -165,6 +198,7 @@ describe("perturbation renderer", () => {
       expect(wasmResult.stats.seriesSkip).toBe(tsResult.stats.seriesSkip);
       expect(wasmResult.stats.distanceEstimatedCount).toBe(tsResult.stats.distanceEstimatedCount);
       expect(wasmResult.stats.paletteFilteredCount).toBe(tsResult.stats.paletteFilteredCount);
+      expect(wasmResult.stats.distanceColorizedCount).toBe(tsResult.stats.distanceColorizedCount);
       expect(wasmResult.stats.boundaryCoverageCount).toBe(tsResult.stats.boundaryCoverageCount);
       expect(wasmResult.stats.maxPaletteFootprint).toBeCloseTo(tsResult.stats.maxPaletteFootprint, 5);
       expect(wasmResult.stats.referenceIdsUsed).toEqual(tsResult.stats.referenceIdsUsed);
@@ -406,6 +440,7 @@ describe("perturbation renderer", () => {
     expect(refined.stats.unresolvedCount).toBe(0);
     expect(new Uint8Array(refined.rgba)).toEqual(new Uint8Array(onePass.rgba));
     expect(refined.stats.paletteFilteredCount).toBe(onePass.stats.paletteFilteredCount);
+    expect(refined.stats.distanceColorizedCount).toBe(onePass.stats.distanceColorizedCount);
     expect(refined.stats.boundaryCoverageCount).toBe(onePass.stats.boundaryCoverageCount);
   });
 
@@ -497,6 +532,7 @@ describe("perturbation renderer", () => {
     expect(final.stats.unresolvedCount).toBe(preview.stats.unresolvedCount);
     expect(preview.stats.distanceEstimatedCount).toBe(0);
     expect(preview.stats.paletteFilteredCount).toBe(0);
+    expect(preview.stats.distanceColorizedCount).toBe(0);
     if (final.stats.unresolvedCount > 0) {
       expect(final.stats.distanceEstimatedCount).toBeLessThanOrEqual(final.width * final.height - final.stats.unresolvedCount);
     } else {

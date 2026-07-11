@@ -73,6 +73,7 @@ interface LinearColor {
 interface BoundaryStats {
   distanceEstimatedCount: number;
   paletteFilteredCount: number;
+  distanceColorizedCount: number;
   boundaryCoverageCount: number;
   maxPaletteFootprint: number;
 }
@@ -82,21 +83,23 @@ const REBASE_G = 1e-8;
 const MAX_REBASES_PER_PIXEL = 64;
 const SERIES_MAX_SKIP = 8192;
 const DISTANCE_EXTRA_ITERATIONS = 1;
-const MIN_EDGE_CHROMA_SCALE = 0.35;
-const DISTANCE_CHROMA_FULL_PX = 0.5;
-const DISTANCE_CHROMA_NONE_PX = 2.0;
-const DISTANCE_COVERAGE_FULL_PX = 0.25;
 const DISTANCE_COVERAGE_NONE_PX = 0.75;
-const DISTANCE_COVERAGE_STRENGTH = 0.75;
+const DISTANCE_COVERAGE_STRENGTH = 0.5;
 const INTERIOR_COLOR = { r: 4, g: 8, b: 16 } as const;
 const PALETTE_SIZE = 2048;
 const PALETTE_CYCLE_SCALE = 0.018;
 const PALETTE_FILTER_LOW = 0.25;
 const PALETTE_FILTER_HIGH = 0.5;
+const DISTANCE_COLOR_FILTER_LOW = 0.5;
+const DISTANCE_COLOR_FILTER_HIGH = 1.0;
+const DISTANCE_COLOR_FULL_PX = 0.5;
+const DISTANCE_COLOR_NONE_PX = 2.0;
+const DISTANCE_COLOR_PALETTE_PHASE = 0.64;
 const COSINE_PALETTE = createCosinePalette(PALETTE_SIZE);
 const SRGB_TO_LINEAR_LUT = createSrgbToLinearLut();
 const PALETTE_LINEAR_SAMPLES = createLinearPaletteSamples(COSINE_PALETTE);
 const PALETTE_LINEAR_PREFIX = createLinearPalettePrefix(PALETTE_LINEAR_SAMPLES);
+const DISTANCE_EDGE_LINEAR_COLOR = paletteLinearColorAtPhase(DISTANCE_COLOR_PALETTE_PHASE);
 const INTERIOR_LINEAR_COLOR = byteColorToLinear(INTERIOR_COLOR);
 const INV_LN2 = 1 / Math.LN2;
 const SMOOTH_LOG_SCALE = 0.5 * INV_LN2;
@@ -258,6 +261,7 @@ export function renderPerturbationTile(message: RenderTileMessage): TileDoneMess
       seriesSkip,
       distanceEstimatedCount: boundaryStats.distanceEstimatedCount,
       paletteFilteredCount: boundaryStats.paletteFilteredCount,
+      distanceColorizedCount: boundaryStats.distanceColorizedCount,
       boundaryCoverageCount: boundaryStats.boundaryCoverageCount,
       maxPaletteFootprint: boundaryStats.maxPaletteFootprint,
       referenceId: referenceIdsUsed[0] ?? contexts[0]?.reference.id ?? "",
@@ -696,6 +700,7 @@ function applyBandlimitedBoundaryShading(
   if (pixelCount === 0 || smoothValues.length < pixelCount || distanceValues.length < pixelCount) return emptyBoundaryStats();
   let distanceEstimatedCount = 0;
   let paletteFilteredCount = 0;
+  let distanceColorizedCount = 0;
   let boundaryCoverageCount = 0;
   let maxPaletteFootprint = 0;
 
@@ -719,11 +724,13 @@ function applyBandlimitedBoundaryShading(
       paletteFilteredCount += 1;
     }
 
-    const chromaRecovery = smoothstep(DISTANCE_CHROMA_FULL_PX, DISTANCE_CHROMA_NONE_PX, distancePx);
-    color = dampenLinearChroma(color, 1 - chromaRecovery);
+    const distanceColorAmount = distanceColorWeight(footprint, distancePx);
+    if (distanceColorAmount > 0) {
+      color = blendLinearColor(color, DISTANCE_EDGE_LINEAR_COLOR, distanceColorAmount);
+      distanceColorizedCount += 1;
+    }
 
-    const coverage = DISTANCE_COVERAGE_STRENGTH *
-      (1 - smoothstep(DISTANCE_COVERAGE_FULL_PX, DISTANCE_COVERAGE_NONE_PX, distancePx));
+    const coverage = boundaryCoverageWeight(distancePx);
     if (coverage > 0) {
       color = blendLinearColor(color, INTERIOR_LINEAR_COLOR, coverage);
       boundaryCoverageCount += 1;
@@ -731,11 +738,17 @@ function applyBandlimitedBoundaryShading(
     writeLinearColor(buffer, offset, color);
   }
 
-  return { distanceEstimatedCount, paletteFilteredCount, boundaryCoverageCount, maxPaletteFootprint };
+  return { distanceEstimatedCount, paletteFilteredCount, distanceColorizedCount, boundaryCoverageCount, maxPaletteFootprint };
 }
 
 function emptyBoundaryStats(): BoundaryStats {
-  return { distanceEstimatedCount: 0, paletteFilteredCount: 0, boundaryCoverageCount: 0, maxPaletteFootprint: 0 };
+  return {
+    distanceEstimatedCount: 0,
+    paletteFilteredCount: 0,
+    distanceColorizedCount: 0,
+    boundaryCoverageCount: 0,
+    maxPaletteFootprint: 0
+  };
 }
 
 function fillUnresolvedPreview(buffer: Uint8ClampedArray, unresolvedMask: Uint8Array, width: number, height: number): void {
@@ -892,6 +905,34 @@ export function paletteFilterWeightForTests(footprint: number): number {
   return smoothstep(PALETTE_FILTER_LOW, PALETTE_FILTER_HIGH, footprint);
 }
 
+export function distanceColorWeightForTests(footprint: number, distancePx = Number.MAX_VALUE): number {
+  return distanceColorWeight(footprint, distancePx);
+}
+
+export function boundaryCoverageWeightForTests(distancePx: number): number {
+  return boundaryCoverageWeight(distancePx);
+}
+
+export function samplePaletteForTests(smooth: number): readonly [number, number, number] {
+  const offset = paletteIndex(smooth) * 3;
+  return [COSINE_PALETTE[offset], COSINE_PALETTE[offset + 1], COSINE_PALETTE[offset + 2]] as const;
+}
+
+export function shadeBoundaryPixelForTests(smooth: number, distancePx: number): readonly [number, number, number] {
+  const buffer = new Uint8ClampedArray(4);
+  writeColorForSmooth(buffer, 0, false, smooth);
+  applyBandlimitedBoundaryShading(
+    buffer,
+    Float32Array.of(smooth),
+    Float32Array.of(distancePx),
+    Uint8Array.of(1),
+    Uint8Array.of(0),
+    1,
+    1
+  );
+  return [buffer[0], buffer[1], buffer[2]] as const;
+}
+
 function paletteIntegral(position: number, channel: 0 | 1 | 2): number {
   const cycle = Math.floor(position);
   const fraction = position - cycle;
@@ -908,6 +949,27 @@ function paletteIndex(smooth: number): number {
   const value = smooth * PALETTE_CYCLE_SCALE;
   const fraction = value - Math.floor(value);
   return Math.min(PALETTE_SIZE - 1, Math.max(0, Math.floor(fraction * PALETTE_SIZE)));
+}
+
+function paletteLinearColorAtPhase(phase: number): LinearColor {
+  const fraction = phase - Math.floor(phase);
+  const index = Math.min(PALETTE_SIZE - 1, Math.max(0, Math.floor(fraction * PALETTE_SIZE)));
+  const offset = index * 3;
+  return {
+    r: PALETTE_LINEAR_SAMPLES[offset],
+    g: PALETTE_LINEAR_SAMPLES[offset + 1],
+    b: PALETTE_LINEAR_SAMPLES[offset + 2]
+  };
+}
+
+function distanceColorWeight(footprint: number, distancePx: number): number {
+  const aliasWeight = smoothstep(DISTANCE_COLOR_FILTER_LOW, DISTANCE_COLOR_FILTER_HIGH, footprint);
+  const proximityWeight = 1 - smoothstep(DISTANCE_COLOR_FULL_PX, DISTANCE_COLOR_NONE_PX, distancePx);
+  return Math.max(aliasWeight, proximityWeight);
+}
+
+function boundaryCoverageWeight(distancePx: number): number {
+  return DISTANCE_COVERAGE_STRENGTH * (1 - smoothstep(0, DISTANCE_COVERAGE_NONE_PX, distancePx));
 }
 
 function smoothIteration(iter: number, maxIter: number, mag2: number): number {
@@ -956,16 +1018,6 @@ function refinedDistanceEstimatePx(
     if (mag2 > 1e64) break;
   }
   return distanceEstimatePx(mag2, currentDerivativeRe, currentDerivativeIm);
-}
-
-function dampenLinearChroma(color: LinearColor, edgeStrength: number): LinearColor {
-  const chromaScale = 1 - (1 - MIN_EDGE_CHROMA_SCALE) * clamp01(edgeStrength);
-  const luma = 0.2126 * color.r + 0.7152 * color.g + 0.0722 * color.b;
-  return {
-    r: luma + (color.r - luma) * chromaScale,
-    g: luma + (color.g - luma) * chromaScale,
-    b: luma + (color.b - luma) * chromaScale
-  };
 }
 
 function blendLinearColor(from: LinearColor, to: LinearColor, amount: number): LinearColor {

@@ -53,6 +53,8 @@ const ANTI_ALIASING_PEPPER_REGRESSION_URL =
   "/?re=-7.47689723441669939527017253976715439192679851461831874268821803604290203278587516851291729e-1&im=-7.22121932539053588116373452229159661989232396616246710140552835347280711817029504503225198e-2&scale=1.47647815655772413738325308653033716994542630984542066793843052404878099060420525511068532e4&iter=779";
 const BANDLIMIT_REPORTED_URL =
   "/?re=-1.48458330140036247637711150173056275201800398126520184731392135110206459886484778357996466e0&im=-2.59388635255443261801021498780013338816140992922161747121570167509133203590861049947497997e-11&scale=5.36190464429385541522377455367357477832895987078444543478371941540670062366744215336045641e8&iter=7000";
+const GRAY_EDGE_REGRESSION_URL =
+  "/?re=-1.27943732849845421883617983015056333056548550645104382141825159351044164938397038329347978e0&im=-5.63147855791696141231505724508040262456380326148232169076294081643376175182702037659590245e-2&scale=2.31557868453953676955259871388625631367299552317831244832768609325162487992078455893055703e4&iter=1500";
 const TILE_EDGE_STRIPE_REGRESSION_URL =
   "/?re=-7.47058923830677172637465716958601050178238459796401120563138311051740403989739537513387692e-1&im=-9.02333390881196912445043591041816477037301725271975723099794599405573445075541691219218423e-2&scale=5.95653801318458424494811292043527003967000942264323805684287564004180700059580065965587753e6";
 const REPORTED_INTERIOR_PERFORMANCE_VIEWS = [
@@ -526,6 +528,34 @@ test("bandlimits the reported deep boundary view and emits visual artifacts", as
   expect(speckleRatio).toBeLessThanOrEqual(0.08);
 });
 
+test("replaces super-Nyquist gray with stable distance color on the reported view", async ({ page }) => {
+  test.setTimeout(120_000);
+  await installInteractionWorkerProbe(page);
+  await page.setViewportSize({ width: 1912, height: 948 });
+  await page.goto(GRAY_EDGE_REGRESSION_URL);
+  await waitForNonBlankCanvas(page, 90_000);
+
+  const tileCounts = await readTileCounts(page);
+  expect(tileCounts.completed).toBe(tileCounts.total);
+  expect((await readInteractionWorkerProbe(page)).renderMessages.filter((message) => message.mode === "exact")).toHaveLength(0);
+
+  const roi = { left: 520, top: 120, right: 1420, bottom: 760 };
+  const colorRatios = await readCanvasColorRatios(page, roi);
+  const speckleRatio = await readCanvasSpeckleRatio(page, roi, { includeLumaOutliers: true });
+  expect(colorRatios.neutralMidtoneRatio).toBeLessThanOrEqual(0.48);
+  expect(colorRatios.colorfulMidtoneRatio).toBeGreaterThanOrEqual(0.30);
+  expect(speckleRatio).toBeLessThanOrEqual(0.08);
+
+  await page.locator("#uiToggle").click();
+  await expect(page.locator("#uiToggle")).toHaveAttribute("aria-expanded", "false");
+  await page.waitForTimeout(260);
+  await page.screenshot({ path: "test-results/distance-color-reported-url.png", fullPage: false });
+  await page.screenshot({
+    path: "test-results/distance-color-reported-url-center.png",
+    clip: { x: roi.left, y: roi.top, width: roi.right - roi.left, height: roi.bottom - roi.top }
+  });
+});
+
 test("does not draw dark horizontal tile-edge bands on the reported view", async ({ page }) => {
   test.setTimeout(90_000);
   await page.setViewportSize({ width: 1912, height: 948 });
@@ -964,4 +994,43 @@ async function readCanvasSpeckleRatio(
     }
     return speckles / Math.max(1, total);
   }, { roi, includeLumaOutliers: options.includeLumaOutliers === true });
+}
+
+async function readCanvasColorRatios(
+  page: import("@playwright/test").Page,
+  roi: { left: number; top: number; right: number; bottom: number }
+): Promise<{ neutralMidtoneRatio: number; colorfulMidtoneRatio: number }> {
+  return page.evaluate((roi) => {
+    const canvas = document.querySelector<HTMLCanvasElement>("#fractal");
+    const gl = canvas?.getContext("webgl2", { alpha: false, antialias: false, preserveDrawingBuffer: true });
+    if (!canvas || !gl) {
+      return { neutralMidtoneRatio: Number.POSITIVE_INFINITY, colorfulMidtoneRatio: 0 };
+    }
+    const left = Math.max(0, Math.floor(roi.left));
+    const top = Math.max(0, Math.floor(roi.top));
+    const right = Math.min(canvas.width, Math.floor(roi.right));
+    const bottom = Math.min(canvas.height, Math.floor(roi.bottom));
+    const width = Math.max(1, right - left);
+    const height = Math.max(1, bottom - top);
+    const pixels = new Uint8Array(width * height * 4);
+    gl.readPixels(left, canvas.height - bottom, width, height, gl.RGBA, gl.UNSIGNED_BYTE, pixels);
+    let midtones = 0;
+    let neutralMidtones = 0;
+    let colorfulMidtones = 0;
+    for (let offset = 0; offset < pixels.length; offset += 4) {
+      const red = pixels[offset];
+      const green = pixels[offset + 1];
+      const blue = pixels[offset + 2];
+      const luma = 0.2126 * red + 0.7152 * green + 0.0722 * blue;
+      if (luma < 45 || luma > 190) continue;
+      const chroma = Math.max(red, green, blue) - Math.min(red, green, blue);
+      midtones += 1;
+      if (chroma < 24) neutralMidtones += 1;
+      if (chroma >= 55) colorfulMidtones += 1;
+    }
+    return {
+      neutralMidtoneRatio: neutralMidtones / Math.max(1, midtones),
+      colorfulMidtoneRatio: colorfulMidtones / Math.max(1, midtones)
+    };
+  }, roi);
 }

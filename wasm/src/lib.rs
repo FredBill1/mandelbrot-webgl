@@ -701,6 +701,7 @@ struct LinearColor64 {
 struct BoundaryStats64 {
     distance_estimated_count: u32,
     palette_filtered_count: u32,
+    distance_colorized_count: u32,
     boundary_coverage_count: u32,
     max_palette_footprint: f64,
 }
@@ -749,12 +750,8 @@ const RENDER_MAX_SERIES_TILE_RADIUS: f64 = 1e-3;
 const RENDER_SERIES_ERROR_SCALE: f64 = 1e-7;
 const RENDER_SERIES_SKIP_SATURATION: f64 = 0.7;
 const RENDER_DISTANCE_EXTRA_ITERATIONS: u32 = 1;
-const RENDER_MIN_EDGE_CHROMA_SCALE: f64 = 0.35;
-const RENDER_DISTANCE_CHROMA_FULL_PX: f64 = 0.5;
-const RENDER_DISTANCE_CHROMA_NONE_PX: f64 = 2.0;
-const RENDER_DISTANCE_COVERAGE_FULL_PX: f64 = 0.25;
 const RENDER_DISTANCE_COVERAGE_NONE_PX: f64 = 0.75;
-const RENDER_DISTANCE_COVERAGE_STRENGTH: f64 = 0.75;
+const RENDER_DISTANCE_COVERAGE_STRENGTH: f64 = 0.5;
 const RENDER_INTERIOR_R: u8 = 4;
 const RENDER_INTERIOR_G: u8 = 8;
 const RENDER_INTERIOR_B: u8 = 16;
@@ -762,6 +759,11 @@ const RENDER_PALETTE_SIZE: usize = 2048;
 const RENDER_PALETTE_CYCLE_SCALE: f64 = 0.018;
 const RENDER_PALETTE_FILTER_LOW: f64 = 0.25;
 const RENDER_PALETTE_FILTER_HIGH: f64 = 0.5;
+const RENDER_DISTANCE_COLOR_FILTER_LOW: f64 = 0.5;
+const RENDER_DISTANCE_COLOR_FILTER_HIGH: f64 = 1.0;
+const RENDER_DISTANCE_COLOR_FULL_PX: f64 = 0.5;
+const RENDER_DISTANCE_COLOR_NONE_PX: f64 = 2.0;
+const RENDER_DISTANCE_COLOR_PALETTE_PHASE: f64 = 0.64;
 const RENDER_INV_LN2: f64 = std::f64::consts::LOG2_E;
 const RENDER_SMOOTH_LOG_SCALE: f64 = 0.5 * std::f64::consts::LOG2_E;
 const RENDER_REFERENCE_INTERIOR_MAX_PERIOD: usize = 256;
@@ -2179,6 +2181,11 @@ fn build_render_tile_value(
     )?;
     set_js_property(
         &stats,
+        "distanceColorizedCount",
+        &JsValue::from_f64(boundary_stats.distance_colorized_count as f64),
+    )?;
+    set_js_property(
+        &stats,
         "boundaryCoverageCount",
         &JsValue::from_f64(boundary_stats.boundary_coverage_count as f64),
     )?;
@@ -3161,8 +3168,11 @@ fn apply_render_bandlimited_shading(
     }
     let mut distance_estimated_count = 0u32;
     let mut palette_filtered_count = 0u32;
+    let mut distance_colorized_count = 0u32;
     let mut boundary_coverage_count = 0u32;
     let mut max_palette_footprint = 0.0f64;
+    let distance_edge_color =
+        render_palette_linear_color_at_phase(RENDER_DISTANCE_COLOR_PALETTE_PHASE, palette);
     for index in 0..pixel_count {
         if render_mask.is_some_and(|mask| mask[index] == 0) {
             continue;
@@ -3175,8 +3185,8 @@ fn apply_render_bandlimited_shading(
             continue;
         }
         distance_estimated_count += 1;
-        let footprint = RENDER_PALETTE_CYCLE_SCALE
-            / (std::f64::consts::LN_2 * distance_px.max(f64::EPSILON));
+        let footprint =
+            RENDER_PALETTE_CYCLE_SCALE / (std::f64::consts::LN_2 * distance_px.max(f64::EPSILON));
         max_palette_footprint = max_palette_footprint.max(footprint);
         let offset = index * 4;
         let mut color = LinearColor64 {
@@ -3200,20 +3210,25 @@ fn apply_render_bandlimited_shading(
             palette_filtered_count += 1;
         }
 
-        let chroma_recovery = smoothstep(
-            RENDER_DISTANCE_CHROMA_FULL_PX,
-            RENDER_DISTANCE_CHROMA_NONE_PX,
-            distance_px,
+        let alias_color_amount = smoothstep(
+            RENDER_DISTANCE_COLOR_FILTER_LOW,
+            RENDER_DISTANCE_COLOR_FILTER_HIGH,
+            footprint,
         );
-        color = dampen_render_linear_chroma(color, 1.0 - chroma_recovery);
+        let proximity_color_amount = 1.0
+            - smoothstep(
+                RENDER_DISTANCE_COLOR_FULL_PX,
+                RENDER_DISTANCE_COLOR_NONE_PX,
+                distance_px,
+            );
+        let distance_color_amount = alias_color_amount.max(proximity_color_amount);
+        if distance_color_amount > 0.0 {
+            color = blend_render_linear_color(color, distance_edge_color, distance_color_amount);
+            distance_colorized_count += 1;
+        }
 
         let coverage = RENDER_DISTANCE_COVERAGE_STRENGTH
-            * (1.0
-                - smoothstep(
-                    RENDER_DISTANCE_COVERAGE_FULL_PX,
-                    RENDER_DISTANCE_COVERAGE_NONE_PX,
-                    distance_px,
-                ));
+            * (1.0 - smoothstep(0.0, RENDER_DISTANCE_COVERAGE_NONE_PX, distance_px));
         if coverage > 0.0 {
             color = blend_render_linear_color(
                 color,
@@ -3231,6 +3246,7 @@ fn apply_render_bandlimited_shading(
     BoundaryStats64 {
         distance_estimated_count,
         palette_filtered_count,
+        distance_colorized_count,
         boundary_coverage_count,
         max_palette_footprint,
     }
@@ -3240,6 +3256,7 @@ fn empty_render_boundary_stats() -> BoundaryStats64 {
     BoundaryStats64 {
         distance_estimated_count: 0,
         palette_filtered_count: 0,
+        distance_colorized_count: 0,
         boundary_coverage_count: 0,
         max_palette_footprint: 0.0,
     }
@@ -3515,6 +3532,18 @@ fn render_palette_index(smooth: f64) -> usize {
     ((fraction * RENDER_PALETTE_SIZE as f64).floor().max(0.0) as usize).min(RENDER_PALETTE_SIZE - 1)
 }
 
+fn render_palette_linear_color_at_phase(phase: f64, palette: &RenderPaletteCache) -> LinearColor64 {
+    let fraction = phase - phase.floor();
+    let index = ((fraction * RENDER_PALETTE_SIZE as f64).floor().max(0.0) as usize)
+        .min(RENDER_PALETTE_SIZE - 1);
+    let offset = index * 3;
+    LinearColor64 {
+        r: palette.linear_colors[offset],
+        g: palette.linear_colors[offset + 1],
+        b: palette.linear_colors[offset + 2],
+    }
+}
+
 fn render_smooth_iteration(iter: u32, max_iter: u32, mag2: f64) -> f64 {
     if iter >= max_iter {
         return max_iter as f64;
@@ -3575,16 +3604,6 @@ fn render_refined_distance_estimate_px(
         }
     }
     render_distance_estimate_px(mag2, derivative_re, derivative_im)
-}
-
-fn dampen_render_linear_chroma(color: LinearColor64, edge_strength: f64) -> LinearColor64 {
-    let chroma_scale = 1.0 - (1.0 - RENDER_MIN_EDGE_CHROMA_SCALE) * clamp01(edge_strength);
-    let luma = 0.2126 * color.r + 0.7152 * color.g + 0.0722 * color.b;
-    LinearColor64 {
-        r: luma + (color.r - luma) * chroma_scale,
-        g: luma + (color.g - luma) * chroma_scale,
-        b: luma + (color.b - luma) * chroma_scale,
-    }
 }
 
 fn blend_render_linear_color(from: LinearColor64, to: LinearColor64, amount: f64) -> LinearColor64 {
