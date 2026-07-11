@@ -1,7 +1,7 @@
 import { REFERENCE_CACHE_SOFT_BYTES, type ReferenceSnapshot, type RuntimeView, type TileDescriptor } from "../types";
 import { ReferenceClient, type ReferenceWorkOptions } from "./referenceClient";
 
-const REFERENCE_CACHE_MAX_ENTRIES = 180;
+const REFERENCE_CACHE_MAX_ENTRIES = 512;
 
 interface ReferenceKey {
   centerRe: string;
@@ -240,17 +240,15 @@ export class ReferenceManager {
     for (const [key, reference] of this.references.entries()) {
       if (reference.revision < currentRevision - 2 && !this.pinnedReferenceIds.has(reference.id)) this.references.delete(key);
     }
-    if (this.pinnedReferenceIds.size === 0) {
-      while (this.references.size > REFERENCE_CACHE_MAX_ENTRIES) {
-        let deleted = false;
-        for (const [key, reference] of this.references.entries()) {
-          if (this.pinnedReferenceIds.has(reference.id)) continue;
-          this.references.delete(key);
-          deleted = true;
-          break;
-        }
-        if (!deleted) break;
+    while (this.references.size > REFERENCE_CACHE_MAX_ENTRIES) {
+      let deleted = false;
+      for (const [key, reference] of this.references.entries()) {
+        if (this.pinnedReferenceIds.has(reference.id)) continue;
+        this.references.delete(key);
+        deleted = true;
+        break;
       }
+      if (!deleted) break;
     }
     while (this.bytes > REFERENCE_CACHE_SOFT_BYTES) {
       let deleted = false;

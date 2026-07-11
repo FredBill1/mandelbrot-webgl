@@ -71,10 +71,8 @@ export interface RenderTileMessage {
   paletteId: string;
   refined: boolean;
   refinementLevel: number;
-  renderMode: "preview" | "final" | "exact";
+  renderMode: "preview" | "final";
   sampleStep: number;
-  exactBaseRgba?: ArrayBuffer;
-  exactUnresolvedMask?: ArrayBuffer;
   refinementBaseRgba?: ArrayBuffer;
   refinementUnresolvedMask?: ArrayBuffer;
   refinementSmoothValues?: ArrayBuffer;
@@ -128,8 +126,7 @@ export interface TileStats {
   unresolvedScreenY: number | undefined;
   unresolvedClusters: UnresolvedCluster[];
   preview: boolean;
-  renderMode: "preview" | "final" | "exact";
-  exactFallbackPixels: number;
+  renderMode: "preview" | "final";
 }
 
 export interface TileDoneMessage {

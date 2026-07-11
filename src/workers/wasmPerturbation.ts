@@ -1,4 +1,4 @@
-import init, { estimate_precision_bits, put_render_reference, render_tile_cached, render_tile_exact, reset_render_cache } from "../wasm/pkg/mandelbrot_wasm";
+import init, { put_render_reference, render_tile_cached, reset_render_cache } from "../wasm/pkg/mandelbrot_wasm";
 import type { ReferenceSnapshot, RenderTileMessage, TileDoneMessage } from "../types";
 
 interface CachedReferenceState {
@@ -18,48 +18,6 @@ let ready: Promise<void> | undefined;
 export async function renderPerturbationTileWasm(message: RenderTileMessage): Promise<TileDoneMessage> {
   await initRenderWasm();
   syncRevision(message.tile.revision);
-  if (message.renderMode === "exact") {
-    const exactBaseRgba = message.exactBaseRgba ? new Uint8Array(message.exactBaseRgba) : new Uint8Array();
-    const exactUnresolvedMask = message.exactUnresolvedMask ? new Uint8Array(message.exactUnresolvedMask) : new Uint8Array();
-    const raw = render_tile_exact(
-      message.tile.id,
-      message.tile.revision,
-      message.tile.rect.x,
-      message.tile.rect.y,
-      message.tile.rect.width,
-      message.tile.rect.height,
-      message.tile.centerRe,
-      message.tile.centerIm,
-      message.tile.centerScreenX,
-      message.tile.centerScreenY,
-      viewScaleForExact(message),
-      message.canvasWidth,
-      message.maxIter,
-      estimate_precision_bits(viewScaleForExact(message), message.maxIter),
-      exactBaseRgba,
-      exactUnresolvedMask
-    ) as TileDoneMessage;
-    return {
-      ...raw,
-      rgba: normalizeRgbaBuffer(raw.rgba),
-      unresolvedMask: normalizeOptionalBuffer(raw.unresolvedMask),
-      stats: {
-        ...raw.stats,
-        maxEscapedIter: raw.stats.maxEscapedIter ?? 0,
-        p95EscapedIter: raw.stats.p95EscapedIter ?? 0,
-        nearCapEscapedCount: raw.stats.nearCapEscapedCount ?? 0,
-        capHitUnknownCount: raw.stats.capHitUnknownCount ?? 0,
-        capHitBoundaryCount: raw.stats.capHitBoundaryCount ?? 0,
-        distanceEstimatedCount: raw.stats.distanceEstimatedCount ?? 0,
-        paletteFilteredCount: raw.stats.paletteFilteredCount ?? 0,
-        boundaryCoverageCount: raw.stats.boundaryCoverageCount ?? 0,
-        maxPaletteFootprint: raw.stats.maxPaletteFootprint ?? 0,
-        referenceCacheMissCount: 0,
-        exactFallbackPixels: raw.stats.exactFallbackPixels ?? raw.width * raw.height
-      }
-    };
-  }
-
   const refIds = new Int32Array(message.references.length);
   let cacheMisses = 0;
 
@@ -116,14 +74,9 @@ export async function renderPerturbationTileWasm(message: RenderTileMessage): Pr
       paletteFilteredCount: raw.stats.paletteFilteredCount ?? 0,
       boundaryCoverageCount: raw.stats.boundaryCoverageCount ?? 0,
       maxPaletteFootprint: raw.stats.maxPaletteFootprint ?? 0,
-      referenceCacheMissCount: (raw.stats.referenceCacheMissCount ?? 0) + cacheMisses,
-      exactFallbackPixels: raw.stats.exactFallbackPixels ?? 0
+      referenceCacheMissCount: (raw.stats.referenceCacheMissCount ?? 0) + cacheMisses
     }
   };
-}
-
-function viewScaleForExact(message: RenderTileMessage): string {
-  return (message as RenderTileMessage & { viewScale?: string }).viewScale ?? String(3.5 / (message.pixelSpan * Math.max(1, message.canvasWidth)));
 }
 
 export function resetWasmPerturbationCacheForTests(): void {

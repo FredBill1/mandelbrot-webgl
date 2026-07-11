@@ -218,7 +218,7 @@ export function renderPerturbationTile(message: RenderTileMessage): TileDoneMess
     message.renderMode === "final" && unresolvedCount > 0 ? unresolvedMask.slice().buffer : undefined;
   const refinementDistanceValuesOutput =
     message.renderMode === "final" && unresolvedCount > 0 ? distanceValues?.slice().buffer : undefined;
-  if (unresolvedCount > 0) fillUnresolvedPreview(rgba, unresolvedMask, width, height);
+  if (unresolvedCount > 0) fillUnresolvedPreview(rgba, unresolvedMask, escapedMask, width, height);
 
   const unresolvedScreenX = unresolvedCount > 0 ? unresolvedScreenXSum / unresolvedCount : undefined;
   const unresolvedScreenY = unresolvedCount > 0 ? unresolvedScreenYSum / unresolvedCount : undefined;
@@ -267,7 +267,6 @@ export function renderPerturbationTile(message: RenderTileMessage): TileDoneMess
       unresolvedClusters,
       preview: message.renderMode === "preview",
       renderMode: message.renderMode,
-      exactFallbackPixels: 0
     }
   };
 }
@@ -738,49 +737,95 @@ function emptyBoundaryStats(): BoundaryStats {
   return { distanceEstimatedCount: 0, paletteFilteredCount: 0, boundaryCoverageCount: 0, maxPaletteFootprint: 0 };
 }
 
-function fillUnresolvedPreview(buffer: Uint8ClampedArray, unresolvedMask: Uint8Array, width: number, height: number): void {
-  for (let pass = 0; pass < 3; pass += 1) {
-    let changed = false;
-    for (let y = 0; y < height; y += 1) {
-      for (let x = 0; x < width; x += 1) {
-        const pixelIndex = y * width + x;
-        if (unresolvedMask[pixelIndex] === 0) continue;
-        let red = 0;
-        let green = 0;
-        let blue = 0;
-        let count = 0;
-        for (let dy = -1; dy <= 1; dy += 1) {
-          for (let dx = -1; dx <= 1; dx += 1) {
-            if (dx === 0 && dy === 0) continue;
-            const nx = x + dx;
-            const ny = y + dy;
-            if (nx < 0 || ny < 0 || nx >= width || ny >= height) continue;
-            const neighborIndex = ny * width + nx;
-            if (unresolvedMask[neighborIndex] !== 0) continue;
-            const offset = neighborIndex * 4;
-            red += buffer[offset];
-            green += buffer[offset + 1];
-            blue += buffer[offset + 2];
-            count += 1;
-          }
-        }
-        const offset = pixelIndex * 4;
-        if (count > 0) {
-          buffer[offset] = Math.round(red / count);
-          buffer[offset + 1] = Math.round(green / count);
-          buffer[offset + 2] = Math.round(blue / count);
-          buffer[offset + 3] = 255;
-          unresolvedMask[pixelIndex] = 0;
-          changed = true;
-        } else if (pass === 2) {
-          buffer[offset] = 40;
-          buffer[offset + 1] = 162;
-          buffer[offset + 2] = 142;
-          buffer[offset + 3] = 255;
-        }
+function fillUnresolvedPreview(
+  buffer: Uint8ClampedArray,
+  unresolvedMask: Uint8Array,
+  escapedMask: Uint8Array | undefined,
+  width: number,
+  height: number
+): void {
+  const preferEscaped = escapedMask?.some((value) => value !== 0) ?? false;
+  const sourceMask = preferEscaped
+    ? escapedMask!
+    : Uint8Array.from(unresolvedMask, (value) => Number(value === 0));
+  const pixelCount = width * height;
+  let seedX = new Int32Array(pixelCount).fill(-1);
+  let seedY = new Int32Array(pixelCount).fill(-1);
+  for (let y = 0; y < height; y += 1) {
+    for (let x = 0; x < width; x += 1) {
+      const index = y * width + x;
+      if (sourceMask[index] !== 0) {
+        seedX[index] = x;
+        seedY[index] = y;
       }
     }
-    if (!changed && pass === 2) break;
+  }
+
+  if (!seedX.some((value) => value >= 0)) {
+    for (let index = 0; index < pixelCount; index += 1) {
+      if (unresolvedMask[index] === 0) continue;
+      const offset = index * 4;
+      buffer[offset] = INTERIOR_COLOR.r;
+      buffer[offset + 1] = INTERIOR_COLOR.g;
+      buffer[offset + 2] = INTERIOR_COLOR.b;
+      buffer[offset + 3] = 255;
+      unresolvedMask[index] = 0;
+    }
+    return;
+  }
+
+  let jump = Math.max(1, 2 ** Math.max(0, Math.ceil(Math.log2(Math.max(width, height))) - 1));
+  while (true) {
+    const previousX = seedX;
+    const previousY = seedY;
+    seedX = previousX.slice();
+    seedY = previousY.slice();
+    for (let y = 0; y < height; y += 1) {
+      for (let x = 0; x < width; x += 1) {
+        const index = y * width + x;
+        if (sourceMask[index] !== 0) continue;
+        let bestX = previousX[index];
+        let bestY = previousY[index];
+        let bestDistance = bestX >= 0 ? (x - bestX) ** 2 + (y - bestY) ** 2 : Number.POSITIVE_INFINITY;
+        for (const dy of [-1, 0, 1]) {
+          for (const dx of [-1, 0, 1]) {
+            const nx = x + dx * jump;
+            const ny = y + dy * jump;
+            if (nx < 0 || ny < 0 || nx >= width || ny >= height) continue;
+            const neighbor = ny * width + nx;
+            const candidateX = previousX[neighbor];
+            const candidateY = previousY[neighbor];
+            if (candidateX < 0) continue;
+            const distance = (x - candidateX) ** 2 + (y - candidateY) ** 2;
+            if (distance < bestDistance) {
+              bestDistance = distance;
+              bestX = candidateX;
+              bestY = candidateY;
+            }
+          }
+        }
+        seedX[index] = bestX;
+        seedY[index] = bestY;
+      }
+    }
+    if (jump === 1) break;
+    jump = Math.floor(jump / 2);
+  }
+
+  for (let index = 0; index < pixelCount; index += 1) {
+    if (unresolvedMask[index] === 0) continue;
+    const offset = index * 4;
+    const sourceX = seedX[index];
+    if (sourceX >= 0) {
+      const sourceOffset = (seedY[index] * width + sourceX) * 4;
+      buffer.copyWithin(offset, sourceOffset, sourceOffset + 4);
+    } else {
+      buffer[offset] = INTERIOR_COLOR.r;
+      buffer[offset + 1] = INTERIOR_COLOR.g;
+      buffer[offset + 2] = INTERIOR_COLOR.b;
+      buffer[offset + 3] = 255;
+    }
+    unresolvedMask[index] = 0;
   }
 }
 

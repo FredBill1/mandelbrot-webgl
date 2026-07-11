@@ -7,6 +7,7 @@ interface RenderTexture {
   rect: Rect;
   width: number;
   height: number;
+  rgba: Uint8Array;
   revision: number;
   retained: boolean;
 }
@@ -33,6 +34,7 @@ export class WebglTileRenderer {
   private readonly uvBuffer: WebGLBuffer;
   private readonly resolutionLocation: WebGLUniformLocation;
   private readonly textureLocation: WebGLUniformLocation;
+  private readonly uvRectLocation: WebGLUniformLocation;
   private readonly cache: LruCache<string, RenderTexture>;
   private activeRevision = 0;
   private readonly retainedTransforms = new Map<number, Transform>();
@@ -47,6 +49,7 @@ export class WebglTileRenderer {
     this.vao = must(gl.createVertexArray(), "vertex array");
     this.resolutionLocation = must(gl.getUniformLocation(this.program, "u_resolution"), "resolution uniform");
     this.textureLocation = must(gl.getUniformLocation(this.program, "u_texture"), "texture uniform");
+    this.uvRectLocation = must(gl.getUniformLocation(this.program, "u_uvRect"), "UV rectangle uniform");
     this.cache = new LruCache(TEXTURE_CACHE_BYTES, (_key, value) => gl.deleteTexture(value.texture));
     this.configure();
   }
@@ -125,16 +128,18 @@ export class WebglTileRenderer {
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
     gl.pixelStorei(gl.UNPACK_ALIGNMENT, 1);
+    const rgba = new Uint8Array(result.rgba);
+    const padded = padTextureRgba(rgba, result.width, result.height);
     gl.texImage2D(
       gl.TEXTURE_2D,
       0,
       gl.RGBA,
-      result.width,
-      result.height,
+      result.width + 2,
+      result.height + 2,
       0,
       gl.RGBA,
       gl.UNSIGNED_BYTE,
-      new Uint8Array(result.rgba)
+      padded
     );
 
     this.cache.set(
@@ -145,11 +150,14 @@ export class WebglTileRenderer {
         rect: result.rect,
         width: result.width,
         height: result.height,
+        rgba,
         revision: result.revision,
         retained: result.revision !== this.activeRevision
       },
-      result.width * result.height * 4
+      padded.byteLength + rgba.byteLength
     );
+    const uploaded = this.cache.get(result.tileId);
+    if (uploaded) this.synchronizeTextureBorders(uploaded);
     recordDeepBench({
       type: "tileUploadDone",
       tileId: result.tileId,
@@ -221,6 +229,13 @@ export class WebglTileRenderer {
     const gl = this.gl;
     const rect = transformRect(tile.rect, transform);
     gl.bindTexture(gl.TEXTURE_2D, tile.texture);
+    gl.uniform4f(
+      this.uvRectLocation,
+      1 / (tile.width + 2),
+      1 / (tile.height + 2),
+      tile.width / (tile.width + 2),
+      tile.height / (tile.height + 2)
+    );
     gl.bindBuffer(gl.ARRAY_BUFFER, this.positionBuffer);
     gl.bufferData(
       gl.ARRAY_BUFFER,
@@ -241,6 +256,42 @@ export class WebglTileRenderer {
       gl.DYNAMIC_DRAW
     );
     gl.drawArrays(gl.TRIANGLES, 0, 6);
+  }
+
+  private synchronizeTextureBorders(tile: RenderTexture): void {
+    for (const other of this.tiles()) {
+      if (other === tile || other.revision !== tile.revision) continue;
+      if (sameSpan(tile.rect.x, tile.rect.width, other.rect.x, other.rect.width) && tile.width === other.width) {
+        if (touchesAfter(tile.rect.y, tile.rect.height, other.rect.y)) {
+          this.connectHorizontalTextures(tile, other);
+        } else if (touchesAfter(other.rect.y, other.rect.height, tile.rect.y)) {
+          this.connectHorizontalTextures(other, tile);
+        }
+      }
+      if (sameSpan(tile.rect.y, tile.rect.height, other.rect.y, other.rect.height) && tile.height === other.height) {
+        if (touchesAfter(tile.rect.x, tile.rect.width, other.rect.x)) {
+          this.connectVerticalTextures(tile, other);
+        } else if (touchesAfter(other.rect.x, other.rect.width, tile.rect.x)) {
+          this.connectVerticalTextures(other, tile);
+        }
+      }
+    }
+  }
+
+  private connectHorizontalTextures(top: RenderTexture, bottom: RenderTexture): void {
+    const gl = this.gl;
+    gl.bindTexture(gl.TEXTURE_2D, top.texture);
+    gl.texSubImage2D(gl.TEXTURE_2D, 0, 1, top.height + 1, top.width, 1, gl.RGBA, gl.UNSIGNED_BYTE, textureRow(bottom, 0));
+    gl.bindTexture(gl.TEXTURE_2D, bottom.texture);
+    gl.texSubImage2D(gl.TEXTURE_2D, 0, 1, 0, bottom.width, 1, gl.RGBA, gl.UNSIGNED_BYTE, textureRow(top, top.height - 1));
+  }
+
+  private connectVerticalTextures(left: RenderTexture, right: RenderTexture): void {
+    const gl = this.gl;
+    gl.bindTexture(gl.TEXTURE_2D, left.texture);
+    gl.texSubImage2D(gl.TEXTURE_2D, 0, left.width + 1, 1, 1, left.height, gl.RGBA, gl.UNSIGNED_BYTE, textureColumn(right, 0));
+    gl.bindTexture(gl.TEXTURE_2D, right.texture);
+    gl.texSubImage2D(gl.TEXTURE_2D, 0, 0, 1, 1, right.height, gl.RGBA, gl.UNSIGNED_BYTE, textureColumn(left, left.width - 1));
   }
 
   private tiles(): RenderTexture[] {
@@ -291,6 +342,41 @@ function tileArea(tile: RenderTexture): number {
   return tile.rect.width * tile.rect.height;
 }
 
+function padTextureRgba(source: Uint8Array, width: number, height: number): Uint8Array {
+  const paddedWidth = width + 2;
+  const padded = new Uint8Array(paddedWidth * (height + 2) * 4);
+  for (let y = 0; y < height + 2; y += 1) {
+    const sourceY = Math.max(0, Math.min(height - 1, y - 1));
+    for (let x = 0; x < width + 2; x += 1) {
+      const sourceX = Math.max(0, Math.min(width - 1, x - 1));
+      const sourceOffset = (sourceY * width + sourceX) * 4;
+      padded.set(source.subarray(sourceOffset, sourceOffset + 4), (y * paddedWidth + x) * 4);
+    }
+  }
+  return padded;
+}
+
+function textureRow(texture: RenderTexture, y: number): Uint8Array {
+  return texture.rgba.subarray(y * texture.width * 4, (y + 1) * texture.width * 4);
+}
+
+function textureColumn(texture: RenderTexture, x: number): Uint8Array {
+  const column = new Uint8Array(texture.height * 4);
+  for (let y = 0; y < texture.height; y += 1) {
+    const sourceOffset = (y * texture.width + x) * 4;
+    column.set(texture.rgba.subarray(sourceOffset, sourceOffset + 4), y * 4);
+  }
+  return column;
+}
+
+function sameSpan(start: number, span: number, otherStart: number, otherSpan: number): boolean {
+  return Math.abs(start - otherStart) < 0.01 && Math.abs(span - otherSpan) < 0.01;
+}
+
+function touchesAfter(start: number, span: number, otherStart: number): boolean {
+  return Math.abs(start + span - otherStart) < 0.01;
+}
+
 function recordDeepBench(event: Record<string, unknown>): void {
   (globalThis as unknown as { __deepBenchRecord?: (event: Record<string, unknown>) => void }).__deepBenchRecord?.(event);
 }
@@ -312,10 +398,28 @@ void main() {
 const fragmentSource = `#version 300 es
 precision highp float;
 uniform sampler2D u_texture;
+uniform vec4 u_uvRect;
 in vec2 v_uv;
 out vec4 out_color;
 
 void main() {
-  out_color = texture(u_texture, v_uv);
+  vec2 uv = u_uvRect.xy + v_uv * u_uvRect.zw;
+  vec2 textureSizePx = vec2(textureSize(u_texture, 0));
+  vec2 texelPosition = uv * textureSizePx - 0.5;
+  vec2 texelBase = floor(texelPosition);
+  vec2 weight = fract(texelPosition);
+  weight = weight * weight * (3.0 - 2.0 * weight);
+  vec2 sampleUv = (texelBase + weight + 0.5) / textureSizePx;
+  vec2 texel = 1.0 / textureSizePx;
+  vec4 center = texture(u_texture, sampleUv);
+  vec4 north = texture(u_texture, sampleUv - vec2(0.0, texel.y));
+  vec4 south = texture(u_texture, sampleUv + vec2(0.0, texel.y));
+  vec4 west = texture(u_texture, sampleUv - vec2(texel.x, 0.0));
+  vec4 east = texture(u_texture, sampleUv + vec2(texel.x, 0.0));
+  vec4 blur = (north + south + west + east) * 0.25;
+  float contrast = max(max(length(center.rgb - north.rgb), length(center.rgb - south.rgb)),
+                       max(length(center.rgb - west.rgb), length(center.rgb - east.rgb)));
+  float sharpen = smoothstep(0.035, 0.22, contrast) * 0.8;
+  out_color = vec4(clamp(center.rgb + (center.rgb - blur.rgb) * sharpen, 0.0, 1.0), center.a);
 }
 `;

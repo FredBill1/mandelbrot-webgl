@@ -576,11 +576,8 @@ struct CachedRenderReference {
     external_id: String,
     screen_x: f64,
     screen_y: f64,
-    escaped_at: u32,
-    max_iter: u32,
     orbit_re: Rc<Vec<f64>>,
     orbit_im: Rc<Vec<f64>>,
-    interior_certificate: Option<ReferenceInteriorCertificate64>,
 }
 
 #[derive(Clone, Copy)]
@@ -741,7 +738,6 @@ thread_local! {
     };
 }
 
-const RENDER_MIN_PIXEL_SPAN_FOR_PERIODIC_INTERIOR: f64 = 1e-18;
 const RENDER_REBASE_G: f64 = 1e-8;
 const RENDER_MAX_REBASES_PER_PIXEL: u32 = 64;
 const RENDER_SERIES_MAX_SKIP: usize = 8192;
@@ -769,8 +765,6 @@ const RENDER_REFERENCE_INTERIOR_MAX_CANDIDATES: usize = 3;
 const RENDER_REFERENCE_INTERIOR_MAX_PERIOD_SCORE: f64 = 3e-6;
 const RENDER_REFERENCE_INTERIOR_MAX_C_VARIANCE: f64 = 1e-8;
 const RENDER_REFERENCE_INTERIOR_DISTANCE_SCALE: f64 = 0.25;
-const RENDER_REFERENCE_INTERIOR_RADIUS_SAFETY: f64 = 0.90;
-const RENDER_REFERENCE_INTERIOR_MIN_BLOCK_SIZE: usize = 16;
 
 #[wasm_bindgen]
 pub fn reset_render_cache(_revision: u32) {
@@ -783,33 +777,20 @@ pub fn put_render_reference(
     external_id: &str,
     screen_x: f64,
     screen_y: f64,
-    escaped_at: u32,
-    max_iter: u32,
-    interior_radius: f64,
+    _escaped_at: u32,
+    _max_iter: u32,
+    _interior_radius: f64,
     orbit_re: Float64Array,
     orbit_im: Float64Array,
 ) {
     let orbit_re = orbit_re.to_vec();
     let orbit_im = orbit_im.to_vec();
-    let interior_certificate = if escaped_at >= max_iter
-        && interior_radius.is_finite()
-        && interior_radius > 0.0
-    {
-        Some(ReferenceInteriorCertificate64 {
-            radius: interior_radius,
-        })
-    } else {
-        None
-    };
     let reference = CachedRenderReference {
         external_id: external_id.to_string(),
         screen_x,
         screen_y,
-        escaped_at,
-        max_iter,
         orbit_re: Rc::new(orbit_re),
         orbit_im: Rc::new(orbit_im),
-        interior_certificate,
     };
     RENDER_REFERENCE_CACHE.with(|cache| {
         cache.borrow_mut().insert(numeric_id, reference);
@@ -884,11 +865,6 @@ pub fn render_tile_cached(
     } else {
         (vec![0u8; width * height * 4], None, None, None, None)
     };
-    let mut certified_interior_mask = if render_mode == "final" && !using_refinement_mask {
-        Some(vec![0u8; width * height])
-    } else {
-        None
-    };
     let mut scratch = PeriodicScratch64 {
         checkpoint_re: [0.0; 32],
         checkpoint_im: [0.0; 32],
@@ -930,24 +906,6 @@ pub fn render_tile_cached(
     } else {
         None
     };
-    if render_mode == "final" {
-        if let Some(mask) = certified_interior_mask.as_mut() {
-            periodic_interior_count += certify_render_blocks_from_references64(
-                mask,
-                &mut rgba,
-                smooth_values.as_deref_mut(),
-                &mut used_reference_indices,
-                width,
-                height,
-                rect,
-                normalized_sample_step,
-                pixel_span,
-                max_iter,
-                &contexts,
-                palette.colors.as_slice(),
-            );
-        }
-    }
     let screen_xs: Vec<f64> = (0..width)
         .map(|px| {
             (rect.x + rect.width - 0.5).min(rect.x + (px as f64 + 0.5) * normalized_sample_step)
@@ -965,12 +923,6 @@ pub fn render_tile_cached(
             if refinement_mask
                 .as_ref()
                 .is_some_and(|mask| mask[pixel_index] == 0)
-            {
-                continue;
-            }
-            if certified_interior_mask
-                .as_ref()
-                .is_some_and(|mask| mask[pixel_index] != 0)
             {
                 continue;
             }
@@ -1131,10 +1083,20 @@ pub fn render_tile_cached(
     };
 
     if unresolved_count > 0 {
-        fill_render_unresolved_preview(&mut rgba, &mut unresolved_mask, width, height);
+        fill_render_unresolved_preview(
+            &mut rgba,
+            &mut unresolved_mask,
+            escaped_mask.as_deref(),
+            width,
+            height,
+        );
     }
 
-    let unresolved_clusters = build_render_unresolved_clusters(&clusters, rect);
+    let unresolved_clusters = if unresolved_count > 0 {
+        build_render_unresolved_clusters(&clusters, rect)
+    } else {
+        Vec::new()
+    };
     let reference_ids_used: Vec<String> = used_reference_indices
         .iter()
         .enumerate()
@@ -1183,147 +1145,7 @@ pub fn render_tile_cached(
             None
         },
         render_mode,
-        0,
     )
-}
-
-#[wasm_bindgen]
-#[allow(clippy::too_many_arguments)]
-pub fn render_tile_exact(
-    tile_id: &str,
-    revision: u32,
-    rect_x: f64,
-    rect_y: f64,
-    rect_width: f64,
-    rect_height: f64,
-    center_re: &str,
-    center_im: &str,
-    center_screen_x: f64,
-    center_screen_y: f64,
-    scale: &str,
-    canvas_width: f64,
-    max_iter: u32,
-    precision_bits: u32,
-    base_rgba: Uint8Array,
-    exact_mask: Uint8Array,
-) -> Result<JsValue, JsValue> {
-    let started = js_sys::Date::now();
-    let rect = Rect64 {
-        x: rect_x,
-        y: rect_y,
-        width: rect_width,
-        height: rect_height,
-    };
-    let width = rect.width.ceil().max(1.0) as usize;
-    let height = rect.height.ceil().max(1.0) as usize;
-    let bits = precision_bits
-        .max(estimate_precision_bits(scale, max_iter))
-        .max(128);
-    let p = precision(bits);
-    let center_re = parse_float(center_re, bits)?;
-    let center_im = parse_float(center_im, bits)?;
-    let scale = parse_float(scale, bits)?;
-    let pixel_span = bf_from_f64(BASE_VIEW_WIDTH, bits)
-        .div(&scale, p, RM)
-        .div(&bf_from_f64(canvas_width.max(1.0), bits), p, RM);
-    let pixel_span_f64 = bf_to_f64(&pixel_span).abs();
-    let palette = RENDER_PALETTE_CACHE.with(Rc::clone);
-    let exact_input = prepare_exact_input(width, height, base_rgba, exact_mask);
-    let mut rgba = exact_input.rgba;
-    let mask = exact_input.mask;
-    let mut escaped_pixels = 0u32;
-    let mut exact_pixels = 0u32;
-    let mut iter_stats = empty_render_iter_stats(max_iter);
-    let mut escaped_mask = vec![0u8; width * height];
-    let mut cap_hit_unknown_mask = vec![0u8; width * height];
-    let unresolved_mask = vec![0u8; width * height];
-    let mut smooth_values = vec![0f32; width * height];
-    let mut distance_values = vec![-1f32; width * height];
-
-    for py in 0..height {
-        let screen_y = (rect.y + rect.height - 0.5).min(rect.y + py as f64 + 0.5);
-        let dy = bf_from_f64(screen_y - center_screen_y, bits);
-        let ci = center_im.add(&pixel_span.mul(&dy, p, RM), p, RM);
-        for px in 0..width {
-            let pixel_index = py * width + px;
-            if !should_render_exact_pixel(mask.as_deref(), pixel_index) {
-                continue;
-            }
-            exact_pixels += 1;
-            let screen_x = (rect.x + rect.width - 0.5).min(rect.x + px as f64 + 0.5);
-            let dx = bf_from_f64(screen_x - center_screen_x, bits);
-            let cr = center_re.add(&pixel_span.mul(&dx, p, RM), p, RM);
-            let exact = run_exact_escape_with_mag2(&cr, &ci, max_iter, p, pixel_span_f64);
-            if exact.iter < max_iter {
-                escaped_pixels += 1;
-                record_render_escaped_iter(&mut iter_stats, exact.iter, max_iter);
-                escaped_mask[pixel_index] = 1;
-                distance_values[pixel_index] = exact.distance_px as f32;
-            } else {
-                iter_stats.cap_hit_unknown_count += 1;
-                cap_hit_unknown_mask[pixel_index] = 1;
-            }
-            let smooth = render_smooth_iteration(exact.iter, max_iter, exact.mag2);
-            smooth_values[pixel_index] = smooth as f32;
-            write_render_color_for_smooth(
-                &mut rgba,
-                pixel_index * 4,
-                exact.iter >= max_iter,
-                smooth,
-                palette.colors.as_slice(),
-            );
-        }
-    }
-    iter_stats.cap_hit_boundary_count =
-        count_render_cap_hit_boundary(&cap_hit_unknown_mask, &escaped_mask, &unresolved_mask, width, height);
-    let boundary_stats = apply_render_bandlimited_shading(
-        &mut rgba,
-        &smooth_values,
-        &distance_values,
-        &escaped_mask,
-        &unresolved_mask,
-        mask.as_deref(),
-        width,
-        height,
-        palette.as_ref(),
-    );
-    let iter_summary = summarize_render_iter_stats(iter_stats);
-
-    build_render_tile_value(
-        tile_id,
-        revision,
-        rect,
-        width,
-        height,
-        rgba,
-        None,
-        None,
-        None,
-        None,
-        Vec::new(),
-        js_sys::Date::now() - started,
-        0,
-        0,
-        escaped_pixels,
-        0,
-        iter_summary,
-        0,
-        0,
-        0,
-        0,
-        0,
-        boundary_stats,
-        Vec::new(),
-        None,
-        None,
-        "exact",
-        exact_pixels,
-    )
-}
-
-struct ExactInput {
-    rgba: Vec<u8>,
-    mask: Option<Vec<u8>>,
 }
 
 struct RefinementInput {
@@ -1332,21 +1154,6 @@ struct RefinementInput {
     smooth_values: Vec<f32>,
     distance_values: Vec<f32>,
     escaped_mask: Vec<u8>,
-}
-
-fn prepare_exact_input(width: usize, height: usize, base_rgba: Uint8Array, exact_mask: Uint8Array) -> ExactInput {
-    let pixel_count = width * height;
-    let rgba = if base_rgba.length() as usize == pixel_count * 4 {
-        base_rgba.to_vec()
-    } else {
-        vec![0u8; pixel_count * 4]
-    };
-    let mask = if exact_mask.length() as usize == pixel_count {
-        Some(exact_mask.to_vec())
-    } else {
-        None
-    };
-    ExactInput { rgba, mask }
 }
 
 fn prepare_refinement_input(
@@ -1379,321 +1186,7 @@ fn prepare_refinement_input(
     })
 }
 
-fn should_render_exact_pixel(mask: Option<&[u8]>, pixel_index: usize) -> bool {
-    mask.map_or(true, |values| values.get(pixel_index).copied().unwrap_or(0) != 0)
-}
-
-struct ExactEscape64 {
-    iter: u32,
-    mag2: f64,
-    distance_px: f64,
-}
-
-fn run_exact_escape_with_mag2(
-    cr: &BigFloat,
-    ci: &BigFloat,
-    max_iter: u32,
-    p: usize,
-    pixel_span: f64,
-) -> ExactEscape64 {
-    let mut zr = BigFloat::from_word(0, p);
-    let mut zi = BigFloat::from_word(0, p);
-    let mut derivative_re = 0.0;
-    let mut derivative_im = 0.0;
-    let four = BigFloat::from_word(4, p);
-
-    for iter in 0..max_iter {
-        if iter > 0 {
-            let mag2 = zr.mul(&zr, p, RM).add(&zi.mul(&zi, p, RM), p, RM);
-            if mag2.cmp(&four).is_some_and(|v| v > 0) {
-                let mag2 = bf_to_f64(&mag2);
-                let z_re = bf_to_f64(&zr);
-                let z_im = bf_to_f64(&zi);
-                return ExactEscape64 {
-                    iter,
-                    mag2,
-                    distance_px: render_refined_distance_estimate_px(
-                        z_re,
-                        z_im,
-                        derivative_re,
-                        derivative_im,
-                        bf_to_f64(cr),
-                        bf_to_f64(ci),
-                        pixel_span,
-                    ),
-                };
-            }
-        }
-        let current_re = bf_to_f64(&zr);
-        let current_im = bf_to_f64(&zi);
-        let next_derivative_re =
-            2.0 * (current_re * derivative_re - current_im * derivative_im) + pixel_span;
-        let next_derivative_im =
-            2.0 * (current_re * derivative_im + current_im * derivative_re);
-        let (next_re, next_im) = step_two_mul(&zr, &zi, cr, ci, p);
-        zr = next_re;
-        zi = next_im;
-        derivative_re = next_derivative_re;
-        derivative_im = next_derivative_im;
-    }
-
-    let mag2 = zr.mul(&zr, p, RM).add(&zi.mul(&zi, p, RM), p, RM);
-    ExactEscape64 {
-        iter: max_iter,
-        mag2: bf_to_f64(&mag2),
-        distance_px: -1.0,
-    }
-}
-
 #[allow(clippy::too_many_arguments)]
-fn certify_render_blocks_from_references64(
-    mask: &mut [u8],
-    rgba: &mut [u8],
-    mut smooth_values: Option<&mut [f32]>,
-    used_reference_indices: &mut [u8],
-    width: usize,
-    height: usize,
-    rect: Rect64,
-    sample_step: f64,
-    pixel_span: f64,
-    max_iter: u32,
-    contexts: &[RenderContext],
-    palette: &[u8],
-) -> u32 {
-    if width == 0 || height == 0 || contexts.is_empty() {
-        return 0;
-    }
-    let mut certified = 0u32;
-    certify_render_block_from_references64(
-        mask,
-        rgba,
-        &mut smooth_values,
-        used_reference_indices,
-        width,
-        rect,
-        sample_step,
-        pixel_span,
-        max_iter,
-        contexts,
-        palette,
-        0,
-        0,
-        width,
-        height,
-        &mut certified,
-    );
-    certified
-}
-
-#[allow(clippy::too_many_arguments)]
-fn certify_render_block_from_references64(
-    mask: &mut [u8],
-    rgba: &mut [u8],
-    smooth_values: &mut Option<&mut [f32]>,
-    used_reference_indices: &mut [u8],
-    stride: usize,
-    rect: Rect64,
-    sample_step: f64,
-    pixel_span: f64,
-    max_iter: u32,
-    contexts: &[RenderContext],
-    palette: &[u8],
-    x0: usize,
-    y0: usize,
-    block_width: usize,
-    block_height: usize,
-    certified: &mut u32,
-) {
-    if block_width == 0 || block_height == 0 {
-        return;
-    }
-
-    if let Some(reference_index) = certifying_reference_for_block64(
-        contexts,
-        rect,
-        sample_step,
-        pixel_span,
-        x0,
-        y0,
-        block_width,
-        block_height,
-    ) {
-        fill_certified_reference_block64(
-            mask,
-            rgba,
-            smooth_values,
-            stride,
-            x0,
-            y0,
-            block_width,
-            block_height,
-            max_iter,
-            palette,
-        );
-        if let Some(used) = used_reference_indices.get_mut(reference_index) {
-            *used = 1;
-        }
-        *certified += (block_width * block_height) as u32;
-        return;
-    }
-
-    if block_width <= RENDER_REFERENCE_INTERIOR_MIN_BLOCK_SIZE
-        && block_height <= RENDER_REFERENCE_INTERIOR_MIN_BLOCK_SIZE
-    {
-        return;
-    }
-
-    if block_width >= block_height && block_width > RENDER_REFERENCE_INTERIOR_MIN_BLOCK_SIZE {
-        let left_width = block_width / 2;
-        let right_width = block_width - left_width;
-        certify_render_block_from_references64(
-            mask,
-            rgba,
-            smooth_values,
-            used_reference_indices,
-            stride,
-            rect,
-            sample_step,
-            pixel_span,
-            max_iter,
-            contexts,
-            palette,
-            x0,
-            y0,
-            left_width,
-            block_height,
-            certified,
-        );
-        certify_render_block_from_references64(
-            mask,
-            rgba,
-            smooth_values,
-            used_reference_indices,
-            stride,
-            rect,
-            sample_step,
-            pixel_span,
-            max_iter,
-            contexts,
-            palette,
-            x0 + left_width,
-            y0,
-            right_width,
-            block_height,
-            certified,
-        );
-    } else if block_height > RENDER_REFERENCE_INTERIOR_MIN_BLOCK_SIZE {
-        let top_height = block_height / 2;
-        let bottom_height = block_height - top_height;
-        certify_render_block_from_references64(
-            mask,
-            rgba,
-            smooth_values,
-            used_reference_indices,
-            stride,
-            rect,
-            sample_step,
-            pixel_span,
-            max_iter,
-            contexts,
-            palette,
-            x0,
-            y0,
-            block_width,
-            top_height,
-            certified,
-        );
-        certify_render_block_from_references64(
-            mask,
-            rgba,
-            smooth_values,
-            used_reference_indices,
-            stride,
-            rect,
-            sample_step,
-            pixel_span,
-            max_iter,
-            contexts,
-            palette,
-            x0,
-            y0 + top_height,
-            block_width,
-            bottom_height,
-            certified,
-        );
-    }
-}
-
-#[allow(clippy::too_many_arguments)]
-fn certifying_reference_for_block64(
-    contexts: &[RenderContext],
-    rect: Rect64,
-    sample_step: f64,
-    pixel_span: f64,
-    x0: usize,
-    y0: usize,
-    block_width: usize,
-    block_height: usize,
-) -> Option<usize> {
-    let screen_x = rect.x + (x0 as f64 + block_width as f64 * 0.5) * sample_step;
-    let screen_y = rect.y + (y0 as f64 + block_height as f64 * 0.5) * sample_step;
-    let block_radius = (block_width as f64 * sample_step)
-        .hypot(block_height as f64 * sample_step)
-        * 0.5
-        * pixel_span;
-    if !screen_x.is_finite() || !screen_y.is_finite() || !block_radius.is_finite() {
-        return None;
-    }
-
-    let mut best: Option<(usize, f64)> = None;
-    for (index, context) in contexts.iter().enumerate() {
-        let reference = &context.reference;
-        if reference.escaped_at < reference.max_iter {
-            continue;
-        }
-        let Some(certificate) = reference.interior_certificate else {
-            continue;
-        };
-        let center_delta = (screen_x - reference.screen_x)
-            .hypot(screen_y - reference.screen_y)
-            * pixel_span;
-        let covered_radius = certificate.radius * RENDER_REFERENCE_INTERIOR_RADIUS_SAFETY;
-        if center_delta + block_radius <= covered_radius {
-            let slack = covered_radius - center_delta - block_radius;
-            if best.is_none_or(|(_, best_slack)| slack > best_slack) {
-                best = Some((index, slack));
-            }
-        }
-    }
-    best.map(|(index, _)| index)
-}
-
-#[allow(clippy::too_many_arguments)]
-fn fill_certified_reference_block64(
-    mask: &mut [u8],
-    rgba: &mut [u8],
-    smooth_values: &mut Option<&mut [f32]>,
-    stride: usize,
-    x0: usize,
-    y0: usize,
-    block_width: usize,
-    block_height: usize,
-    max_iter: u32,
-    palette: &[u8],
-) {
-    let smooth = max_iter as f64;
-    for y in y0..(y0 + block_height) {
-        for x in x0..(x0 + block_width) {
-            let index = y * stride + x;
-            mask[index] = 1;
-            if let Some(values) = smooth_values.as_deref_mut() {
-                values[index] = smooth as f32;
-            }
-            write_render_color_for_smooth(rgba, index * 4, true, smooth, palette);
-        }
-    }
-}
-
 fn reference_interior_certificate64(
     orbit_re: &[f64],
     orbit_im: &[f64],
@@ -2025,8 +1518,7 @@ fn build_render_contexts(
             .with(|cache| cache.borrow().get(&id).cloned())
             .ok_or_else(|| JsValue::from_str("render reference cache miss"))?;
         let radius = render_tile_radius(rect, reference.screen_x, reference.screen_y, pixel_span);
-        let probes =
-            render_tile_probe_offsets(rect, reference.screen_x, reference.screen_y, pixel_span);
+        let probes = render_tile_probe_offsets(rect, reference.screen_x, reference.screen_y, pixel_span);
         contexts.push(RenderContext {
             reference,
             radius,
@@ -2065,7 +1557,6 @@ fn build_render_tile_value(
     unresolved_screen_x: Option<f64>,
     unresolved_screen_y: Option<f64>,
     render_mode: &str,
-    exact_fallback_pixels: u32,
 ) -> Result<JsValue, JsValue> {
     let object = Object::new();
     set_js_property(&object, "type", &JsValue::from_str("tileDone"))?;
@@ -2199,11 +1690,6 @@ fn build_render_tile_value(
     set_js_property(&stats, "referenceIdsUsed", used_ids.as_ref())?;
     set_js_property(
         &stats,
-        "exactFallbackPixels",
-        &JsValue::from_f64(exact_fallback_pixels as f64),
-    )?;
-    set_js_property(
-        &stats,
         "unresolvedScreenX",
         &unresolved_screen_x.map_or(JsValue::UNDEFINED, JsValue::from_f64),
     )?;
@@ -2317,9 +1803,30 @@ fn render_pixel_with_references64(
     );
     let mut best_unresolved_reference_index = -1;
     let mut max_skip = 0usize;
-    let allow_periodic_interior = pixel_span >= RENDER_MIN_PIXEL_SPAN_FOR_PERIODIC_INTERIOR;
+    let allow_periodic_interior = true;
 
-    for index in 0..contexts.len() {
+    let mut reference_distances = [f64::INFINITY; 8];
+    for (index, context) in contexts.iter().take(reference_distances.len()).enumerate() {
+        reference_distances[index] = (screen_x - context.reference.screen_x).powi(2)
+            + (screen_y - context.reference.screen_y).powi(2);
+    }
+    let mut tried_references = 0u8;
+    for _ in 0..contexts.len().min(reference_distances.len()) {
+        let mut nearest_index = None;
+        let mut nearest_distance = f64::INFINITY;
+        for (index, distance) in reference_distances.iter().take(contexts.len()).enumerate() {
+            if tried_references & (1 << index) != 0 {
+                continue;
+            }
+            if *distance < nearest_distance {
+                nearest_distance = *distance;
+                nearest_index = Some(index);
+            }
+        }
+        let Some(index) = nearest_index else {
+            break;
+        };
+        tried_references |= 1 << index;
         let c_re = (screen_x - contexts[index].reference.screen_x) * pixel_span;
         let c_im = (screen_y - contexts[index].reference.screen_y) * pixel_span;
         ensure_render_series(&mut contexts[index], series_degree);
@@ -3319,61 +2826,114 @@ fn count_render_cap_hit_boundary(
 fn fill_render_unresolved_preview(
     buffer: &mut [u8],
     unresolved_mask: &mut [u8],
+    escaped_mask: Option<&[u8]>,
     width: usize,
     height: usize,
 ) {
-    for pass in 0..3 {
-        let mut changed = false;
-        for y in 0..height {
-            for x in 0..width {
-                let pixel_index = y * width + x;
-                if unresolved_mask[pixel_index] == 0 {
-                    continue;
-                }
-                let mut red = 0u32;
-                let mut green = 0u32;
-                let mut blue = 0u32;
-                let mut count = 0u32;
-                for dy in -1isize..=1 {
-                    for dx in -1isize..=1 {
-                        if dx == 0 && dy == 0 {
-                            continue;
-                        }
-                        let nx = x as isize + dx;
-                        let ny = y as isize + dy;
-                        if nx < 0 || ny < 0 || nx >= width as isize || ny >= height as isize {
-                            continue;
-                        }
-                        let neighbor_index = ny as usize * width + nx as usize;
-                        if unresolved_mask[neighbor_index] != 0 {
-                            continue;
-                        }
-                        let offset = neighbor_index * 4;
-                        red += buffer[offset] as u32;
-                        green += buffer[offset + 1] as u32;
-                        blue += buffer[offset + 2] as u32;
-                        count += 1;
-                    }
-                }
-                let offset = pixel_index * 4;
-                if count > 0 {
-                    buffer[offset] = ((red as f64 / count as f64).round()) as u8;
-                    buffer[offset + 1] = ((green as f64 / count as f64).round()) as u8;
-                    buffer[offset + 2] = ((blue as f64 / count as f64).round()) as u8;
-                    buffer[offset + 3] = 255;
-                    unresolved_mask[pixel_index] = 0;
-                    changed = true;
-                } else if pass == 2 {
-                    buffer[offset] = 40;
-                    buffer[offset + 1] = 162;
-                    buffer[offset + 2] = 142;
-                    buffer[offset + 3] = 255;
-                }
+    let prefer_escaped = escaped_mask.is_some_and(|mask| mask.iter().any(|value| *value != 0));
+    let source_mask = if prefer_escaped {
+        escaped_mask.unwrap().to_vec()
+    } else {
+        unresolved_mask.iter().map(|value| u8::from(*value == 0)).collect()
+    };
+    let pixel_count = width * height;
+    let mut seed_x = vec![-1i32; pixel_count];
+    let mut seed_y = vec![-1i32; pixel_count];
+    for y in 0..height {
+        for x in 0..width {
+            let index = y * width + x;
+            if source_mask[index] != 0 {
+                seed_x[index] = x as i32;
+                seed_y[index] = y as i32;
             }
         }
-        if !changed && pass == 2 {
+    }
+    if seed_x.iter().all(|value| *value < 0) {
+        for (pixel_index, value) in unresolved_mask.iter_mut().enumerate() {
+            if *value == 0 {
+                continue;
+            }
+            let offset = pixel_index * 4;
+            buffer[offset] = RENDER_INTERIOR_R;
+            buffer[offset + 1] = RENDER_INTERIOR_G;
+            buffer[offset + 2] = RENDER_INTERIOR_B;
+            buffer[offset + 3] = 255;
+            *value = 0;
+        }
+        return;
+    }
+
+    let mut jump = (width.max(height).next_power_of_two() / 2).max(1);
+    loop {
+        let previous_x = seed_x.clone();
+        let previous_y = seed_y.clone();
+        for y in 0..height {
+            for x in 0..width {
+                let index = y * width + x;
+                if source_mask[index] != 0 {
+                    continue;
+                }
+                let mut best_x = previous_x[index];
+                let mut best_y = previous_y[index];
+                let mut best_distance = if best_x >= 0 {
+                    (x as i32 - best_x).pow(2) + (y as i32 - best_y).pow(2)
+                } else {
+                    i32::MAX
+                };
+                for dy in [-1i32, 0, 1] {
+                    for dx in [-1i32, 0, 1] {
+                        let nx = x as i32 + dx * jump as i32;
+                        let ny = y as i32 + dy * jump as i32;
+                        if nx < 0 || ny < 0 || nx >= width as i32 || ny >= height as i32 {
+                            continue;
+                        }
+                        let neighbor = ny as usize * width + nx as usize;
+                        let candidate_x = previous_x[neighbor];
+                        let candidate_y = previous_y[neighbor];
+                        if candidate_x < 0 {
+                            continue;
+                        }
+                        let distance = (x as i32 - candidate_x).pow(2) + (y as i32 - candidate_y).pow(2);
+                        if distance < best_distance {
+                            best_distance = distance;
+                            best_x = candidate_x;
+                            best_y = candidate_y;
+                        }
+                    }
+                }
+                seed_x[index] = best_x;
+                seed_y[index] = best_y;
+            }
+        }
+        if jump == 1 {
             break;
         }
+        jump /= 2;
+    }
+
+    for (pixel_index, value) in unresolved_mask.iter_mut().enumerate() {
+        if *value == 0 {
+            continue;
+        }
+        let source_x = seed_x[pixel_index];
+        let source_y = seed_y[pixel_index];
+        let offset = pixel_index * 4;
+        if source_x >= 0 {
+            let source_offset = (source_y as usize * width + source_x as usize) * 4;
+            let color = [
+                buffer[source_offset],
+                buffer[source_offset + 1],
+                buffer[source_offset + 2],
+                buffer[source_offset + 3],
+            ];
+            buffer[offset..offset + 4].copy_from_slice(&color);
+        } else {
+            buffer[offset] = RENDER_INTERIOR_R;
+            buffer[offset + 1] = RENDER_INTERIOR_G;
+            buffer[offset + 2] = RENDER_INTERIOR_B;
+            buffer[offset + 3] = 255;
+        }
+        *value = 0;
     }
 }
 

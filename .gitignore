@@ -8,3 +8,4 @@ wasm/target/
 wasm/Cargo.lock
 *.log
 tsconfig.tsbuildinfo
+artifacts/
