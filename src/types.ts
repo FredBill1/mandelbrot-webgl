@@ -110,6 +110,7 @@ export interface TileStats {
   blaStepCount: number;
   referenceCacheMissCount: number;
   seriesSkip: number;
+  seriesReplayPixels: number;
   distanceEstimatedCount: number;
   paletteFilteredCount: number;
   distanceColorizedCount: number;

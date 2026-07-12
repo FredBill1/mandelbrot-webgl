@@ -598,6 +598,8 @@ struct RenderContext {
 struct SeriesPlan64 {
     skip: usize,
     degree: usize,
+    error_bound: f64,
+    radius: f64,
     coeff_re: Vec<f64>,
     coeff_im: Vec<f64>,
 }
@@ -622,6 +624,7 @@ struct PixelResult64 {
     rebase_limit: bool,
     bla_skip_count: u32,
     bla_step_count: u32,
+    series_replayed: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -730,6 +733,7 @@ const RENDER_SERIES_MAX_SKIP: usize = 8192;
 const RENDER_MAX_SERIES_TILE_RADIUS: f64 = 1e-3;
 const RENDER_SERIES_ERROR_SCALE: f64 = 2.9e-2;
 const RENDER_SERIES_SKIP_SATURATION: f64 = 0.7;
+const RENDER_SERIES_PIXEL_ERROR_SCALE: f64 = 0.25;
 const RENDER_DISTANCE_EXTRA_ITERATIONS: u32 = 1;
 const RENDER_DISTANCE_COVERAGE_NONE_PX: f64 = 0.75;
 const RENDER_DISTANCE_COVERAGE_STRENGTH: f64 = 0.5;
@@ -878,6 +882,7 @@ pub fn render_tile_cached(
     let mut rebase_limit_count = 0u32;
     let mut bla_skip_count = 0u32;
     let mut bla_step_count = 0u32;
+    let mut series_replay_pixels = 0u32;
     let mut unresolved_screen_x_sum = 0.0;
     let mut unresolved_screen_y_sum = 0.0;
     let mut series_skip = 0usize;
@@ -974,6 +979,9 @@ pub fn render_tile_cached(
             }
             bla_skip_count += result.bla_skip_count;
             bla_step_count += result.bla_step_count;
+            if result.series_replayed {
+                series_replay_pixels += 1;
+            }
             if result.glitch {
                 glitch_count += 1;
             }
@@ -1125,6 +1133,7 @@ pub fn render_tile_cached(
         rebase_limit_count,
         bla_skip_count,
         bla_step_count,
+        series_replay_pixels,
         series_skip as u32,
         boundary_stats,
         reference_ids_used,
@@ -1263,6 +1272,7 @@ pub fn render_tile_exact(
         escaped_pixels,
         0,
         iter_summary,
+        0,
         0,
         0,
         0,
@@ -1763,6 +1773,7 @@ fn build_render_tile_value(
     rebase_limit_count: u32,
     bla_skip_count: u32,
     bla_step_count: u32,
+    series_replay_pixels: u32,
     series_skip: u32,
     boundary_stats: BoundaryStats64,
     reference_ids_used: Vec<String>,
@@ -1871,6 +1882,11 @@ fn build_render_tile_value(
     )?;
     set_js_property(&stats, "referenceCacheMissCount", &JsValue::from_f64(0.0))?;
     set_js_property(&stats, "seriesSkip", &JsValue::from_f64(series_skip as f64))?;
+    set_js_property(
+        &stats,
+        "seriesReplayPixels",
+        &JsValue::from_f64(series_replay_pixels as f64),
+    )?;
     set_js_property(
         &stats,
         "distanceEstimatedCount",
@@ -2025,7 +2041,7 @@ fn render_pixel_with_references64(
     for index in 0..contexts.len() {
         let c_re = (screen_x - contexts[index].reference.screen_x) * pixel_span;
         let c_im = (screen_y - contexts[index].reference.screen_y) * pixel_span;
-        ensure_render_series(&mut contexts[index], series_degree);
+        ensure_render_series(&mut contexts[index], series_degree, pixel_span);
         let series = contexts[index].series.as_ref().unwrap();
         let result = perturb64(
             c_re,
@@ -2060,7 +2076,7 @@ fn render_pixel_with_references64(
     }
 }
 
-fn ensure_render_series(context: &mut RenderContext, series_degree: usize) {
+fn ensure_render_series(context: &mut RenderContext, series_degree: usize, pixel_span: f64) {
     if context.series.is_none() {
         context.series = Some(build_series_plan64(
             &context.reference.orbit_re,
@@ -2068,6 +2084,7 @@ fn ensure_render_series(context: &mut RenderContext, series_degree: usize) {
             series_degree,
             RENDER_SERIES_MAX_SKIP,
             context.radius,
+            pixel_span,
             &context.probes,
         ));
     }
@@ -2082,7 +2099,34 @@ fn perturb64(
     max_iter: u32,
     series: &SeriesPlan64,
     compute_distance: bool,
-    _scratch: &mut PeriodicScratch64,
+    scratch: &mut PeriodicScratch64,
+) -> PixelResult64 {
+    perturb64_inner(
+        c_re,
+        c_im,
+        pixel_span,
+        orbit_re,
+        orbit_im,
+        max_iter,
+        series,
+        compute_distance,
+        scratch,
+        true,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn perturb64_inner(
+    c_re: f64,
+    c_im: f64,
+    pixel_span: f64,
+    orbit_re: &[f64],
+    orbit_im: &[f64],
+    max_iter: u32,
+    series: &SeriesPlan64,
+    compute_distance: bool,
+    scratch: &mut PeriodicScratch64,
+    allow_series_replay: bool,
 ) -> PixelResult64 {
     let mut dz_re = 0.0;
     let mut dz_im = 0.0;
@@ -2097,6 +2141,12 @@ fn perturb64(
     let rebase_limit = false;
     let bla_skip_count = 0u32;
     let bla_step_count = 0u32;
+    let radius_ratio = if series.radius > 0.0 {
+        (c_re.hypot(c_im) / series.radius).min(1.0)
+    } else {
+        0.0
+    };
+    let parameter_error = series.error_bound * radius_ratio.powi((series.degree + 1) as i32);
 
     if series.skip > 0 {
         if compute_distance {
@@ -2132,89 +2182,21 @@ fn perturb64(
             bla_step_count,
         );
     }
-
-    // When an offset the size of one pixel is faithfully representable beside
-    // the reference parameter, the direct recurrence has the same numerical
-    // resolution and is much cheaper than perturbation. At deep scales this
-    // condition naturally fails, so all significant low bits stay in delta.
-    if parameter_resolves_pixel64(orbit_re.get(1).copied().unwrap_or(0.0), pixel_span)
-        && parameter_resolves_pixel64(orbit_im.get(1).copied().unwrap_or(0.0), pixel_span)
+    if allow_series_replay
+        && series.skip > 0
+        && (!parameter_error.is_finite()
+            || parameter_error > pixel_span.abs() * RENDER_SERIES_PIXEL_ERROR_SCALE)
     {
-        let direct_c_re = orbit_re.get(1).copied().unwrap_or(0.0) + c_re;
-        let direct_c_im = orbit_im.get(1).copied().unwrap_or(0.0) + c_im;
-        let mut z_re = orbit_re[ref_index] + dz_re;
-        let mut z_im = orbit_im[ref_index] + dz_im;
-        while iter <= max_iter {
-            if !z_re.is_finite() || !z_im.is_finite() {
-                return failure_result64(
-                    max_iter,
-                    mag2,
-                    true,
-                    FailureKind64::NonFiniteArithmetic,
-                    iter.min(max_iter),
-                    rebase_count,
-                    rebase_limit,
-                    bla_skip_count,
-                    bla_step_count,
-                );
-            }
-            let z_norm = z_re.abs().max(z_im.abs());
-            mag2 = z_re * z_re + z_im * z_im;
-            if z_norm > 2.0 {
-                return success_result64(
-                    iter,
-                    mag2,
-                    if compute_distance {
-                        render_refined_distance_estimate_px(
-                            z_re,
-                            z_im,
-                            derivative_re,
-                            derivative_im,
-                            direct_c_re,
-                            direct_c_im,
-                            pixel_span,
-                        )
-                    } else {
-                        -1.0
-                    },
-                    false,
-                    false,
-                    rebase_count,
-                    rebase_limit,
-                    bla_skip_count,
-                    bla_step_count,
-                );
-            }
-            if iter >= max_iter {
-                return success_result64(
-                    max_iter,
-                    mag2,
-                    -1.0,
-                    false,
-                    false,
-                    rebase_count,
-                    rebase_limit,
-                    bla_skip_count,
-                    bla_step_count,
-                );
-            }
-            let next_derivative_re = if compute_distance {
-                2.0 * (z_re * derivative_re - z_im * derivative_im) + pixel_span
-            } else {
-                0.0
-            };
-            let next_derivative_im = if compute_distance {
-                2.0 * (z_re * derivative_im + z_im * derivative_re)
-            } else {
-                0.0
-            };
-            let next_re = z_re * z_re - z_im * z_im + direct_c_re;
-            z_im = 2.0 * z_re * z_im + direct_c_im;
-            z_re = next_re;
-            derivative_re = next_derivative_re;
-            derivative_im = next_derivative_im;
-            iter += 1;
-        }
+        return replay_without_series64(
+            c_re,
+            c_im,
+            pixel_span,
+            orbit_re,
+            orbit_im,
+            max_iter,
+            compute_distance,
+            scratch,
+        );
     }
 
     while iter <= max_iter && ref_index <= limit {
@@ -2234,8 +2216,8 @@ fn perturb64(
             break;
         }
         let z_norm = z_re.abs().max(z_im.abs());
-        mag2 = z_re * z_re + z_im * z_im;
         if z_norm > 2.0 {
+            mag2 = z_re * z_re + z_im * z_im;
             return success_result64(
                 iter,
                 mag2,
@@ -2286,14 +2268,6 @@ fn perturb64(
             step_ref_re = orbit_re[0];
             step_ref_im = orbit_im[0];
             rebase_count += 1;
-        } else if !ref_re.is_finite()
-            || !ref_im.is_finite()
-            || !dz_re.is_finite()
-            || !dz_im.is_finite()
-        {
-            glitch = true;
-            failure_kind = FailureKind64::NonFiniteArithmetic;
-            break;
         }
 
         let next_derivative_re = if compute_distance {
@@ -2354,6 +2328,41 @@ fn perturb64(
     )
 }
 
+#[allow(clippy::too_many_arguments)]
+fn replay_without_series64(
+    c_re: f64,
+    c_im: f64,
+    pixel_span: f64,
+    orbit_re: &[f64],
+    orbit_im: &[f64],
+    max_iter: u32,
+    compute_distance: bool,
+    scratch: &mut PeriodicScratch64,
+) -> PixelResult64 {
+    let zero_series = SeriesPlan64 {
+        skip: 0,
+        degree: 0,
+        error_bound: 0.0,
+        radius: 0.0,
+        coeff_re: vec![0.0],
+        coeff_im: vec![0.0],
+    };
+    let mut result = perturb64_inner(
+        c_re,
+        c_im,
+        pixel_span,
+        orbit_re,
+        orbit_im,
+        max_iter,
+        &zero_series,
+        compute_distance,
+        scratch,
+        false,
+    );
+    result.series_replayed = true;
+    result
+}
+
 fn success_result64(
     iter: u32,
     mag2: f64,
@@ -2378,6 +2387,7 @@ fn success_result64(
         rebase_limit,
         bla_skip_count,
         bla_step_count,
+        series_replayed: false,
     }
 }
 
@@ -2405,6 +2415,7 @@ fn failure_result64(
         rebase_limit,
         bla_skip_count,
         bla_step_count,
+        series_replayed: false,
     }
 }
 
@@ -2414,6 +2425,7 @@ fn build_series_plan64(
     degree: usize,
     max_skip: usize,
     tile_radius: f64,
+    pixel_span: f64,
     probes: &[Complex64],
 ) -> SeriesPlan64 {
     let normalized_degree = degree;
@@ -2424,6 +2436,7 @@ fn build_series_plan64(
             2,
             max_skip,
             tile_radius,
+            pixel_span,
             probes,
         );
         if is_series_skip_saturated64(best.skip, max_skip, orbit_re, orbit_im) {
@@ -2439,6 +2452,7 @@ fn build_series_plan64(
                 candidate_degree,
                 max_skip,
                 tile_radius,
+                pixel_span,
                 probes,
             );
             if candidate.skip > best.skip
@@ -2458,6 +2472,7 @@ fn build_series_plan64(
         normalized_degree,
         max_skip,
         tile_radius,
+        pixel_span,
         probes,
     )
 }
@@ -2481,6 +2496,7 @@ fn build_series_plan_for_degree64(
     normalized_degree: usize,
     max_skip: usize,
     tile_radius: f64,
+    pixel_span: f64,
     probes: &[Complex64],
 ) -> SeriesPlan64 {
     let mut coeff_re = vec![0.0; normalized_degree + 1];
@@ -2489,6 +2505,8 @@ fn build_series_plan_for_degree64(
         || max_skip == 0
         || !tile_radius.is_finite()
         || tile_radius <= 0.0
+        || !pixel_span.is_finite()
+        || pixel_span == 0.0
         || tile_radius > RENDER_MAX_SERIES_TILE_RADIUS
         || orbit_re.len() < 2
         || orbit_im.len() < 2
@@ -2497,6 +2515,8 @@ fn build_series_plan_for_degree64(
         return SeriesPlan64 {
             skip: 0,
             degree: normalized_degree,
+            error_bound: 0.0,
+            radius: tile_radius,
             coeff_re,
             coeff_im,
         };
@@ -2509,6 +2529,8 @@ fn build_series_plan_for_degree64(
     let mut next_probe_re = vec![0.0; probes.len()];
     let mut next_probe_im = vec![0.0; probes.len()];
     let mut skip = 0usize;
+    let mut error_bound = 0.0f64;
+    let error_limit = pixel_span.abs() * RENDER_SERIES_PIXEL_ERROR_SCALE;
 
     for n in 0..max_skip.min(orbit_re.len() - 1) {
         next_re.fill(0.0);
@@ -2537,7 +2559,7 @@ fn build_series_plan_for_degree64(
             }
         }
 
-        if !probes_validate_series_step64(
+        let Some(probe_error) = probes_validate_series_step64(
             probes,
             &probe_re,
             &probe_im,
@@ -2549,20 +2571,33 @@ fn build_series_plan_for_degree64(
             orbit_im,
             n,
             tile_radius,
-        ) {
+        ) else {
+            break;
+        };
+        let derivative_lower_bound =
+            series_derivative_lower_bound64(&next_re, &next_im, tile_radius);
+        if derivative_lower_bound <= 0.0 {
             break;
         }
-
+        let orbit_error_bound = next_up_nonnegative(probe_error);
+        let next_error_bound =
+            next_up_nonnegative(error_bound.max(orbit_error_bound / derivative_lower_bound));
+        if !next_error_bound.is_finite() || next_error_bound > error_limit {
+            break;
+        }
         coeff_re.copy_from_slice(&next_re);
         coeff_im.copy_from_slice(&next_im);
         probe_re.copy_from_slice(&next_probe_re);
         probe_im.copy_from_slice(&next_probe_im);
+        error_bound = next_error_bound;
         skip = n + 1;
     }
 
     SeriesPlan64 {
         skip,
         degree: normalized_degree,
+        error_bound,
+        radius: tile_radius,
         coeff_re,
         coeff_im,
     }
@@ -2623,14 +2658,15 @@ fn probes_validate_series_step64(
     orbit_im: &[f64],
     n: usize,
     tile_radius: f64,
-) -> bool {
+) -> Option<f64> {
     let zr = orbit_re[n];
     let zi = orbit_im[n];
     let next_ref_re = orbit_re[n + 1];
     let next_ref_im = orbit_im[n + 1];
     if !next_ref_re.is_finite() || !next_ref_im.is_finite() {
-        return false;
+        return None;
     }
+    let mut max_error = 0.0f64;
 
     for index in 0..probes.len() {
         let c_re = probes[index].re;
@@ -2644,20 +2680,20 @@ fn probes_validate_series_step64(
         let exact_re = two_ref_dz_re + dz2_re + c_re;
         let exact_im = two_ref_dz_im + dz2_im + c_im;
         if !exact_re.is_finite() || !exact_im.is_finite() {
-            return false;
+            return None;
         }
 
         let z_re = next_ref_re + exact_re;
         let z_im = next_ref_im + exact_im;
         let mag2 = z_re * z_re + z_im * z_im;
         if !mag2.is_finite() || mag2 > 4.0 {
-            return false;
+            return None;
         }
 
         let ref_mag2 = next_ref_re * next_ref_re + next_ref_im * next_ref_im;
         let dz_mag2 = exact_re * exact_re + exact_im * exact_im;
         if is_render_cancellation_glitch(mag2, ref_mag2, dz_mag2) {
-            return false;
+            return None;
         }
 
         let mut estimate_zr = 0.0;
@@ -2671,7 +2707,7 @@ fn probes_validate_series_step64(
         let estimate_re = estimate_zr * c_re - estimate_zi * c_im;
         let estimate_im = estimate_zr * c_im + estimate_zi * c_re;
         if !estimate_re.is_finite() || !estimate_im.is_finite() {
-            return false;
+            return None;
         }
         let error = (exact_re - estimate_re).hypot(exact_im - estimate_im);
         let exact_mag = exact_re.hypot(exact_im);
@@ -2682,13 +2718,30 @@ fn probes_validate_series_step64(
                 .max(estimate_mag)
                 .max(f64::MIN_POSITIVE);
         if !error.is_finite() || error > allowed {
-            return false;
+            return None;
         }
+        max_error = max_error.max(error);
 
         next_probe_re[index] = exact_re;
         next_probe_im[index] = exact_im;
     }
-    true
+    Some(max_error)
+}
+
+fn series_derivative_lower_bound64(coeff_re: &[f64], coeff_im: &[f64], radius: f64) -> f64 {
+    let linear = coeff_re.get(1).copied().unwrap_or(0.0).hypot(
+        coeff_im.get(1).copied().unwrap_or(0.0),
+    );
+    let mut tail = 0.0f64;
+    let mut power = radius;
+    for degree in 2..coeff_re.len().min(coeff_im.len()) {
+        let coefficient_norm = coeff_re[degree].hypot(coeff_im[degree]);
+        tail = next_up_nonnegative(
+            tail + next_up_nonnegative(degree as f64 * coefficient_norm * power),
+        );
+        power = next_up_nonnegative(power * radius);
+    }
+    linear - tail
 }
 
 fn is_render_cancellation_glitch(mag2: f64, ref_mag2: f64, dz_mag2: f64) -> bool {
@@ -2858,17 +2911,6 @@ fn failure_kind_key(index: usize) -> &'static str {
         1 => "nonFiniteArithmetic",
         _ => "seriesUnsafe",
     }
-}
-
-fn parameter_resolves_pixel64(value: f64, pixel_span: f64) -> bool {
-    let span = pixel_span.abs();
-    if !value.is_finite() || !span.is_finite() || span == 0.0 {
-        return false;
-    }
-    let plus = (value + span) - value;
-    let minus = value - (value - span);
-    let error = (plus - span).abs().max((minus - span).abs());
-    error <= span * 1e-6
 }
 
 fn estimate_render_distances_from_smooth(
@@ -3651,6 +3693,8 @@ mod tests {
         SeriesPlan64 {
             skip: 0,
             degree: 0,
+            error_bound: 0.0,
+            radius: 0.0,
             coeff_re: Vec::new(),
             coeff_im: Vec::new(),
         }
@@ -3709,5 +3753,50 @@ mod tests {
         assert!(bounded > 0.0);
         assert!(bounded <= 0.25);
         assert_eq!(estimate_max_iter_bounded_radius64(2, 64, &[0.0, 1.0], &[0.0, 0.0]), 0.0);
+    }
+
+    #[test]
+    fn series_plan_error_stays_below_a_quarter_pixel() {
+        let orbit_re = vec![0.0; 65];
+        let orbit_im = vec![0.0; 65];
+        let pixel_span = 1e-6;
+        let plan = build_series_plan64(
+            &orbit_re,
+            &orbit_im,
+            12,
+            64,
+            1e-4,
+            pixel_span,
+            &[Complex64 { re: 1e-4, im: 0.0 }],
+        );
+        assert!(plan.error_bound.is_finite());
+        assert!(plan.error_bound <= pixel_span * RENDER_SERIES_PIXEL_ERROR_SCALE);
+    }
+
+    #[test]
+    fn uncertain_series_state_replays_without_acceleration() {
+        let series = SeriesPlan64 {
+            skip: 1,
+            degree: 1,
+            error_bound: 1.0,
+            radius: 1.0,
+            coeff_re: vec![0.0, 1.0],
+            coeff_im: vec![0.0, 0.0],
+        };
+        let mut scratch = PeriodicScratch64;
+        let result = perturb64(
+            1e-3,
+            0.0,
+            1e-6,
+            &[0.0; 9],
+            &[0.0; 9],
+            8,
+            &series,
+            false,
+            &mut scratch,
+        );
+        assert!(result.series_replayed);
+        assert!(!result.unresolved);
+        assert_eq!(result.iter, 8);
     }
 }

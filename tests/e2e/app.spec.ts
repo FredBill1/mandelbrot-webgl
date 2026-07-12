@@ -67,6 +67,11 @@ const REPORTED_DEEP_PERFORMANCE_VIEW =
 const ALT_REPORTED_DEEP_PERFORMANCE_VIEW = `/?re=${ALT_DEEP_PRESET.re}&im=${ALT_DEEP_PRESET.im}&scale=${ALT_DEEP_PRESET.scale}`;
 const REFERENCE_PRESSURE_PERFORMANCE_VIEW =
   "/?re=-1.78638467787648365419207727720547018425703939706085767725832225881685228735410418701755894e0&im=-1.87892462354318380104774042945871534747473396966114579975399303084919971138018941887528654e-2&scale=1.7258385479561780535790570974260812707442099869376129800677603403441562714056599956588571e21";
+const TILE_STABILITY_REGRESSION_VIEWS = [
+  "/?re=-7.01387731903521223674098370590029601822238961543775804742227688464250492677780739033222047e-1&im=-3.56367439465469861709467103905413691257500903471530163501858632930155641658498130531713519e-1&scale=8.54058762526144333935599265187197755732295827821093845497191539505192936261353888372715873e2",
+  "/?re=-7.01396305289865928998453850684321869304035150941346243956315387347432441546595468420334784e-1&im=-3.56337432613263393074222923575390755071214240580033626236780076918807543075060661738918592e-1&scale=8.5405876252614433393559926518719775573229582782109384549735467211689289937451832943672213e2",
+  "/?re=-7.02485508327748859893342034308239792901618973010193311747252495163082235735932939989055177e-1&im=-3.56069077897478957563590466145738846539804563682882057788922289119637288451593193386773247e-1&scale=1.71542288092908036911506000078131071223401233704341709118016699422518034262720667917371947e4"
+] as const;
 const UNSAFE_ACCELERATION_TILE_REGRESSIONS = [
   {
     url:
@@ -530,6 +535,32 @@ test("bandlimits the reported deep boundary view and emits visual artifacts", as
   expect(speckleRatio).toBeLessThanOrEqual(0.08);
 });
 
+test("keeps reported minibrot geometry stable across tile boundaries and small view changes", async ({ page }) => {
+  test.setTimeout(30_000);
+  await installInteractionWorkerProbe(page);
+  await page.setViewportSize({ width: 1912, height: 948 });
+
+  for (const url of TILE_STABILITY_REGRESSION_VIEWS) {
+    const started = Date.now();
+    await page.goto(url);
+    const metrics = await waitForStableMetrics(page, started, 2_500);
+    expect(metrics.status).toBe("stable");
+    expect(metrics.stableMs).toBeLessThan(2_500);
+    expect(metrics.peakReferences).toBe(1);
+
+    const tileCounts = await readTileCounts(page);
+    expect(tileCounts.completed).toBe(tileCounts.total);
+    const probe = await readInteractionWorkerProbe(page);
+    expect(probe.referenceRequests).toBe(1);
+    expect(probe.renderMessages.filter((message) => message.mode === "exact")).toHaveLength(0);
+    expect(probe.renderMessages.filter((message) => message.mode === "final")).toHaveLength(tileCounts.total);
+
+    const seam = await readTileSeamDiscontinuity(page, 128);
+    expect(seam.anomalousRatio).toBeLessThan(0.05);
+      expect(seam.excessRatio).toBeLessThan(0.025);
+  }
+});
+
 test("replaces super-Nyquist gray with stable distance color on the reported view", async ({ page }) => {
   test.setTimeout(120_000);
   await installInteractionWorkerProbe(page);
@@ -760,6 +791,7 @@ interface InteractionWorkerProbe {
   unknownWorkers: number;
   referenceRequests: number;
   renderMessages: Array<{ revision: number; mode: string; at: number }>;
+  tileResults: Array<{ revision: number; seriesReplayPixels: number }>;
 }
 
 async function installInteractionWorkerProbe(page: import("@playwright/test").Page): Promise<void> {
@@ -770,7 +802,8 @@ async function installInteractionWorkerProbe(page: import("@playwright/test").Pa
       referenceWorkers: 0,
       unknownWorkers: 0,
       referenceRequests: 0,
-      renderMessages: []
+      renderMessages: [],
+      tileResults: []
     };
     (globalThis as unknown as { __interactionWorkerProbe: InteractionWorkerProbe }).__interactionWorkerProbe = probe;
 
@@ -800,6 +833,15 @@ async function installInteractionWorkerProbe(page: import("@playwright/test").Pa
         postMessage(message, transferOrOptions);
       }) as Worker["postMessage"];
 
+      worker.addEventListener("message", (event: MessageEvent) => {
+        const data = event.data as { type?: unknown; revision?: unknown; stats?: { seriesReplayPixels?: unknown } };
+        if (data?.type !== "tileDone") return;
+        probe.tileResults.push({
+          revision: typeof data.revision === "number" ? data.revision : -1,
+          seriesReplayPixels: typeof data.stats?.seriesReplayPixels === "number" ? data.stats.seriesReplayPixels : 0
+        });
+      });
+
       return worker;
     } as unknown as typeof Worker;
     patchedWorker.prototype = originalWorker.prototype;
@@ -816,7 +858,8 @@ async function readInteractionWorkerProbe(page: import("@playwright/test").Page)
       referenceWorkers: probe.referenceWorkers,
       unknownWorkers: probe.unknownWorkers,
       referenceRequests: probe.referenceRequests,
-      renderMessages: [...probe.renderMessages]
+      renderMessages: [...probe.renderMessages],
+      tileResults: [...probe.tileResults]
     };
   });
 }
@@ -977,6 +1020,80 @@ async function readHorizontalDarkSeamScore(
       maxExcessDarkDropRatio = Math.max(maxExcessDarkDropRatio, excess);
     }
     return { maxDarkDropRatio, maxExcessDarkDropRatio, row };
+  }, tileSize);
+}
+
+async function readTileSeamDiscontinuity(
+  page: import("@playwright/test").Page,
+  tileSize: number
+): Promise<{ anomalousRatio: number; controlRatio: number; excessRatio: number; anomalous: number; compared: number }> {
+  return page.evaluate((tileSize) => {
+    const canvas = document.querySelector<HTMLCanvasElement>("#fractal");
+    const gl = canvas?.getContext("webgl2", { alpha: false, antialias: false, preserveDrawingBuffer: true });
+    if (!canvas || !gl) {
+      return { anomalousRatio: Number.POSITIVE_INFINITY, controlRatio: 0, excessRatio: Number.POSITIVE_INFINITY, anomalous: 0, compared: 0 };
+    }
+    const width = canvas.width;
+    const height = canvas.height;
+    const pixels = new Uint8Array(width * height * 4);
+    gl.readPixels(0, 0, width, height, gl.RGBA, gl.UNSIGNED_BYTE, pixels);
+    const offset = (x: number, screenY: number) => ((height - 1 - screenY) * width + x) * 4;
+    const delta = (ax: number, ay: number, bx: number, by: number) => {
+      const a = offset(ax, ay);
+      const b = offset(bx, by);
+      return Math.abs(pixels[a] - pixels[b]) + Math.abs(pixels[a + 1] - pixels[b + 1]) + Math.abs(pixels[a + 2] - pixels[b + 2]);
+    };
+    let anomalous = 0;
+    let compared = 0;
+    let controlAnomalous = 0;
+    let controlCompared = 0;
+    const isAnomalous = (seam: number, before: number, after: number) =>
+      seam > 120 && seam > Math.max(before, after) * 2.5 + 30;
+    const recordVertical = (lineX: number, y: number, control: boolean) => {
+      const value = isAnomalous(
+        delta(lineX - 1, y, lineX, y),
+        delta(lineX - 2, y, lineX - 1, y),
+        delta(lineX, y, lineX + 1, y)
+      );
+      if (control) {
+        controlCompared += 1;
+        if (value) controlAnomalous += 1;
+      } else {
+        compared += 1;
+        if (value) anomalous += 1;
+      }
+    };
+    const recordHorizontal = (x: number, lineY: number, control: boolean) => {
+      const value = isAnomalous(
+        delta(x, lineY - 1, x, lineY),
+        delta(x, lineY - 2, x, lineY - 1),
+        delta(x, lineY, x, lineY + 1)
+      );
+      if (control) {
+        controlCompared += 1;
+        if (value) controlAnomalous += 1;
+      } else {
+        compared += 1;
+        if (value) anomalous += 1;
+      }
+    };
+    for (let x = tileSize; x < width - 2; x += tileSize) {
+      for (let y = 2; y < height - 2; y += 1) {
+        recordVertical(x, y, false);
+        recordVertical(x - 16, y, true);
+        recordVertical(x + 16, y, true);
+      }
+    }
+    for (let y = tileSize; y < height - 2; y += tileSize) {
+      for (let x = 2; x < width - 2; x += 1) {
+        recordHorizontal(x, y, false);
+        recordHorizontal(x, y - 16, true);
+        recordHorizontal(x, y + 16, true);
+      }
+    }
+    const anomalousRatio = anomalous / Math.max(1, compared);
+    const controlRatio = controlAnomalous / Math.max(1, controlCompared);
+    return { anomalousRatio, controlRatio, excessRatio: Math.max(0, anomalousRatio - controlRatio), anomalous, compared };
   }, tileSize);
 }
 

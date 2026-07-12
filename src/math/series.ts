@@ -1,6 +1,8 @@
 export interface SeriesPlan {
   skip: number;
   degree: number;
+  errorBound: number;
+  radius: number;
   coeffRe: Float64Array;
   coeffIm: Float64Array;
 }
@@ -18,6 +20,7 @@ export interface SeriesEvaluation {
 const MAX_SERIES_TILE_RADIUS = 1e-3;
 const SERIES_ERROR_SCALE = 2.9e-2;
 const SERIES_SKIP_SATURATION = 0.7;
+const SERIES_PIXEL_ERROR_SCALE = 0.25;
 
 export function buildSeriesPlan(
   orbitRe: ArrayLike<number>,
@@ -25,15 +28,16 @@ export function buildSeriesPlan(
   degree: number,
   maxSkip: number,
   tileRadius: number,
+  pixelSpan: number,
   probes: readonly Complex[] = [{ re: 0, im: 0 }]
 ): SeriesPlan {
   const normalizedDegree = Math.max(0, Math.floor(degree));
   if (normalizedDegree > 2) {
-    let best = buildSeriesPlanForDegree(orbitRe, orbitIm, 2, maxSkip, tileRadius, probes);
+    let best = buildSeriesPlanForDegree(orbitRe, orbitIm, 2, maxSkip, tileRadius, pixelSpan, probes);
     if (isSeriesSkipSaturated(best.skip, maxSkip, orbitRe, orbitIm)) return best;
     for (const candidateDegree of [4, 8, 12]) {
       if (candidateDegree > normalizedDegree) break;
-      const candidate = buildSeriesPlanForDegree(orbitRe, orbitIm, candidateDegree, maxSkip, tileRadius, probes);
+      const candidate = buildSeriesPlanForDegree(orbitRe, orbitIm, candidateDegree, maxSkip, tileRadius, pixelSpan, probes);
       if (candidate.skip > best.skip || (candidate.skip === best.skip && candidate.degree < best.degree)) {
         best = candidate;
       }
@@ -41,7 +45,7 @@ export function buildSeriesPlan(
     }
     return best;
   }
-  return buildSeriesPlanForDegree(orbitRe, orbitIm, normalizedDegree, maxSkip, tileRadius, probes);
+  return buildSeriesPlanForDegree(orbitRe, orbitIm, normalizedDegree, maxSkip, tileRadius, pixelSpan, probes);
 }
 
 function isSeriesSkipSaturated(skip: number, maxSkip: number, orbitRe: ArrayLike<number>, orbitIm: ArrayLike<number>): boolean {
@@ -55,6 +59,7 @@ function buildSeriesPlanForDegree(
   normalizedDegree: number,
   maxSkip: number,
   tileRadius: number,
+  pixelSpan: number,
   probes: readonly Complex[]
 ): SeriesPlan {
   const coeffRe = new Float64Array(normalizedDegree + 1);
@@ -64,12 +69,14 @@ function buildSeriesPlanForDegree(
     maxSkip <= 0 ||
     !Number.isFinite(tileRadius) ||
     tileRadius <= 0 ||
+    !Number.isFinite(pixelSpan) ||
+    pixelSpan === 0 ||
     tileRadius > MAX_SERIES_TILE_RADIUS ||
     orbitRe.length < 2 ||
     orbitIm.length < 2 ||
     probes.length === 0
   ) {
-    return { skip: 0, degree: normalizedDegree, coeffRe, coeffIm };
+    return { skip: 0, degree: normalizedDegree, errorBound: 0, radius: tileRadius, coeffRe, coeffIm };
   }
 
   const nextRe = new Float64Array(normalizedDegree + 1);
@@ -79,6 +86,8 @@ function buildSeriesPlanForDegree(
   const nextProbeRe = new Float64Array(probes.length);
   const nextProbeIm = new Float64Array(probes.length);
   let skip = 0;
+  let errorBound = 0;
+  const errorLimit = Math.abs(pixelSpan) * SERIES_PIXEL_ERROR_SCALE;
 
   for (let n = 0; n < Math.min(maxSkip, orbitRe.length - 1); n += 1) {
     nextRe.fill(0);
@@ -104,16 +113,34 @@ function buildSeriesPlanForDegree(
       }
     }
 
-    if (!probesValidateSeriesStep(probes, probeRe, probeIm, nextProbeRe, nextProbeIm, nextRe, nextIm, orbitRe, orbitIm, n, tileRadius)) break;
-
+    const probeError = probesValidateSeriesStep(
+      probes,
+      probeRe,
+      probeIm,
+      nextProbeRe,
+      nextProbeIm,
+      nextRe,
+      nextIm,
+      orbitRe,
+      orbitIm,
+      n,
+      tileRadius
+    );
+    if (probeError === undefined) break;
+    const derivativeLowerBound = seriesDerivativeLowerBound(nextRe, nextIm, tileRadius);
+    if (!(derivativeLowerBound > 0)) break;
+    const orbitErrorBound = nextUpNonnegative(probeError);
+    const nextErrorBound = nextUpNonnegative(Math.max(errorBound, orbitErrorBound / derivativeLowerBound));
+    if (!Number.isFinite(nextErrorBound) || nextErrorBound > errorLimit) break;
     coeffRe.set(nextRe);
     coeffIm.set(nextIm);
     probeRe.set(nextProbeRe);
     probeIm.set(nextProbeIm);
+    errorBound = nextErrorBound;
     skip = n + 1;
   }
 
-  return { skip, degree: normalizedDegree, coeffRe, coeffIm };
+  return { skip, degree: normalizedDegree, errorBound, radius: tileRadius, coeffRe, coeffIm };
 }
 
 export function evaluateSeries(plan: SeriesPlan, cRe: number, cIm: number): Complex {
@@ -170,12 +197,13 @@ function probesValidateSeriesStep(
   orbitIm: ArrayLike<number>,
   n: number,
   tileRadius: number
-): boolean {
+): number | undefined {
   const zr = orbitRe[n] ?? 0;
   const zi = orbitIm[n] ?? 0;
   const nextRefRe = orbitRe[n + 1] ?? 0;
   const nextRefIm = orbitIm[n + 1] ?? 0;
-  if (!Number.isFinite(nextRefRe) || !Number.isFinite(nextRefIm)) return false;
+  if (!Number.isFinite(nextRefRe) || !Number.isFinite(nextRefIm)) return undefined;
+  let maxError = 0;
 
   for (let index = 0; index < probes.length; index += 1) {
     const cRe = probes[index].re;
@@ -188,16 +216,16 @@ function probesValidateSeriesStep(
     const twoRefDzIm = 2 * (zr * dzIm + zi * dzRe);
     const exactRe = twoRefDzRe + dz2Re + cRe;
     const exactIm = twoRefDzIm + dz2Im + cIm;
-    if (!Number.isFinite(exactRe) || !Number.isFinite(exactIm)) return false;
+    if (!Number.isFinite(exactRe) || !Number.isFinite(exactIm)) return undefined;
 
     const zRe = nextRefRe + exactRe;
     const zIm = nextRefIm + exactIm;
     const mag2 = zRe * zRe + zIm * zIm;
-    if (!Number.isFinite(mag2) || mag2 > 4) return false;
+    if (!Number.isFinite(mag2) || mag2 > 4) return undefined;
 
     const refMag2 = nextRefRe * nextRefRe + nextRefIm * nextRefIm;
     const dzMag2 = exactRe * exactRe + exactIm * exactIm;
-    if (isCancellationGlitch(mag2, refMag2, dzMag2)) return false;
+    if (isCancellationGlitch(mag2, refMag2, dzMag2)) return undefined;
 
     let estimateZr = 0;
     let estimateZi = 0;
@@ -209,18 +237,37 @@ function probesValidateSeriesStep(
     }
     const estimateRe = estimateZr * cRe - estimateZi * cIm;
     const estimateIm = estimateZr * cIm + estimateZi * cRe;
-    if (!Number.isFinite(estimateRe) || !Number.isFinite(estimateIm)) return false;
+    if (!Number.isFinite(estimateRe) || !Number.isFinite(estimateIm)) return undefined;
     const error = Math.hypot(exactRe - estimateRe, exactIm - estimateIm);
     const exactMag = Math.hypot(exactRe, exactIm);
     const estimateMag = Math.hypot(estimateRe, estimateIm);
     const allowed = SERIES_ERROR_SCALE * Math.max(tileRadius, exactMag, estimateMag, Number.MIN_VALUE);
-    if (!Number.isFinite(error) || error > allowed) return false;
+    if (!Number.isFinite(error) || error > allowed) return undefined;
+    maxError = Math.max(maxError, error);
 
     nextProbeRe[index] = exactRe;
     nextProbeIm[index] = exactIm;
   }
 
-  return true;
+  return maxError;
+}
+
+function seriesDerivativeLowerBound(coeffRe: Float64Array, coeffIm: Float64Array, radius: number): number {
+  const linear = Math.hypot(coeffRe[1] ?? 0, coeffIm[1] ?? 0);
+  let tail = 0;
+  let power = radius;
+  for (let degree = 2; degree < coeffRe.length; degree += 1) {
+    const coefficientNorm = Math.hypot(coeffRe[degree], coeffIm[degree]);
+    tail = nextUpNonnegative(tail + nextUpNonnegative(degree * coefficientNorm * power));
+    power = nextUpNonnegative(power * radius);
+  }
+  return linear - tail;
+}
+
+function nextUpNonnegative(value: number): number {
+  if (!Number.isFinite(value) || value < 0) return value;
+  if (value === 0) return Number.MIN_VALUE;
+  return value + Math.max(Number.MIN_VALUE, Math.abs(value) * Number.EPSILON);
 }
 
 function isCancellationGlitch(mag2: number, refMag2: number, dzMag2: number): boolean {

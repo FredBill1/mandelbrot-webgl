@@ -372,6 +372,7 @@ function installWorkerProbe() {
       totalGlitches: 0,
       totalRebases: 0,
       totalPeriodicInterior: 0,
+      totalSeriesReplayPixels: 0,
       exactFallbackPixels: 0,
       onePixelTiles: 0,
       minTileArea: Infinity
@@ -493,6 +494,7 @@ function installWorkerProbe() {
           bench.waves.totalGlitches += data.stats.glitchCount;
           bench.waves.totalRebases += data.stats.rebaseCount;
           bench.waves.totalPeriodicInterior += data.stats.periodicInteriorCount;
+          bench.waves.totalSeriesReplayPixels += data.stats.seriesReplayPixels ?? 0;
           bench.waves.exactFallbackPixels += data.stats.exactFallbackPixels ?? 0;
           pushSlowFinal({
             workerMs: Math.round(data.stats.elapsedMs),
@@ -507,6 +509,7 @@ function installWorkerProbe() {
             glitches: data.stats.glitchCount,
             rebases: data.stats.rebaseCount,
             periodicInterior: data.stats.periodicInteriorCount,
+            seriesReplayPixels: data.stats.seriesReplayPixels ?? 0,
             distanceEstimated: data.stats.distanceEstimatedCount,
             paletteFiltered: data.stats.paletteFilteredCount,
             distanceColorized: data.stats.distanceColorizedCount,
@@ -539,6 +542,7 @@ function installWorkerProbe() {
               glitches: data.stats.glitchCount,
               rebases: data.stats.rebaseCount,
               periodicInterior: data.stats.periodicInteriorCount,
+              seriesReplayPixels: data.stats.seriesReplayPixels ?? 0,
               distanceEstimated: data.stats.distanceEstimatedCount,
               paletteFiltered: data.stats.paletteFilteredCount,
               distanceColorized: data.stats.distanceColorizedCount,
@@ -561,6 +565,7 @@ function installWorkerProbe() {
             glitches: data.stats.glitchCount,
             rebases: data.stats.rebaseCount,
             periodicInterior: data.stats.periodicInteriorCount,
+            seriesReplayPixels: data.stats.seriesReplayPixels ?? 0,
             distanceEstimated: data.stats.distanceEstimatedCount,
             paletteFiltered: data.stats.paletteFilteredCount,
             distanceColorized: data.stats.distanceColorizedCount,

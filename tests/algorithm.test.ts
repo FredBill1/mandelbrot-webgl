@@ -2,7 +2,7 @@ import { beforeAll, describe, expect, it } from "vitest";
 import { readFileSync } from "node:fs";
 import init, { apply_view_transform, compute_reference, compute_reference_3mul, compute_reference_sparse, direct_escape, estimate_max_iter_bounded_radius } from "../src/wasm/pkg/mandelbrot_wasm";
 import { createVisibleTileShells } from "../src/tiles/tileKey";
-import { evaluateSeriesWithDerivative, type SeriesPlan } from "../src/math/series";
+import { buildSeriesPlan, evaluateSeriesWithDerivative, type SeriesPlan } from "../src/math/series";
 import {
   boundaryCoverageWeightForTests,
   distanceColorWeightForTests,
@@ -25,6 +25,8 @@ describe("perturbation renderer", () => {
     const plan: SeriesPlan = {
       skip: 12,
       degree: 4,
+      errorBound: 0,
+      radius: 0,
       coeffRe: Float64Array.from([0, 0.84, -0.37, 0.19, -0.031]),
       coeffIm: Float64Array.from([0, -0.22, 0.41, 0.071, -0.025])
     };
@@ -196,6 +198,7 @@ describe("perturbation renderer", () => {
       expect(wasmResult.stats.rebaseCount).toBe(tsResult.stats.rebaseCount);
       expect(wasmResult.stats.rebaseLimitCount).toBe(tsResult.stats.rebaseLimitCount);
       expect(wasmResult.stats.seriesSkip).toBe(tsResult.stats.seriesSkip);
+      expect(wasmResult.stats.seriesReplayPixels).toBe(tsResult.stats.seriesReplayPixels);
       expect(wasmResult.stats.distanceEstimatedCount).toBe(tsResult.stats.distanceEstimatedCount);
       expect(wasmResult.stats.paletteFilteredCount).toBe(tsResult.stats.paletteFilteredCount);
       expect(wasmResult.stats.distanceColorizedCount).toBe(tsResult.stats.distanceColorizedCount);
@@ -676,6 +679,88 @@ describe("perturbation renderer", () => {
     }
   });
 
+  it("keeps the reported minibrot classification stable with one view reference", () => {
+    const views = [
+      {
+        re: "-7.01387731903521223674098370590029601822238961543775804742227688464250492677780739033222047e-1",
+        im: "-3.56367439465469861709467103905413691257500903471530163501858632930155641658498130531713519e-1",
+        scale: "8.54058762526144333935599265187197755732295827821093845497191539505192936261353888372715873e2",
+        maxIter: 700,
+        samples: [[1000.5, 240.5], [1023.5, 255.5], [1024.5, 256.5], [1080.5, 300.5]]
+      },
+      {
+        re: "-7.01396305289865928998453850684321869304035150941346243956315387347432441546595468420334784e-1",
+        im: "-3.56337432613263393074222923575390755071214240580033626236780076918807543075060661738918592e-1",
+        scale: "8.5405876252614433393559926518719775573229582782109384549735467211689289937451832943672213e2",
+        maxIter: 700,
+        samples: [[1000.5, 220.5], [1023.5, 255.5], [1024.5, 256.5], [1080.5, 300.5]]
+      },
+      {
+        re: "-7.02485508327748859893342034308239792901618973010193311747252495163082235735932939989055177e-1",
+        im: "-3.56069077897478957563590466145738846539804563682882057788922289119637288451593193386773247e-1",
+        scale: "1.71542288092908036911506000078131071223401233704341709118016699422518034262720667917371947e4",
+        maxIter: 783,
+        samples: [[127.5, 400.5], [128.5, 400.5], [255.5, 512.5], [256.5, 512.5], [511.5, 512.5], [512.5, 512.5]]
+      }
+    ] as const;
+
+    for (const view of views) {
+      const reference = makeReference(view.re, view.im, view.maxIter, 256, 956, 474);
+      for (const [x, y] of view.samples) {
+        const point = highPrecisionPointAtScreen(view, x, y, 1912, 948);
+        const direct = direct_escape(point.re, point.im, view.maxIter, 256);
+        const result = renderSinglePixelWithReference(view, point, x, y, reference);
+        expect(result.stats.unresolvedCount).toBe(0);
+        expect(result.stats.escapedPixels).toBe(direct < view.maxIter ? 1 : 0);
+      }
+    }
+  });
+
+  it("bounds series initialization to a quarter pixel without replaying certified pixels", async () => {
+    const view = {
+      re: "-7.01387731903521223674098370590029601822238961543775804742227688464250492677780739033222047e-1",
+      im: "-3.56367439465469861709467103905413691257500903471530163501858632930155641658498130531713519e-1",
+      scale: "8.54058762526144333935599265187197755732295827821093845497191539505192936261353888372715873e2",
+      maxIter: 700
+    };
+    const span = pixelSpan(view.scale, 1912);
+    const reference = makeReference(view.re, view.im, view.maxIter, 256, 956, 474);
+    const radius = Math.hypot(128, 128) * span;
+    const probes = [
+      { re: (896 - 956) * span, im: (128 - 474) * span },
+      { re: (1024 - 956) * span, im: (256 - 474) * span }
+    ];
+    const plan = buildSeriesPlan(reference.orbitRe, reference.orbitIm, SERIES_DEGREE, 8192, radius, span, probes);
+    expect(plan.errorBound).toBeLessThanOrEqual(span * 0.25);
+
+    const message = overlappingTileMessage(view, reference, { x: 896, y: 128, width: 128, height: 128 }, "series-replay");
+    resetWasmPerturbationCacheForTests();
+    const result = await renderPerturbationTileWasm(message);
+    expect(result.stats.seriesSkip).toBeGreaterThan(0);
+    expect(result.stats.seriesReplayPixels).toBe(0);
+    expect(result.stats.unresolvedCount).toBe(0);
+  });
+
+  it("renders the same reported pixel identically across overlapping tile domains", async () => {
+    const view = {
+      re: "-7.01387731903521223674098370590029601822238961543775804742227688464250492677780739033222047e-1",
+      im: "-3.56367439465469861709467103905413691257500903471530163501858632930155641658498130531713519e-1",
+      scale: "8.54058762526144333935599265187197755732295827821093845497191539505192936261353888372715873e2",
+      maxIter: 700
+    };
+    const reference = makeReference(view.re, view.im, view.maxIter, 256, 956, 474);
+    const first = overlappingTileMessage(view, reference, { x: 896, y: 128, width: 128, height: 128 }, "overlap-a");
+    const second = overlappingTileMessage(view, reference, { x: 960, y: 192, width: 128, height: 128 }, "overlap-b");
+    resetWasmPerturbationCacheForTests();
+    const firstResult = await renderPerturbationTileWasm(first);
+    const secondResult = await renderPerturbationTileWasm(second);
+    const screenX = 1000;
+    const screenY = 240;
+    const firstOffset = ((screenY - first.tile.rect.y) * firstResult.width + screenX - first.tile.rect.x) * 4;
+    const secondOffset = ((screenY - second.tile.rect.y) * secondResult.width + screenX - second.tile.rect.x) * 4;
+    expect([...new Uint8Array(firstResult.rgba, firstOffset, 4)]).toEqual([...new Uint8Array(secondResult.rgba, secondOffset, 4)]);
+  });
+
   it("computes a conservative max-iteration bounded radius", () => {
     const bounded = makeReference("0", "0", 64, 192, 0, 0);
     const escaped = makeReference("1", "0", 64, 192, 0, 0);
@@ -944,6 +1029,39 @@ function makeTileMessage(
     paletteId: "cosine",
     renderMode,
     sampleStep
+  };
+}
+
+function overlappingTileMessage(
+  view: { re: string; im: string; scale: string; maxIter: number },
+  reference: ReferenceSnapshot,
+  rect: { x: number; y: number; width: number; height: number },
+  id: string
+): RenderTileMessage {
+  const centerScreenX = rect.x + rect.width * 0.5;
+  const centerScreenY = rect.y + rect.height * 0.5;
+  const center = highPrecisionPointAtScreen(view, centerScreenX, centerScreenY, 1912, 948);
+  return {
+    type: "renderTile",
+    tile: {
+      id,
+      key: { level: 0, x: rect.x, y: rect.y, span: Math.max(rect.width, rect.height) },
+      rect,
+      centerScreenX,
+      centerScreenY,
+      centerRe: center.re,
+      centerIm: center.im,
+      revision: 1
+    },
+    canvasWidth: 1912,
+    canvasHeight: 948,
+    pixelSpan: pixelSpan(view.scale, 1912),
+    maxIter: view.maxIter,
+    reference,
+    seriesDegree: SERIES_DEGREE,
+    paletteId: "cosine",
+    renderMode: "final",
+    sampleStep: 1
   };
 }
 

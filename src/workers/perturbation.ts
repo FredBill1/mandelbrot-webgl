@@ -14,6 +14,7 @@ interface PixelResult {
   rebaseLimit: boolean;
   blaSkipCount: number;
   blaStepCount: number;
+  seriesReplayed: boolean;
 }
 
 interface PixelSelection {
@@ -76,6 +77,15 @@ interface BoundaryStats {
 }
 
 const SERIES_MAX_SKIP = 8192;
+const SERIES_PIXEL_ERROR_SCALE = 0.25;
+const ZERO_SERIES_PLAN: ReturnType<typeof buildSeriesPlan> = {
+  skip: 0,
+  degree: 0,
+  errorBound: 0,
+  radius: 0,
+  coeffRe: new Float64Array(1),
+  coeffIm: new Float64Array(1)
+};
 const DISTANCE_EXTRA_ITERATIONS = 1;
 const DISTANCE_COVERAGE_NONE_PX = 0.75;
 const DISTANCE_COVERAGE_STRENGTH = 0.5;
@@ -135,6 +145,7 @@ export function renderPerturbationTile(message: RenderTileMessage): TileDoneMess
   let rebaseLimitCount = 0;
   let blaSkipCount = 0;
   let blaStepCount = 0;
+  let seriesReplayPixels = 0;
   let unresolvedScreenXSum = 0;
   let unresolvedScreenYSum = 0;
   let seriesSkip = 0;
@@ -174,6 +185,7 @@ export function renderPerturbationTile(message: RenderTileMessage): TileDoneMess
       if (result.rebaseLimit) rebaseLimitCount += 1;
       blaSkipCount += result.blaSkipCount;
       blaStepCount += result.blaStepCount;
+      if (result.seriesReplayed) seriesReplayPixels += 1;
       if (result.glitch) glitchCount += 1;
       if (referenceIndex >= 0) usedReferenceIndices[referenceIndex] = 1;
       seriesSkip = Math.max(seriesSkip, skip);
@@ -248,6 +260,7 @@ export function renderPerturbationTile(message: RenderTileMessage): TileDoneMess
       blaStepCount,
       referenceCacheMissCount: 0,
       seriesSkip,
+      seriesReplayPixels,
       distanceEstimatedCount: boundaryStats.distanceEstimatedCount,
       paletteFilteredCount: boundaryStats.paletteFilteredCount,
       distanceColorizedCount: boundaryStats.distanceColorizedCount,
@@ -286,7 +299,7 @@ function renderPixelWithReferences(
     const context = contexts[index];
     const cRe = (screenX - context.screenX) * pixelSpan;
     const cIm = (screenY - context.screenY) * pixelSpan;
-    const series = seriesForContext(context, seriesDegree);
+    const series = seriesForContext(context, seriesDegree, pixelSpan);
     const result = perturb(
       cRe,
       cIm,
@@ -333,7 +346,8 @@ function createPixelResult(): PixelResult {
     rebaseCount: 0,
     rebaseLimit: false,
     blaSkipCount: 0,
-    blaStepCount: 0
+    blaStepCount: 0,
+    seriesReplayed: false
   };
 }
 
@@ -350,11 +364,20 @@ function copyPixelResult(source: PixelResult, target: PixelResult): void {
   target.rebaseLimit = source.rebaseLimit;
   target.blaSkipCount = source.blaSkipCount;
   target.blaStepCount = source.blaStepCount;
+  target.seriesReplayed = source.seriesReplayed;
 }
 
-function seriesForContext(context: ReferenceContext, seriesDegree: number): ReturnType<typeof buildSeriesPlan> {
+function seriesForContext(context: ReferenceContext, seriesDegree: number, pixelSpan: number): ReturnType<typeof buildSeriesPlan> {
   if (!context.series) {
-    context.series = buildSeriesPlan(context.orbitRe, context.orbitIm, seriesDegree, SERIES_MAX_SKIP, context.radius, context.probes);
+    context.series = buildSeriesPlan(
+      context.orbitRe,
+      context.orbitIm,
+      seriesDegree,
+      SERIES_MAX_SKIP,
+      context.radius,
+      pixelSpan,
+      context.probes
+    );
   }
   return context.series;
 }
@@ -369,7 +392,8 @@ function perturb(
   series: ReturnType<typeof buildSeriesPlan>,
   computeDistance: boolean,
   scratch: PeriodicScratch,
-  output: PixelResult
+  output: PixelResult,
+  allowSeriesReplay = true
 ): PixelResult {
   let dzRe = 0;
   let dzIm = 0;
@@ -383,6 +407,8 @@ function perturb(
   let rebaseLimit = false;
   let blaSkipCount = 0;
   let blaStepCount = 0;
+  const radiusRatio = series.radius > 0 ? Math.min(1, Math.hypot(cRe, cIm) / series.radius) : 0;
+  const parameterError = series.errorBound * radiusRatio ** (series.degree + 1);
 
   if (series.skip > 0) {
     if (computeDistance) {
@@ -404,51 +430,22 @@ function perturb(
   if (limit < 0 || refIndex > limit) {
     return failureResult(output, maxIter, mag2, true, Math.max(0, limit), rebaseCount, rebaseLimit, blaSkipCount, blaStepCount);
   }
-
-  // Once a pixel-sized parameter offset is representable in f64, continuing
-  // with the reconstructed parameter is mathematically identical and avoids
-  // the substantially more expensive perturbation recurrence. Deep views do
-  // not satisfy this numerical condition and retain the perturbation path.
   if (
-    parameterResolvesPixel(orbitRe[1] ?? 0, pixelSpan) &&
-    parameterResolvesPixel(orbitIm[1] ?? 0, pixelSpan)
+    allowSeriesReplay &&
+    series.skip > 0 &&
+    (!Number.isFinite(parameterError) || parameterError > Math.abs(pixelSpan) * SERIES_PIXEL_ERROR_SCALE)
   ) {
-    const directCRe = (orbitRe[1] ?? 0) + cRe;
-    const directCIm = (orbitIm[1] ?? 0) + cIm;
-    let zRe = orbitRe[refIndex] + dzRe;
-    let zIm = orbitIm[refIndex] + dzIm;
-    while (iter <= maxIter) {
-      if (!Number.isFinite(zRe) || !Number.isFinite(zIm)) {
-        return failureResult(output, maxIter, mag2, true, Math.min(iter, maxIter), rebaseCount, rebaseLimit, blaSkipCount, blaStepCount);
-      }
-      const zNorm = Math.max(Math.abs(zRe), Math.abs(zIm));
-      mag2 = zRe * zRe + zIm * zIm;
-      if (zNorm > 2) {
-        return successResult(
-          output,
-          iter,
-          mag2,
-          computeDistance
-            ? refinedDistanceEstimatePx(zRe, zIm, derivativeRe, derivativeIm, directCRe, directCIm, pixelSpan)
-            : -1,
-          false,
-          false,
-          rebaseCount,
-          rebaseLimit,
-          blaSkipCount,
-          blaStepCount
-        );
-      }
-      if (iter >= maxIter) return successResult(output, maxIter, mag2, -1, false, false, rebaseCount, rebaseLimit, blaSkipCount, blaStepCount);
-      const nextDerivativeRe = computeDistance ? 2 * (zRe * derivativeRe - zIm * derivativeIm) + pixelSpan : 0;
-      const nextDerivativeIm = computeDistance ? 2 * (zRe * derivativeIm + zIm * derivativeRe) : 0;
-      const nextRe = zRe * zRe - zIm * zIm + directCRe;
-      zIm = 2 * zRe * zIm + directCIm;
-      zRe = nextRe;
-      derivativeRe = nextDerivativeRe;
-      derivativeIm = nextDerivativeIm;
-      iter += 1;
-    }
+    return replayWithoutSeries(
+      cRe,
+      cIm,
+      pixelSpan,
+      orbitRe,
+      orbitIm,
+      maxIter,
+      computeDistance,
+      scratch,
+      output
+    );
   }
 
   while (iter <= maxIter && refIndex <= limit) {
@@ -462,8 +459,8 @@ function perturb(
       break;
     }
     const zNorm = Math.max(Math.abs(zRe), Math.abs(zIm));
-    mag2 = zRe * zRe + zIm * zIm;
     if (zNorm > 2) {
+      mag2 = zRe * zRe + zIm * zIm;
       return successResult(
         output,
         iter,
@@ -501,14 +498,6 @@ function perturb(
       stepRefRe = orbitRe[0] ?? 0;
       stepRefIm = orbitIm[0] ?? 0;
       rebaseCount += 1;
-    } else if (
-      !Number.isFinite(refRe) ||
-      !Number.isFinite(refIm) ||
-      !Number.isFinite(dzRe) ||
-      !Number.isFinite(dzIm)
-    ) {
-      glitch = true;
-      break;
     }
 
     const nextDerivativeRe = computeDistance ? 2 * (zRe * derivativeRe - zIm * derivativeIm) + pixelSpan : 0;
@@ -536,6 +525,34 @@ function perturb(
   return successResult(output, maxIter, mag2, -1, false, false, rebaseCount, rebaseLimit, blaSkipCount, blaStepCount);
 }
 
+function replayWithoutSeries(
+  cRe: number,
+  cIm: number,
+  pixelSpan: number,
+  orbitRe: Float64Array,
+  orbitIm: Float64Array,
+  maxIter: number,
+  computeDistance: boolean,
+  scratch: PeriodicScratch,
+  output: PixelResult
+): PixelResult {
+  const result = perturb(
+    cRe,
+    cIm,
+    pixelSpan,
+    orbitRe,
+    orbitIm,
+    maxIter,
+    ZERO_SERIES_PLAN,
+    computeDistance,
+    scratch,
+    output,
+    false
+  );
+  result.seriesReplayed = true;
+  return result;
+}
+
 function successResult(
   output: PixelResult,
   iter: number,
@@ -560,6 +577,7 @@ function successResult(
   output.rebaseLimit = rebaseLimit;
   output.blaSkipCount = blaSkipCount;
   output.blaStepCount = blaStepCount;
+  output.seriesReplayed = false;
   return output;
 }
 
@@ -586,6 +604,7 @@ function failureResult(
   output.rebaseLimit = rebaseLimit;
   output.blaSkipCount = blaSkipCount;
   output.blaStepCount = blaStepCount;
+  output.seriesReplayed = false;
   return output;
 }
 
@@ -736,15 +755,6 @@ function applyBandlimitedBoundaryShading(
   }
 
   return { distanceEstimatedCount, paletteFilteredCount, distanceColorizedCount, boundaryCoverageCount, maxPaletteFootprint };
-}
-
-function parameterResolvesPixel(value: number, pixelSpan: number): boolean {
-  const span = Math.abs(pixelSpan);
-  if (!Number.isFinite(value) || !Number.isFinite(span) || span === 0) return false;
-  const plus = value + span - value;
-  const minus = value - (value - span);
-  const error = Math.max(Math.abs(plus - span), Math.abs(minus - span));
-  return error <= span * 1e-6;
 }
 
 function estimateDistancesFromSmooth(

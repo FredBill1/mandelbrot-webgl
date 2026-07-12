@@ -87,6 +87,7 @@ export async function renderPerturbationTileWasm(message: RenderTileMessage): Pr
         boundaryCoverageCount: raw.stats.boundaryCoverageCount ?? 0,
         maxPaletteFootprint: raw.stats.maxPaletteFootprint ?? 0,
         referenceCacheMissCount: 0,
+        seriesReplayPixels: raw.stats.seriesReplayPixels ?? 0,
         exactFallbackPixels: raw.stats.exactFallbackPixels ?? raw.width * raw.height
       }
     };
@@ -146,6 +147,7 @@ export async function renderPerturbationTileWasm(message: RenderTileMessage): Pr
       boundaryCoverageCount: raw.stats.boundaryCoverageCount ?? 0,
       maxPaletteFootprint: raw.stats.maxPaletteFootprint ?? 0,
       referenceCacheMissCount: (raw.stats.referenceCacheMissCount ?? 0) + cacheMisses,
+      seriesReplayPixels: raw.stats.seriesReplayPixels ?? 0,
       exactFallbackPixels: raw.stats.exactFallbackPixels ?? 0
     }
   };
