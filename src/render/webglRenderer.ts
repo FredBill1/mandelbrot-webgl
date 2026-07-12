@@ -160,9 +160,7 @@ export class WebglTileRenderer {
     });
   }
 
-  pruneRetainedWhenActiveCoverage(minActiveTiles: number): void {
-    const active = this.tiles().filter((tile) => tile.revision === this.activeRevision).length;
-    if (active < minActiveTiles) return;
+  discardRetained(): void {
     for (const id of this.cache.keys()) {
       const tile = this.cache.get(id);
       if (tile && tile.revision < this.activeRevision) this.cache.delete(id);

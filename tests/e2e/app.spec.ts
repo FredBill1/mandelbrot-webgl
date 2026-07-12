@@ -59,6 +59,8 @@ const PALETTE_FOOTPRINT_REGRESSION_URL =
   "/?re=-6.66946223594351220414061702075025073882181567152192831986002310059523004175864072078497634e-1&im=-4.73676488536724904191861481769138940645914771730222045140362508393748458135121359473063677e-1&scale=7.74784629252607411431486981341523433374510907407907698525079151524254606022906253914814138e1";
 const TILE_EDGE_STRIPE_REGRESSION_URL =
   "/?re=-7.47058923830677172637465716958601050178238459796401120563138311051740403989739537513387692e-1&im=-9.02333390881196912445043591041816477037301725271975723099794599405573445075541691219218423e-2&scale=5.95653801318458424494811292043527003967000942264323805684287564004180700059580065965587753e6";
+const RETAINED_ZOOM_REGRESSION_URL =
+  "/?re=3.655073371765788852940260600948035967717538518864657891169046360358083748319044546850415587451296599501781717446246424045550101697395757929738867149146694906951587112e-1&im=5.92476366173214971781468865486627113155901675162131546210951676040509852198816827792342255876351114214355530399965315622626124804616767906310619742850551578473321577e-1&scale=9.001713130052164959645281712618962642478317587779029549748404978588248904553262998280261787393564400658816650653428951595626051579660571849070736507817648557393264193e101";
 const REPORTED_INTERIOR_PERFORMANCE_VIEWS = [
   "/?re=-1.1257397657301325439972230515997209520613044826021924611013993759582727462837647199843872e0&im=-2.63359294664505520032151212049212698578945273361152731968738849510276867533004652329837119e-1&scale=2.83557495047450223543249716015972746789962659367598078011974223737616687921440259198156578e3",
   "/?re=-1.12600997907991589078966883643508860863586283945543450132120638790851859625175396984211583e0&im=-2.63568831182114856578871320311966693404083840260713337021920764797237400042112179495938257e-1&scale=1.55619652783714923159368677783330267864989296425986665680680538989238710992832234279105968e3",
@@ -362,6 +364,29 @@ test("keeps rendered deep tiles responsive during pan and zoom", async ({ page }
   await page.mouse.wheel(0, -600);
   await expect.poll(() => hasRetainedFrameAfter(page, zoomStart), { timeout: 500 }).toBe(true);
   await expect(page.locator("#readStatus")).not.toHaveText(/reference zoom/i);
+});
+
+test("keeps retained zoom tiles visible until the replacement frame is complete", async ({ page }) => {
+  test.setTimeout(90_000);
+  await page.setViewportSize({ width: 1912, height: 948 });
+  await page.goto(RETAINED_ZOOM_REGRESSION_URL);
+  await waitForNonBlankCanvas(page, 75_000);
+  await installRetainedZoomProbe(page);
+
+  await page.mouse.move(956, 474);
+  await page.mouse.wheel(0, -120);
+  await expect.poll(async () => (await readRetainedZoomProbe(page)).thresholdObserved, {
+    timeout: 10_000,
+    intervals: [5, 10, 25]
+  }).toBe(true);
+  await page.screenshot({ path: "test-results/retained-zoom-transition.png", fullPage: false });
+
+  await expect(page.locator("#readStatus")).toHaveText("stable", { timeout: 30_000 });
+  const tileCounts = await readTileCounts(page);
+  expect(tileCounts.completed).toBe(tileCounts.total);
+  const probe = await readRetainedZoomProbe(page);
+  expect(probe.finished).toBe(true);
+  expect(probe.maxClearEdgeTiles).toBe(0);
 });
 
 test("defers render work while pan and wheel zoom inputs are still changing", async ({ page }) => {
@@ -812,6 +837,109 @@ interface InteractionWorkerProbe {
   referenceRequests: number;
   renderMessages: Array<{ revision: number; mode: string; at: number }>;
   tileResults: Array<{ revision: number; seriesReplayPixels: number }>;
+}
+
+interface RetainedZoomProbe {
+  thresholdObserved: boolean;
+  finished: boolean;
+  maxClearEdgeTiles: number;
+  completedAtThreshold: number;
+  totalAtThreshold: number;
+}
+
+async function installRetainedZoomProbe(page: import("@playwright/test").Page): Promise<void> {
+  await page.evaluate(() => {
+    const canvas = document.querySelector<HTMLCanvasElement>("#fractal");
+    const status = document.querySelector<HTMLElement>("#readStatus");
+    const tiles = document.querySelector<HTMLElement>("#readTiles");
+    const gl = canvas?.getContext("webgl2", { alpha: false, antialias: false, preserveDrawingBuffer: true });
+    if (!canvas || !status || !tiles || !gl) throw new Error("Missing retained zoom probe target");
+
+    const probe: RetainedZoomProbe = {
+      thresholdObserved: false,
+      finished: false,
+      maxClearEdgeTiles: 0,
+      completedAtThreshold: 0,
+      totalAtThreshold: 0
+    };
+    (globalThis as unknown as { __retainedZoomProbe?: RetainedZoomProbe }).__retainedZoomProbe = probe;
+    const tileSize = 128;
+    let started = false;
+
+    const isClearPixel = (x: number, y: number): boolean => {
+      const pixel = new Uint8Array(4);
+      gl.readPixels(x, canvas.height - y - 1, 1, 1, gl.RGBA, gl.UNSIGNED_BYTE, pixel);
+      return Math.abs(pixel[0] - 2) <= 1 && Math.abs(pixel[1] - 2) <= 1 && Math.abs(pixel[2] - 4) <= 1 && pixel[3] === 255;
+    };
+
+    const countClearEdgeTiles = (): number => {
+      const rects = new Map<string, { x: number; y: number; width: number; height: number }>();
+      const addRect = (x: number, y: number) => {
+        rects.set(`${x}:${y}`, {
+          x,
+          y,
+          width: Math.min(tileSize, canvas.width - x),
+          height: Math.min(tileSize, canvas.height - y)
+        });
+      };
+      const bottom = Math.floor((canvas.height - 1) / tileSize) * tileSize;
+      const right = Math.floor((canvas.width - 1) / tileSize) * tileSize;
+      for (let x = 0; x < canvas.width; x += tileSize) {
+        addRect(x, 0);
+        addRect(x, bottom);
+      }
+      for (let y = tileSize; y < bottom; y += tileSize) {
+        addRect(0, y);
+        addRect(right, y);
+      }
+
+      let clearTiles = 0;
+      for (const rect of rects.values()) {
+        const samples = [
+          [0.25, 0.25],
+          [0.75, 0.25],
+          [0.5, 0.5],
+          [0.25, 0.75],
+          [0.75, 0.75]
+        ];
+        if (samples.every(([u, v]) => isClearPixel(
+          Math.min(canvas.width - 1, Math.floor(rect.x + rect.width * u)),
+          Math.min(canvas.height - 1, Math.floor(rect.y + rect.height * v))
+        ))) clearTiles += 1;
+      }
+      return clearTiles;
+    };
+
+    const observe = () => {
+      const match = /^(\d+)\/(\d+)$/.exec(tiles.textContent ?? "");
+      const completed = Number(match?.[1] ?? 0);
+      const total = Number(match?.[2] ?? 0);
+      if (!started && status.textContent !== "stable") started = true;
+      if (started && total > 0) {
+        const oldPruneThreshold = Math.max(1, Math.floor(canvas.width * canvas.height / (tileSize * tileSize) * 0.7));
+        if (completed >= oldPruneThreshold && completed < total) {
+          probe.thresholdObserved = true;
+          probe.completedAtThreshold = completed;
+          probe.totalAtThreshold = total;
+          probe.maxClearEdgeTiles = Math.max(probe.maxClearEdgeTiles, countClearEdgeTiles());
+        }
+      }
+      if (started && status.textContent === "stable") {
+        probe.finished = true;
+        return;
+      }
+      window.requestAnimationFrame(observe);
+    };
+    window.requestAnimationFrame(observe);
+  });
+}
+
+async function readRetainedZoomProbe(page: import("@playwright/test").Page): Promise<RetainedZoomProbe> {
+  return page.evaluate(() => {
+    const probe = (globalThis as unknown as { __retainedZoomProbe?: RetainedZoomProbe }).__retainedZoomProbe;
+    if (!probe) throw new Error("Missing retained zoom probe");
+    return { ...probe };
+  });
 }
 
 async function installInteractionWorkerProbe(page: import("@playwright/test").Page): Promise<void> {

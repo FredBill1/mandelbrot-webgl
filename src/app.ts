@@ -326,7 +326,7 @@ export async function startApp(root: HTMLElement): Promise<void> {
     resetRenderWorkState();
     renderer.setActiveRevision(revision);
     if (options.resetRetained ?? true) {
-      renderer.pruneRetainedWhenActiveCoverage(0);
+      renderer.discardRetained();
     } else {
       if (options.retainedTransform) renderer.applyRetainedTransform(options.retainedTransform);
     }
@@ -537,7 +537,6 @@ export async function startApp(root: HTMLElement): Promise<void> {
       stats.completedTiles += 1;
       pendingTileIds.delete(state.tile.id);
       stats.pending = pendingWorkCount();
-      renderer.pruneRetainedWhenActiveCoverage(Math.max(1, Math.floor((localRuntime.width * localRuntime.height) / (TILE_SIZE * TILE_SIZE) * 0.7)));
       updateWorkStatus("rendering");
     } catch (error) {
       state.inFlight = false;
@@ -741,7 +740,12 @@ export async function startApp(root: HTMLElement): Promise<void> {
     stats.pending = pendingWorkCount();
     stats.activeWorkers = pool.active;
     stats.references = references.size;
-    stats.status = hasOutstandingWork() ? activeStatus : "stable";
+    if (hasOutstandingWork()) {
+      stats.status = activeStatus;
+      return;
+    }
+    renderer.discardRetained();
+    stats.status = "stable";
   }
 
   function pendingWorkCount(): number {
