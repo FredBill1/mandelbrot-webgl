@@ -1,4 +1,4 @@
-import init, { compute_reference, estimate_precision_bits, estimate_reference_interior_radius, put_render_reference, render_tile_cached, render_tile_exact, reset_render_cache } from "../wasm/pkg/mandelbrot_wasm";
+import init, { compute_reference, estimate_max_iter_bounded_radius, estimate_precision_bits, put_render_reference, render_tile_cached, render_tile_exact, reset_render_cache } from "../wasm/pkg/mandelbrot_wasm";
 import type { ReferenceSnapshot, RenderTileMessage, TileDoneMessage } from "../types";
 import type { RawReferenceResult } from "../reference/referenceClient";
 
@@ -40,7 +40,7 @@ export async function computeReferenceWasm(input: {
     centerIm: raw.center_im,
     precisionBits: raw.precision_bits,
     escapedAt: raw.escaped_at,
-    interiorRadius: estimate_reference_interior_radius(raw.escaped_at, input.maxIter, orbitRe, orbitIm),
+    maxIterBoundedRadius: estimate_max_iter_bounded_radius(raw.escaped_at, input.maxIter, orbitRe, orbitIm),
     orbitRe,
     orbitIm
   };
@@ -92,22 +92,21 @@ export async function renderPerturbationTileWasm(message: RenderTileMessage): Pr
     };
   }
 
-  const refIds = new Int32Array(message.references.length);
+  const reference = message.reference;
+  if (!reference) throw new Error("Perturbation render requires a view reference");
+  const refIds = new Int32Array(1);
   let cacheMisses = 0;
 
-  for (let index = 0; index < message.references.length; index += 1) {
-    const reference = message.references[index];
-    const key = referenceCacheKey(reference);
-    let numericId = cacheState.ids.get(key);
-    if (numericId === undefined) {
-      numericId = cacheState.nextId;
-      cacheState.nextId += 1;
-      cacheState.ids.set(key, numericId);
-      cacheMisses += 1;
-      putReference(numericId, reference);
-    }
-    refIds[index] = numericId;
+  const key = referenceCacheKey(reference);
+  let numericId = cacheState.ids.get(key);
+  if (numericId === undefined) {
+    numericId = cacheState.nextId;
+    cacheState.nextId += 1;
+    cacheState.ids.set(key, numericId);
+    cacheMisses += 1;
+    putReference(numericId, reference);
   }
+  refIds[0] = numericId;
 
   const raw = render_tile_cached(
     message.tile.id,
@@ -122,11 +121,11 @@ export async function renderPerturbationTileWasm(message: RenderTileMessage): Pr
     message.seriesDegree,
     message.renderMode,
     message.sampleStep,
-    message.refinementBaseRgba ? new Uint8Array(message.refinementBaseRgba) : new Uint8Array(),
-    message.refinementUnresolvedMask ? new Uint8Array(message.refinementUnresolvedMask) : new Uint8Array(),
-    message.refinementSmoothValues ? new Float32Array(message.refinementSmoothValues) : new Float32Array(),
-    message.refinementDistanceValues ? new Float32Array(message.refinementDistanceValues) : new Float32Array(),
-    message.refinementEscapedMask ? new Uint8Array(message.refinementEscapedMask) : new Uint8Array()
+    new Uint8Array(),
+    new Uint8Array(),
+    new Float32Array(),
+    new Float32Array(),
+    new Uint8Array()
   ) as TileDoneMessage;
 
   const rgba = normalizeRgbaBuffer(raw.rgba);
@@ -134,9 +133,6 @@ export async function renderPerturbationTileWasm(message: RenderTileMessage): Pr
     ...raw,
     rgba,
     unresolvedMask: normalizeOptionalBuffer(raw.unresolvedMask),
-    refinementSmoothValues: normalizeOptionalBuffer(raw.refinementSmoothValues),
-    refinementDistanceValues: normalizeOptionalBuffer(raw.refinementDistanceValues),
-    refinementEscapedMask: normalizeOptionalBuffer(raw.refinementEscapedMask),
     stats: {
       ...raw.stats,
       maxEscapedIter: raw.stats.maxEscapedIter ?? 0,
@@ -186,14 +182,14 @@ function putReference(numericId: number, reference: ReferenceSnapshot): void {
     reference.screenY,
     reference.escapedAt,
     reference.maxIter,
-    reference.interiorRadius,
+    reference.maxIterBoundedRadius,
     asFloat64(reference.orbitRe),
     asFloat64(reference.orbitIm)
   );
 }
 
 function referenceCacheKey(reference: ReferenceSnapshot): string {
-  return `${reference.revision}|${reference.id}|${reference.screenX}|${reference.screenY}|${reference.escapedAt}|${reference.maxIter}|${reference.interiorRadius}`;
+  return `${reference.revision}|${reference.id}|${reference.screenX}|${reference.screenY}|${reference.escapedAt}|${reference.maxIter}|${reference.maxIterBoundedRadius}`;
 }
 
 function normalizeRgbaBuffer(value: unknown): ArrayBuffer {

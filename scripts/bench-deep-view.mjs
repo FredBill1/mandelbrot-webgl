@@ -34,8 +34,10 @@ try {
   let hud = await readHud(page);
   let maxHudTotalTiles = 0;
   let maxHudCompletedTiles = 0;
+  let peakHudReferences = 0;
   while (Date.now() - started < options.timeoutMs) {
     hud = await readHud(page);
+    peakHudReferences = Math.max(peakHudReferences, Number(hud.refs) || 0);
     const hudTiles = parseTileProgress(hud.tiles);
     maxHudCompletedTiles = Math.max(maxHudCompletedTiles, hudTiles.completed);
     maxHudTotalTiles = Math.max(maxHudTotalTiles, hudTiles.total);
@@ -98,6 +100,9 @@ try {
       exactCount: bench.counts.exact,
       previewCount: bench.counts.preview,
       referenceDone: bench.counts.referenceDone,
+      referenceRequests: bench.counts.referenceDone + bench.counts.referenceError,
+      peakHudReferences,
+      finalPasses: bench.counts.final,
       totalTiles: hudTiles.total || maxHudTotalTiles,
       maxActiveTiles: maxHudTotalTiles,
       refs,
@@ -355,8 +360,6 @@ function installWorkerProbe() {
       previewQueueMs: []
     },
     waves: {
-      finalByRefinement: {},
-      previewByRefinement: {},
       unresolvedFinals: 0,
       completedFinals: 0,
       maxRefsUsed: 0,
@@ -445,8 +448,7 @@ function installWorkerProbe() {
           renderMode: message.renderMode,
           tileId: message.tile.id,
           rect: { ...message.tile.rect },
-          refs: message.references.length,
-          refinementLevel: message.refinementLevel,
+          refs: message.reference ? 1 : 0,
           sampleStep: message.sampleStep
         };
       } else if (message?.type === "computeReference") {
@@ -476,8 +478,6 @@ function installWorkerProbe() {
           bench.sums.finalWallMs += wallMs;
           bench.samples.finalWorkerMs.push(data.stats.elapsedMs);
           bench.samples.finalWallMs.push(wallMs);
-          bench.waves.finalByRefinement[data.stats.renderMode + ":" + (current?.refinementLevel ?? "unknown")] =
-            (bench.waves.finalByRefinement[data.stats.renderMode + ":" + (current?.refinementLevel ?? "unknown")] ?? 0) + 1;
           if (data.stats.unresolvedCount > 0) bench.waves.unresolvedFinals += 1;
           else bench.waves.completedFinals += 1;
           bench.waves.maxRefsUsed = Math.max(bench.waves.maxRefsUsed, data.stats.referenceIdsUsed.length);
@@ -499,7 +499,6 @@ function installWorkerProbe() {
             wallMs: Math.round(wallMs),
             rect: data.rect,
             refs: current?.refs,
-            refinementLevel: current?.refinementLevel,
             unresolved: data.stats.unresolvedCount,
             escaped: data.stats.escapedPixels,
             seriesSkip: data.stats.seriesSkip,
@@ -521,8 +520,6 @@ function installWorkerProbe() {
           bench.sums.previewWorkerMs += data.stats.elapsedMs;
           bench.sums.previewWallMs += wallMs;
           bench.samples.previewWorkerMs.push(data.stats.elapsedMs);
-          bench.waves.previewByRefinement[String(current?.refinementLevel ?? "unknown")] =
-            (bench.waves.previewByRefinement[String(current?.refinementLevel ?? "unknown")] ?? 0) + 1;
         }
         if (current?.tileId) {
           const tile = tileProfile(current.tileId);
@@ -534,7 +531,6 @@ function installWorkerProbe() {
             workerMs: data.stats.elapsedMs,
             rect: data.rect,
             refs: current.refs,
-            refinementLevel: current.refinementLevel,
             sampleStep: current.sampleStep,
             stats: {
               unresolved: data.stats.unresolvedCount,
@@ -557,7 +553,6 @@ function installWorkerProbe() {
           tile.workerMs = data.stats.elapsedMs;
           tile.rect = data.rect;
           tile.refs = current.refs;
-          tile.refinementLevel = current.refinementLevel;
           tile.sampleStep = current.sampleStep;
           tile.stats = {
             unresolved: data.stats.unresolvedCount,

@@ -624,13 +624,11 @@ struct PixelResult64 {
     bla_step_count: u32,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum FailureKind64 {
     None,
     EarlyReferenceEscape,
-    CancellationGlitch,
-    DeltaOverflow,
-    RebaseLimit,
+    NonFiniteArithmetic,
     SeriesUnsafe,
 }
 
@@ -642,15 +640,6 @@ struct PixelSelection64 {
 }
 
 struct PeriodicScratch64;
-
-#[derive(Clone, Copy)]
-struct PeriodDerivatives64 {
-    z: Complex64,
-    dz_dz: Complex64,
-    dz_dc: Complex64,
-    d_dz_dz: Complex64,
-    d_dc_dz: Complex64,
-}
 
 #[derive(Clone)]
 struct ClusterAccumulator64 {
@@ -668,7 +657,7 @@ struct ClusterAccumulator64 {
     best_y: f64,
     best_survived_iter: i32,
     best_source_reference_id: Option<String>,
-    failure_kind_counts: [u32; 5],
+    failure_kind_counts: [u32; 3],
 }
 
 #[derive(Clone)]
@@ -682,8 +671,7 @@ struct UnresolvedCluster64 {
     bin_y: u32,
     bounds: Rect64,
     source_reference_id: String,
-    failure_kind_counts: [u32; 5],
-    suggested_precision_bits: u32,
+    failure_kind_counts: [u32; 3],
 }
 
 #[derive(Clone, Copy)]
@@ -738,8 +726,6 @@ thread_local! {
     };
 }
 
-const RENDER_MIN_PIXEL_SPAN_FOR_PERIODIC_INTERIOR: f64 = 1e-18;
-const RENDER_MAX_REBASES_PER_PIXEL: u32 = 64;
 const RENDER_SERIES_MAX_SKIP: usize = 8192;
 const RENDER_MAX_SERIES_TILE_RADIUS: f64 = 1e-3;
 const RENDER_SERIES_ERROR_SCALE: f64 = 2.9e-2;
@@ -761,11 +747,6 @@ const RENDER_DISTANCE_COLOR_NONE_PX: f64 = 2.0;
 const RENDER_DISTANCE_COLOR_PALETTE_PHASE: f64 = 0.64;
 const RENDER_INV_LN2: f64 = std::f64::consts::LOG2_E;
 const RENDER_SMOOTH_LOG_SCALE: f64 = 0.5 * std::f64::consts::LOG2_E;
-const RENDER_REFERENCE_INTERIOR_MAX_PERIOD: usize = 256;
-const RENDER_REFERENCE_INTERIOR_MAX_CANDIDATES: usize = 3;
-const RENDER_REFERENCE_INTERIOR_MAX_PERIOD_SCORE: f64 = 3e-6;
-const RENDER_REFERENCE_INTERIOR_MAX_C_VARIANCE: f64 = 1e-8;
-const RENDER_REFERENCE_INTERIOR_DISTANCE_SCALE: f64 = 0.25;
 const RENDER_REFERENCE_INTERIOR_RADIUS_SAFETY: f64 = 0.90;
 const RENDER_REFERENCE_INTERIOR_MIN_BLOCK_SIZE: usize = 16;
 
@@ -782,18 +763,18 @@ pub fn put_render_reference(
     screen_y: f64,
     escaped_at: u32,
     max_iter: u32,
-    interior_radius: f64,
+    max_iter_bounded_radius: f64,
     orbit_re: Float64Array,
     orbit_im: Float64Array,
 ) {
     let orbit_re = orbit_re.to_vec();
     let orbit_im = orbit_im.to_vec();
     let interior_certificate = if escaped_at >= max_iter
-        && interior_radius.is_finite()
-        && interior_radius > 0.0
+        && max_iter_bounded_radius.is_finite()
+        && max_iter_bounded_radius > 0.0
     {
         Some(ReferenceInteriorCertificate64 {
-            radius: interior_radius,
+            radius: max_iter_bounded_radius,
         })
     } else {
         None
@@ -1669,323 +1650,71 @@ fn fill_certified_reference_block64(
     }
 }
 
-fn reference_interior_certificate64(
-    orbit_re: &[f64],
-    orbit_im: &[f64],
-    max_iter: u32,
-) -> Option<ReferenceInteriorCertificate64> {
-    let len = orbit_re.len().min(orbit_im.len());
-    if len < 16 {
-        return None;
-    }
-    let last_index = (max_iter as usize).min(len - 1);
-    if last_index < 16 {
-        return None;
-    }
-
-    let mut best_radius = 0.0;
-    for period in candidate_reference_periods64(orbit_re, orbit_im, last_index) {
-        if let Some(radius) = reference_interior_radius_for_period64(
-            orbit_re,
-            orbit_im,
-            last_index,
-            period,
-        ) {
-            if radius > best_radius {
-                best_radius = radius;
-            }
-        }
-    }
-    if best_radius.is_finite() && best_radius > 0.0 {
-        Some(ReferenceInteriorCertificate64 {
-            radius: best_radius,
-        })
-    } else {
-        None
-    }
-}
-
 #[wasm_bindgen]
-pub fn estimate_reference_interior_radius(
+pub fn estimate_max_iter_bounded_radius(
     escaped_at: u32,
     max_iter: u32,
     orbit_re: Float64Array,
     orbit_im: Float64Array,
 ) -> f64 {
-    if escaped_at < max_iter {
+    let orbit_re = orbit_re.to_vec();
+    let orbit_im = orbit_im.to_vec();
+    estimate_max_iter_bounded_radius64(escaped_at, max_iter, &orbit_re, &orbit_im)
+}
+
+fn estimate_max_iter_bounded_radius64(
+    escaped_at: u32,
+    max_iter: u32,
+    orbit_re: &[f64],
+    orbit_im: &[f64],
+) -> f64 {
+    if escaped_at < max_iter || max_iter < 2 {
         return 0.0;
     }
-    reference_interior_certificate64(&orbit_re.to_vec(), &orbit_im.to_vec(), max_iter)
-        .map(|certificate| certificate.radius)
-        .filter(|radius| radius.is_finite() && *radius > 0.0)
-        .unwrap_or(0.0)
-}
+    let limit = (max_iter as usize).min(orbit_re.len()).min(orbit_im.len());
+    if limit < max_iter as usize {
+        return 0.0;
+    }
 
-fn candidate_reference_periods64(
-    orbit_re: &[f64],
-    orbit_im: &[f64],
-    last_index: usize,
-) -> Vec<usize> {
-    let max_period = RENDER_REFERENCE_INTERIOR_MAX_PERIOD
-        .min(last_index / 2)
-        .max(1);
-    let mut candidates: Vec<(usize, f64)> = Vec::with_capacity(max_period);
-    for period in 1..=max_period {
-        let d1 = complex_distance2_from_orbit64(orbit_re, orbit_im, last_index, last_index - period);
-        let d2 = if last_index >= period * 2 {
-            complex_distance2_from_orbit64(
-                orbit_re,
-                orbit_im,
-                last_index - period,
-                last_index - period * 2,
-            )
-        } else {
-            d1
-        };
-        let score = d1.max(d2);
-        if score.is_finite() && score <= RENDER_REFERENCE_INTERIOR_MAX_PERIOD_SCORE {
-            candidates.push((period, score));
+    let survives = |radius: f64| -> bool {
+        let mut error = 0.0f64;
+        for index in 0..limit.saturating_sub(1) {
+            let re = next_up_nonnegative(orbit_re[index].abs());
+            let im = next_up_nonnegative(orbit_im[index].abs());
+            let orbit_norm = next_up_nonnegative(re.hypot(im));
+            if !orbit_norm.is_finite() || orbit_norm + error > 2.0 {
+                return false;
+            }
+            let linear = next_up_nonnegative(2.0 * orbit_norm + error);
+            error = next_up_nonnegative(next_up_nonnegative(linear * error) + radius);
+            if !error.is_finite() {
+                return false;
+            }
         }
-    }
-    candidates.sort_by(|a, b| a.1.total_cmp(&b.1).then_with(|| a.0.cmp(&b.0)));
-    candidates.truncate(RENDER_REFERENCE_INTERIOR_MAX_CANDIDATES);
-    candidates.into_iter().map(|(period, _)| period).collect()
-}
-
-fn reference_interior_radius_for_period64(
-    orbit_re: &[f64],
-    orbit_im: &[f64],
-    last_index: usize,
-    period: usize,
-) -> Option<f64> {
-    if period == 0 || last_index < period {
-        return None;
-    }
-    let start = last_index - period;
-    let (c, c_variance) = estimate_reference_parameter64(orbit_re, orbit_im, start, period)?;
-    if !complex_is_finite(c)
-        || !c_variance.is_finite()
-        || c_variance > RENDER_REFERENCE_INTERIOR_MAX_C_VARIANCE
-    {
-        return None;
-    }
-
-    let mut z = orbit_point64(orbit_re, orbit_im, start)?;
-    for _ in 0..16 {
-        let derivatives = iterate_period_derivatives64(z, c, period)?;
-        let residual = complex_sub(derivatives.z, z);
-        let jacobian = complex_sub(derivatives.dz_dz, Complex64 { re: 1.0, im: 0.0 });
-        if complex_abs(jacobian) <= 1e-14 {
-            return None;
-        }
-        let delta = complex_div(residual, jacobian)?;
-        if !complex_is_finite(delta) {
-            return None;
-        }
-        z = complex_sub(z, delta);
-        if complex_abs(delta) <= 1e-14 {
-            break;
-        }
-    }
-
-    let period = reduce_reference_period64(z, c, period);
-    let derivatives = iterate_period_derivatives64(z, c, period)?;
-    let residual = complex_abs(complex_sub(derivatives.z, z));
-    let multiplier = complex_abs(derivatives.dz_dz);
-    if residual > 1e-10 || !multiplier.is_finite() || multiplier >= 0.995 {
-        return None;
-    }
-
-    let one_minus_multiplier = complex_sub(Complex64 { re: 1.0, im: 0.0 }, derivatives.dz_dz);
-    let correction = complex_div(derivatives.dz_dc, one_minus_multiplier)?;
-    let denominator = complex_add(
-        derivatives.d_dc_dz,
-        complex_mul(derivatives.d_dz_dz, correction),
-    );
-    let denominator_abs = complex_abs(denominator);
-    if !denominator_abs.is_finite() || denominator_abs <= 1e-30 {
-        return None;
-    }
-
-    let distance_estimate = (1.0 - multiplier * multiplier) / denominator_abs;
-    let radius = distance_estimate * RENDER_REFERENCE_INTERIOR_DISTANCE_SCALE
-        - residual * 32.0
-        - c_variance * 8.0;
-    if radius.is_finite() && radius > 0.0 {
-        Some(radius)
-    } else {
-        None
-    }
-}
-
-fn estimate_reference_parameter64(
-    orbit_re: &[f64],
-    orbit_im: &[f64],
-    start: usize,
-    period: usize,
-) -> Option<(Complex64, f64)> {
-    let mut values = Vec::with_capacity(period);
-    let mut sum = Complex64 { re: 0.0, im: 0.0 };
-    for offset in 0..period {
-        let z = orbit_point64(orbit_re, orbit_im, start + offset)?;
-        let next = orbit_point64(orbit_re, orbit_im, start + offset + 1)?;
-        let c = complex_sub(next, complex_mul(z, z));
-        if !complex_is_finite(c) {
-            return None;
-        }
-        sum = complex_add(sum, c);
-        values.push(c);
-    }
-    let c = complex_scale(sum, 1.0 / period as f64);
-    let mut max_variance: f64 = 0.0;
-    for value in values {
-        max_variance = max_variance.max(complex_abs(complex_sub(value, c)));
-    }
-    Some((c, max_variance))
-}
-
-fn reduce_reference_period64(z: Complex64, c: Complex64, period: usize) -> usize {
-    for candidate in 1..period {
-        if period % candidate != 0 {
-            continue;
-        }
-        let Some(derivatives) = iterate_period_derivatives64(z, c, candidate) else {
-            continue;
-        };
-        if complex_abs(complex_sub(derivatives.z, z)) <= 1e-9 {
-            return candidate;
-        }
-    }
-    period
-}
-
-fn iterate_period_derivatives64(
-    mut z: Complex64,
-    c: Complex64,
-    period: usize,
-) -> Option<PeriodDerivatives64> {
-    let mut dz_dz = Complex64 { re: 1.0, im: 0.0 };
-    let mut dz_dc = Complex64 { re: 0.0, im: 0.0 };
-    let mut d_dz_dz = Complex64 { re: 0.0, im: 0.0 };
-    let mut d_dc_dz = Complex64 { re: 0.0, im: 0.0 };
-
-    for _ in 0..period {
-        if !complex_is_finite(z)
-            || !complex_is_finite(dz_dz)
-            || !complex_is_finite(dz_dc)
-            || !complex_is_finite(d_dz_dz)
-            || !complex_is_finite(d_dc_dz)
-        {
-            return None;
-        }
-        let two_z = complex_scale(z, 2.0);
-        let next_d_dc_dz = complex_add(
-            complex_scale(complex_mul(dz_dc, dz_dz), 2.0),
-            complex_mul(two_z, d_dc_dz),
-        );
-        let next_d_dz_dz = complex_add(
-            complex_scale(complex_mul(dz_dz, dz_dz), 2.0),
-            complex_mul(two_z, d_dz_dz),
-        );
-        let next_dz_dc = complex_add(complex_mul(two_z, dz_dc), Complex64 { re: 1.0, im: 0.0 });
-        let next_dz_dz = complex_mul(two_z, dz_dz);
-        z = complex_add(complex_mul(z, z), c);
-        dz_dz = next_dz_dz;
-        dz_dc = next_dz_dc;
-        d_dz_dz = next_d_dz_dz;
-        d_dc_dz = next_d_dc_dz;
-    }
-
-    if !complex_is_finite(z)
-        || !complex_is_finite(dz_dz)
-        || !complex_is_finite(dz_dc)
-        || !complex_is_finite(d_dz_dz)
-        || !complex_is_finite(d_dc_dz)
-    {
-        return None;
-    }
-
-    Some(PeriodDerivatives64 {
-        z,
-        dz_dz,
-        dz_dc,
-        d_dz_dz,
-        d_dc_dz,
-    })
-}
-
-fn orbit_point64(orbit_re: &[f64], orbit_im: &[f64], index: usize) -> Option<Complex64> {
-    let point = Complex64 {
-        re: *orbit_re.get(index)?,
-        im: *orbit_im.get(index)?,
+        true
     };
-    if complex_is_finite(point) {
-        Some(point)
-    } else {
-        None
+
+    let mut low = 0.0f64;
+    let mut high = 4.0f64;
+    for _ in 0..64 {
+        let middle = low + (high - low) * 0.5;
+        if survives(middle) {
+            low = middle;
+        } else {
+            high = middle;
+        }
     }
+    if low.is_finite() && low > 0.0 { low * 0.9 } else { 0.0 }
 }
 
-fn complex_distance2_from_orbit64(
-    orbit_re: &[f64],
-    orbit_im: &[f64],
-    a: usize,
-    b: usize,
-) -> f64 {
-    let re = orbit_re[a] - orbit_re[b];
-    let im = orbit_im[a] - orbit_im[b];
-    re * re + im * im
-}
-
-fn complex_add(a: Complex64, b: Complex64) -> Complex64 {
-    Complex64 {
-        re: a.re + b.re,
-        im: a.im + b.im,
+fn next_up_nonnegative(value: f64) -> f64 {
+    if value.is_nan() || value == f64::INFINITY {
+        return value;
     }
-}
-
-fn complex_sub(a: Complex64, b: Complex64) -> Complex64 {
-    Complex64 {
-        re: a.re - b.re,
-        im: a.im - b.im,
+    if value == 0.0 {
+        return f64::from_bits(1);
     }
-}
-
-fn complex_mul(a: Complex64, b: Complex64) -> Complex64 {
-    Complex64 {
-        re: a.re * b.re - a.im * b.im,
-        im: a.re * b.im + a.im * b.re,
-    }
-}
-
-fn complex_div(a: Complex64, b: Complex64) -> Option<Complex64> {
-    let denom = b.re * b.re + b.im * b.im;
-    if !denom.is_finite() || denom <= 0.0 {
-        return None;
-    }
-    Some(Complex64 {
-        re: (a.re * b.re + a.im * b.im) / denom,
-        im: (a.im * b.re - a.re * b.im) / denom,
-    })
-}
-
-fn complex_scale(a: Complex64, scale: f64) -> Complex64 {
-    Complex64 {
-        re: a.re * scale,
-        im: a.im * scale,
-    }
-}
-
-fn complex_abs2(a: Complex64) -> f64 {
-    a.re * a.re + a.im * a.im
-}
-
-fn complex_abs(a: Complex64) -> f64 {
-    complex_abs2(a).sqrt()
-}
-
-fn complex_is_finite(a: Complex64) -> bool {
-    a.re.is_finite() && a.im.is_finite()
+    f64::from_bits(value.to_bits() + 1)
 }
 
 fn build_render_contexts(
@@ -2251,17 +1980,12 @@ fn unresolved_clusters_to_js(clusters: &[UnresolvedCluster64]) -> Result<Array, 
             "failureKindCounts",
             &failure_kind_counts_to_js(cluster.failure_kind_counts)?.into(),
         )?;
-        set_js_property(
-            &object,
-            "suggestedPrecisionBits",
-            &JsValue::from_f64(cluster.suggested_precision_bits as f64),
-        )?;
         array.push(object.as_ref());
     }
     Ok(array)
 }
 
-fn failure_kind_counts_to_js(counts: [u32; 5]) -> Result<Object, JsValue> {
+fn failure_kind_counts_to_js(counts: [u32; 3]) -> Result<Object, JsValue> {
     let object = Object::new();
     for (index, count) in counts.iter().enumerate() {
         set_js_property(
@@ -2297,7 +2021,6 @@ fn render_pixel_with_references64(
     );
     let mut best_unresolved_reference_index = -1;
     let mut max_skip = 0usize;
-    let allow_periodic_interior = pixel_span >= RENDER_MIN_PIXEL_SPAN_FOR_PERIODIC_INTERIOR;
 
     for index in 0..contexts.len() {
         let c_re = (screen_x - contexts[index].reference.screen_x) * pixel_span;
@@ -2312,7 +2035,6 @@ fn render_pixel_with_references64(
             &contexts[index].reference.orbit_im,
             max_iter,
             series,
-            allow_periodic_interior,
             compute_distance,
             scratch,
         );
@@ -2359,7 +2081,6 @@ fn perturb64(
     orbit_im: &[f64],
     max_iter: u32,
     series: &SeriesPlan64,
-    allow_periodic_interior: bool,
     compute_distance: bool,
     _scratch: &mut PeriodicScratch64,
 ) -> PixelResult64 {
@@ -2373,14 +2094,9 @@ fn perturb64(
     let mut glitch = false;
     let mut failure_kind = FailureKind64::EarlyReferenceEscape;
     let mut rebase_count = 0u32;
-    let mut rebase_limit = false;
+    let rebase_limit = false;
     let bla_skip_count = 0u32;
     let bla_step_count = 0u32;
-    let mut periodic_checkpoint_re = 0.0;
-    let mut periodic_checkpoint_im = 0.0;
-    let mut periodic_power = 1u32;
-    let mut periodic_lam = 0u32;
-    let mut periodic_initialized = false;
 
     if series.skip > 0 {
         if compute_distance {
@@ -2417,19 +2133,109 @@ fn perturb64(
         );
     }
 
+    // When an offset the size of one pixel is faithfully representable beside
+    // the reference parameter, the direct recurrence has the same numerical
+    // resolution and is much cheaper than perturbation. At deep scales this
+    // condition naturally fails, so all significant low bits stay in delta.
+    if parameter_resolves_pixel64(orbit_re.get(1).copied().unwrap_or(0.0), pixel_span)
+        && parameter_resolves_pixel64(orbit_im.get(1).copied().unwrap_or(0.0), pixel_span)
+    {
+        let direct_c_re = orbit_re.get(1).copied().unwrap_or(0.0) + c_re;
+        let direct_c_im = orbit_im.get(1).copied().unwrap_or(0.0) + c_im;
+        let mut z_re = orbit_re[ref_index] + dz_re;
+        let mut z_im = orbit_im[ref_index] + dz_im;
+        while iter <= max_iter {
+            if !z_re.is_finite() || !z_im.is_finite() {
+                return failure_result64(
+                    max_iter,
+                    mag2,
+                    true,
+                    FailureKind64::NonFiniteArithmetic,
+                    iter.min(max_iter),
+                    rebase_count,
+                    rebase_limit,
+                    bla_skip_count,
+                    bla_step_count,
+                );
+            }
+            let z_norm = z_re.abs().max(z_im.abs());
+            mag2 = z_re * z_re + z_im * z_im;
+            if z_norm > 2.0 {
+                return success_result64(
+                    iter,
+                    mag2,
+                    if compute_distance {
+                        render_refined_distance_estimate_px(
+                            z_re,
+                            z_im,
+                            derivative_re,
+                            derivative_im,
+                            direct_c_re,
+                            direct_c_im,
+                            pixel_span,
+                        )
+                    } else {
+                        -1.0
+                    },
+                    false,
+                    false,
+                    rebase_count,
+                    rebase_limit,
+                    bla_skip_count,
+                    bla_step_count,
+                );
+            }
+            if iter >= max_iter {
+                return success_result64(
+                    max_iter,
+                    mag2,
+                    -1.0,
+                    false,
+                    false,
+                    rebase_count,
+                    rebase_limit,
+                    bla_skip_count,
+                    bla_step_count,
+                );
+            }
+            let next_derivative_re = if compute_distance {
+                2.0 * (z_re * derivative_re - z_im * derivative_im) + pixel_span
+            } else {
+                0.0
+            };
+            let next_derivative_im = if compute_distance {
+                2.0 * (z_re * derivative_im + z_im * derivative_re)
+            } else {
+                0.0
+            };
+            let next_re = z_re * z_re - z_im * z_im + direct_c_re;
+            z_im = 2.0 * z_re * z_im + direct_c_im;
+            z_re = next_re;
+            derivative_re = next_derivative_re;
+            derivative_im = next_derivative_im;
+            iter += 1;
+        }
+    }
+
     while iter <= max_iter && ref_index <= limit {
         let ref_re = orbit_re[ref_index];
         let ref_im = orbit_im[ref_index];
         if !ref_re.is_finite() || !ref_im.is_finite() {
             glitch = true;
-            failure_kind = FailureKind64::DeltaOverflow;
+            failure_kind = FailureKind64::NonFiniteArithmetic;
             break;
         }
 
         let z_re = ref_re + dz_re;
         let z_im = ref_im + dz_im;
+        if !z_re.is_finite() || !z_im.is_finite() {
+            glitch = true;
+            failure_kind = FailureKind64::NonFiniteArithmetic;
+            break;
+        }
+        let z_norm = z_re.abs().max(z_im.abs());
         mag2 = z_re * z_re + z_im * z_im;
-        if mag2 > 4.0 {
+        if z_norm > 2.0 {
             return success_result64(
                 iter,
                 mag2,
@@ -2468,85 +2274,25 @@ fn perturb64(
             );
         }
 
-        if allow_periodic_interior && iter >= 32 {
-            if !periodic_initialized {
-                periodic_checkpoint_re = z_re;
-                periodic_checkpoint_im = z_im;
-                periodic_initialized = true;
-            } else {
-                periodic_lam += 1;
-                if periodic_lam >= 32 {
-                    let cycle_tolerance = 1e-20 * 1.0f64.max(mag2);
-                    let cycle_delta_re = z_re - periodic_checkpoint_re;
-                    let cycle_delta_im = z_im - periodic_checkpoint_im;
-                    let cycle_delta2 = cycle_delta_re * cycle_delta_re + cycle_delta_im * cycle_delta_im;
-                    if cycle_delta2.is_finite() && cycle_delta2 < cycle_tolerance {
-                        return success_result64(
-                            max_iter,
-                            mag2,
-                            -1.0,
-                            false,
-                            true,
-                            rebase_count,
-                            rebase_limit,
-                            bla_skip_count,
-                            bla_step_count,
-                        );
-                    }
-                }
-                if periodic_lam == periodic_power {
-                    periodic_checkpoint_re = z_re;
-                    periodic_checkpoint_im = z_im;
-                    periodic_power = periodic_power.saturating_mul(2).max(1);
-                    periodic_lam = 0;
-                }
-            }
-        }
-
-        let ref_mag2 = ref_re * ref_re + ref_im * ref_im;
-        let dz_mag2_before_step = dz_re * dz_re + dz_im * dz_im;
+        let dz_norm_before_step = dz_re.abs().max(dz_im.abs());
         let mut step_ref_re = ref_re;
         let mut step_ref_im = ref_im;
-        let mut step_ref_mag2 = ref_mag2;
         if ref_index > 0
-            && mag2.is_finite()
-            && dz_mag2_before_step.is_finite()
-            && mag2 < dz_mag2_before_step
+            && (z_norm < dz_norm_before_step || ref_index == limit)
         {
-            if rebase_count >= RENDER_MAX_REBASES_PER_PIXEL {
-                glitch = true;
-                rebase_limit = true;
-                failure_kind = FailureKind64::RebaseLimit;
-                break;
-            }
             dz_re = z_re;
             dz_im = z_im;
             ref_index = 0;
             step_ref_re = orbit_re[0];
             step_ref_im = orbit_im[0];
-            step_ref_mag2 = step_ref_re * step_ref_re + step_ref_im * step_ref_im;
             rebase_count += 1;
-        } else if !mag2.is_finite()
-            || !ref_mag2.is_finite()
-            || !dz_mag2_before_step.is_finite()
-            || (ref_mag2 > 1e-30
-                && dz_mag2_before_step > 1e-30
-                && dz_mag2_before_step > ref_mag2 * 1e-4
-                && mag2 < ref_mag2 * 1e-20)
+        } else if !ref_re.is_finite()
+            || !ref_im.is_finite()
+            || !dz_re.is_finite()
+            || !dz_im.is_finite()
         {
             glitch = true;
-            failure_kind = if !mag2.is_finite()
-                || !ref_mag2.is_finite()
-                || !dz_mag2_before_step.is_finite()
-            {
-                FailureKind64::DeltaOverflow
-            } else {
-                FailureKind64::CancellationGlitch
-            };
-            break;
-        }
-
-        if ref_index == limit {
+            failure_kind = FailureKind64::NonFiniteArithmetic;
             break;
         }
 
@@ -2571,10 +2317,9 @@ fn perturb64(
         iter += 1;
         ref_index += 1;
 
-        let dz_mag2 = dz_re * dz_re + dz_im * dz_im;
-        if !dz_mag2.is_finite() || (step_ref_mag2 > 1e-24 && dz_mag2 > step_ref_mag2 * 1e8) {
+        if !dz_re.is_finite() || !dz_im.is_finite() {
             glitch = true;
-            failure_kind = FailureKind64::DeltaOverflow;
+            failure_kind = FailureKind64::NonFiniteArithmetic;
             break;
         }
     }
@@ -2986,7 +2731,7 @@ fn create_render_cluster_accumulators(rect: Rect64) -> Vec<ClusterAccumulator64>
                 best_y: 0.0,
                 best_survived_iter: -1,
                 best_source_reference_id: None,
-                failure_kind_counts: [0; 5],
+                failure_kind_counts: [0; 3],
             });
         }
     }
@@ -3086,9 +2831,6 @@ fn build_render_unresolved_clusters(
                 bounds,
                 source_reference_id: cluster.best_source_reference_id.clone().unwrap_or_default(),
                 failure_kind_counts: cluster.failure_kind_counts,
-                suggested_precision_bits: suggested_precision_bits_for_cluster(
-                    cluster.best_survived_iter.max(0) as u32,
-                ),
             }
         })
         .collect();
@@ -3105,26 +2847,28 @@ fn failure_kind_index(kind: FailureKind64) -> Option<usize> {
     match kind {
         FailureKind64::None => None,
         FailureKind64::EarlyReferenceEscape => Some(0),
-        FailureKind64::CancellationGlitch => Some(1),
-        FailureKind64::DeltaOverflow => Some(2),
-        FailureKind64::RebaseLimit => Some(3),
-        FailureKind64::SeriesUnsafe => Some(4),
+        FailureKind64::NonFiniteArithmetic => Some(1),
+        FailureKind64::SeriesUnsafe => Some(2),
     }
 }
 
 fn failure_kind_key(index: usize) -> &'static str {
     match index {
         0 => "earlyReferenceEscape",
-        1 => "cancellationGlitch",
-        2 => "deltaOverflow",
-        3 => "rebaseLimit",
+        1 => "nonFiniteArithmetic",
         _ => "seriesUnsafe",
     }
 }
 
-fn suggested_precision_bits_for_cluster(survived_iter: u32) -> u32 {
-    let orbit_margin = ((survived_iter.max(1) as f64).log2() * 4.0).ceil() as u32;
-    (128 + orbit_margin).clamp(128, 4096)
+fn parameter_resolves_pixel64(value: f64, pixel_span: f64) -> bool {
+    let span = pixel_span.abs();
+    if !value.is_finite() || !span.is_finite() || span == 0.0 {
+        return false;
+    }
+    let plus = (value + span) - value;
+    let minus = value - (value - span);
+    let error = (plus - span).abs().max((minus - span).abs());
+    error <= span * 1e-6
 }
 
 fn estimate_render_distances_from_smooth(
@@ -3897,4 +3641,73 @@ pub fn direct_escape(
         false,
     )
     .escaped_at)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn no_series() -> SeriesPlan64 {
+        SeriesPlan64 {
+            skip: 0,
+            degree: 0,
+            coeff_re: Vec::new(),
+            coeff_im: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn finite_large_delta_is_an_escape_not_a_numeric_failure() {
+        let mut scratch = PeriodicScratch64;
+        let result = perturb64(
+            1e150,
+            0.0,
+            1e-300,
+            &[0.0, 0.0],
+            &[0.0, 0.0],
+            8,
+            &no_series(),
+            false,
+            &mut scratch,
+        );
+        assert!(!result.unresolved);
+        assert!(result.iter < 8);
+        assert_eq!(result.failure_kind, FailureKind64::None);
+    }
+
+    #[test]
+    fn carries_on_after_a_short_reference_orbit() {
+        let mut scratch = PeriodicScratch64;
+        let result = perturb64(
+            -1.0,
+            0.0,
+            1e-300,
+            &[0.0, 1.0],
+            &[0.0, 0.0],
+            32,
+            &no_series(),
+            false,
+            &mut scratch,
+        );
+        assert!(!result.unresolved);
+        assert_eq!(result.iter, 32);
+        assert!(result.rebase_count > 0);
+    }
+
+    #[test]
+    fn component_norm_does_not_underflow() {
+        let re: f64 = 1e-300;
+        let im: f64 = -5e-301;
+        assert_eq!(re * re + im * im, 0.0);
+        assert!(re.abs().max(im.abs()) > 0.0);
+    }
+
+    #[test]
+    fn bounded_radius_is_conservative_for_known_cases() {
+        let zeros = vec![0.0; 65];
+        let bounded = estimate_max_iter_bounded_radius64(64, 64, &zeros, &zeros);
+        assert!(bounded > 0.0);
+        assert!(bounded <= 0.25);
+        assert_eq!(estimate_max_iter_bounded_radius64(2, 64, &[0.0, 1.0], &[0.0, 0.0]), 0.0);
+    }
 }

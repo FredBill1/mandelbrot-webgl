@@ -6,9 +6,9 @@ import { resolveWorkerCount } from "../src/scheduler/workerPool";
 describe("worker safety", () => {
   it("caps tile worker oversubscription", () => {
     expect(resolveWorkerCount(1)).toBe(1);
-    expect(resolveWorkerCount(12)).toBe(24);
-    expect(resolveWorkerCount(16)).toBe(32);
-    expect(resolveWorkerCount(3.8)).toBe(7);
+    expect(resolveWorkerCount(12)).toBe(12);
+    expect(resolveWorkerCount(16)).toBe(16);
+    expect(resolveWorkerCount(3.8)).toBe(3);
   });
 
   it("does not use cross-origin isolated shared buffers in source", () => {

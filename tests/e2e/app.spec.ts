@@ -65,6 +65,8 @@ const REPORTED_INTERIOR_PERFORMANCE_VIEWS = [
 const REPORTED_DEEP_PERFORMANCE_VIEW =
   "/?re=-7.46883943431692760541919532714409859232606639886333750701092541165643808224287821342188522092587382149759799587046156756309863566112516698524311312263708365547443519e-1&im=-1.00525982411215876752593698920114371641511074291356983067885243750788193219078894211160534174388216978954526887172496458449660477900264112017850945405489228557321858e-1&scale=1e100";
 const ALT_REPORTED_DEEP_PERFORMANCE_VIEW = `/?re=${ALT_DEEP_PRESET.re}&im=${ALT_DEEP_PRESET.im}&scale=${ALT_DEEP_PRESET.scale}`;
+const REFERENCE_PRESSURE_PERFORMANCE_VIEW =
+  "/?re=-1.78638467787648365419207727720547018425703939706085767725832225881685228735410418701755894e0&im=-1.87892462354318380104774042945871534747473396966114579975399303084919971138018941887528654e-2&scale=1.7258385479561780535790570974260812707442099869376129800677603403441562714056599956588571e21";
 const UNSAFE_ACCELERATION_TILE_REGRESSIONS = [
   {
     url:
@@ -648,6 +650,26 @@ test("stabilizes the alternate reported e100 deep view under 2.5 seconds", async
   }
 });
 
+test("stabilizes the reported reference-pressure view under 2.5 seconds with one reference", async ({ page }) => {
+  test.setTimeout(30_000);
+  await installInteractionWorkerProbe(page);
+  await page.setViewportSize({ width: 1912, height: 948 });
+
+  const started = Date.now();
+  await page.goto(REFERENCE_PRESSURE_PERFORMANCE_VIEW);
+  const metrics = await waitForStableMetrics(page, started, 2_500);
+  expect(metrics.status).toBe("stable");
+  expect(metrics.stableMs).toBeLessThan(2_500);
+  expect(metrics.peakReferences).toBe(1);
+
+  const tileCounts = await readTileCounts(page);
+  expect(tileCounts.completed).toBe(tileCounts.total);
+  const probe = await readInteractionWorkerProbe(page);
+  expect(probe.referenceRequests).toBe(1);
+  expect(probe.renderMessages.filter((message) => message.mode === "exact")).toHaveLength(0);
+  expect(probe.renderMessages.filter((message) => message.mode === "final")).toHaveLength(tileCounts.total);
+});
+
 async function readUiLayout(page: import("@playwright/test").Page) {
   return page.evaluate(() => {
     const rect = (selector: string) => {
@@ -736,6 +758,7 @@ interface InteractionWorkerProbe {
   tileWorkers: number;
   referenceWorkers: number;
   unknownWorkers: number;
+  referenceRequests: number;
   renderMessages: Array<{ revision: number; mode: string; at: number }>;
 }
 
@@ -746,6 +769,7 @@ async function installInteractionWorkerProbe(page: import("@playwright/test").Pa
       tileWorkers: 0,
       referenceWorkers: 0,
       unknownWorkers: 0,
+      referenceRequests: 0,
       renderMessages: []
     };
     (globalThis as unknown as { __interactionWorkerProbe: InteractionWorkerProbe }).__interactionWorkerProbe = probe;
@@ -759,7 +783,9 @@ async function installInteractionWorkerProbe(page: import("@playwright/test").Pa
 
       const postMessage = worker.postMessage.bind(worker) as (message: unknown, transferOrOptions?: Transferable[] | StructuredSerializeOptions) => void;
       worker.postMessage = ((message: unknown, transferOrOptions?: Transferable[] | StructuredSerializeOptions) => {
-        if (
+        if (message && typeof message === "object" && (message as { type?: unknown }).type === "computeReference") {
+          probe.referenceRequests += 1;
+        } else if (
           message &&
           typeof message === "object" &&
           (message as { type?: unknown }).type === "renderTile"
@@ -789,6 +815,7 @@ async function readInteractionWorkerProbe(page: import("@playwright/test").Page)
       tileWorkers: probe.tileWorkers,
       referenceWorkers: probe.referenceWorkers,
       unknownWorkers: probe.unknownWorkers,
+      referenceRequests: probe.referenceRequests,
       renderMessages: [...probe.renderMessages]
     };
   });
@@ -874,6 +901,26 @@ async function readTileCounts(page: import("@playwright/test").Page): Promise<{ 
   const match = /^(\d+)\/(\d+)$/.exec(text ?? "");
   if (!match) return { completed: 0, total: Number.POSITIVE_INFINITY };
   return { completed: Number(match[1]), total: Number(match[2]) };
+}
+
+async function waitForStableMetrics(
+  page: import("@playwright/test").Page,
+  started: number,
+  timeoutMs: number
+): Promise<{ status: string; stableMs: number; peakReferences: number }> {
+  let status = "";
+  let peakReferences = 0;
+  while (Date.now() - started < timeoutMs) {
+    const sample = await page.evaluate(() => ({
+      status: document.querySelector("#readStatus")?.textContent ?? "",
+      references: Number(document.querySelector("#readRefs")?.textContent ?? 0)
+    }));
+    status = sample.status;
+    peakReferences = Math.max(peakReferences, sample.references);
+    if (status === "stable") break;
+    await page.waitForTimeout(25);
+  }
+  return { status, stableMs: Date.now() - started, peakReferences };
 }
 
 async function readReferenceCount(page: import("@playwright/test").Page): Promise<number> {

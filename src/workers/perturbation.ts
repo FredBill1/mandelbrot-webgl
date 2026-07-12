@@ -34,9 +34,6 @@ interface ReferenceContext {
 }
 
 interface PeriodicScratch {
-  checkpointRe: Float64Array;
-  checkpointIm: Float64Array;
-  checkpointIter: Int32Array;
   pixelResult: PixelResult;
   bestResult: PixelResult;
   selection: PixelSelection;
@@ -78,8 +75,6 @@ interface BoundaryStats {
   maxPaletteFootprint: number;
 }
 
-const MIN_PIXEL_SPAN_FOR_PERIODIC_INTERIOR = 1e-18;
-const MAX_REBASES_PER_PIXEL = 64;
 const SERIES_MAX_SKIP = 8192;
 const DISTANCE_EXTRA_ITERATIONS = 1;
 const DISTANCE_COVERAGE_NONE_PX = 0.75;
@@ -110,7 +105,7 @@ export function renderPerturbationTile(message: RenderTileMessage): TileDoneMess
   const width = Math.max(1, Math.ceil(tile.rect.width / sampleStep));
   const height = Math.max(1, Math.ceil(tile.rect.height / sampleStep));
   const rgba = new Uint8ClampedArray(width * height * 4);
-  const contexts = message.references.map((reference) => {
+  const contexts = message.reference ? [message.reference].map((reference) => {
     const orbitRe = asFloat64(reference.orbitRe);
     const orbitIm = asFloat64(reference.orbitIm);
     const radius = tileRadius(tile.rect, reference, pixelSpan);
@@ -125,11 +120,8 @@ export function renderPerturbationTile(message: RenderTileMessage): TileDoneMess
       probes,
       series: undefined
     } satisfies ReferenceContext;
-  });
+  }) : [];
   const scratch: PeriodicScratch = {
-    checkpointRe: new Float64Array(32),
-    checkpointIm: new Float64Array(32),
-    checkpointIter: new Int32Array(32),
     pixelResult: createPixelResult(),
     bestResult: createPixelResult(),
     selection: { result: createPixelResult(), referenceIndex: -1, skip: 0 }
@@ -160,8 +152,6 @@ export function renderPerturbationTile(message: RenderTileMessage): TileDoneMess
   for (let py = 0; py < height; py += 1) {
     screenYs[py] = Math.min(tile.rect.y + tile.rect.height - 0.5, tile.rect.y + (py + 0.5) * sampleStep);
   }
-  const allowPeriodicInterior = pixelSpan >= MIN_PIXEL_SPAN_FOR_PERIODIC_INTERIOR;
-
   for (let py = 0; py < height; py += 1) {
     const screenY = screenYs[py];
     for (let px = 0; px < width; px += 1) {
@@ -175,7 +165,6 @@ export function renderPerturbationTile(message: RenderTileMessage): TileDoneMess
         seriesDegree,
         contexts,
         scratch,
-        allowPeriodicInterior,
         false
       );
       const offset = pixelIndex * 4;
@@ -222,8 +211,6 @@ export function renderPerturbationTile(message: RenderTileMessage): TileDoneMess
 
   const unresolvedMaskOutput =
     message.renderMode === "final" && unresolvedCount > 0 ? unresolvedMask.slice().buffer : undefined;
-  const refinementDistanceValuesOutput =
-    message.renderMode === "final" && unresolvedCount > 0 ? distanceValues?.slice().buffer : undefined;
   if (unresolvedCount > 0) fillUnresolvedPreview(rgba, unresolvedMask, width, height);
 
   const unresolvedScreenX = unresolvedCount > 0 ? unresolvedScreenXSum / unresolvedCount : undefined;
@@ -243,7 +230,6 @@ export function renderPerturbationTile(message: RenderTileMessage): TileDoneMess
     height,
     rgba: rgba.buffer,
     unresolvedMask: unresolvedMaskOutput,
-    refinementDistanceValues: refinementDistanceValuesOutput,
     needsReference: unresolvedClusters.length > 0,
     stats: {
       elapsedMs: performance.now() - started,
@@ -287,7 +273,6 @@ function renderPixelWithReferences(
   seriesDegree: number,
   contexts: ReferenceContext[],
   scratch: PeriodicScratch,
-  allowPeriodicInterior: boolean,
   computeDistance: boolean
 ): PixelSelection {
   const selection = scratch.selection;
@@ -310,7 +295,6 @@ function renderPixelWithReferences(
       context.orbitIm,
       maxIter,
       series,
-      allowPeriodicInterior,
       computeDistance,
       scratch,
       scratch.pixelResult
@@ -383,7 +367,6 @@ function perturb(
   orbitIm: Float64Array,
   maxIter: number,
   series: ReturnType<typeof buildSeriesPlan>,
-  allowPeriodicInterior: boolean,
   computeDistance: boolean,
   scratch: PeriodicScratch,
   output: PixelResult
@@ -400,11 +383,6 @@ function perturb(
   let rebaseLimit = false;
   let blaSkipCount = 0;
   let blaStepCount = 0;
-  const checkpointRe = allowPeriodicInterior ? scratch.checkpointRe : undefined;
-  const checkpointIm = allowPeriodicInterior ? scratch.checkpointIm : undefined;
-  const checkpointIter = allowPeriodicInterior ? scratch.checkpointIter : undefined;
-  let checkpointCount = 0;
-  let checkpointIndex = 0;
 
   if (series.skip > 0) {
     if (computeDistance) {
@@ -427,18 +405,65 @@ function perturb(
     return failureResult(output, maxIter, mag2, true, Math.max(0, limit), rebaseCount, rebaseLimit, blaSkipCount, blaStepCount);
   }
 
+  // Once a pixel-sized parameter offset is representable in f64, continuing
+  // with the reconstructed parameter is mathematically identical and avoids
+  // the substantially more expensive perturbation recurrence. Deep views do
+  // not satisfy this numerical condition and retain the perturbation path.
+  if (
+    parameterResolvesPixel(orbitRe[1] ?? 0, pixelSpan) &&
+    parameterResolvesPixel(orbitIm[1] ?? 0, pixelSpan)
+  ) {
+    const directCRe = (orbitRe[1] ?? 0) + cRe;
+    const directCIm = (orbitIm[1] ?? 0) + cIm;
+    let zRe = orbitRe[refIndex] + dzRe;
+    let zIm = orbitIm[refIndex] + dzIm;
+    while (iter <= maxIter) {
+      if (!Number.isFinite(zRe) || !Number.isFinite(zIm)) {
+        return failureResult(output, maxIter, mag2, true, Math.min(iter, maxIter), rebaseCount, rebaseLimit, blaSkipCount, blaStepCount);
+      }
+      const zNorm = Math.max(Math.abs(zRe), Math.abs(zIm));
+      mag2 = zRe * zRe + zIm * zIm;
+      if (zNorm > 2) {
+        return successResult(
+          output,
+          iter,
+          mag2,
+          computeDistance
+            ? refinedDistanceEstimatePx(zRe, zIm, derivativeRe, derivativeIm, directCRe, directCIm, pixelSpan)
+            : -1,
+          false,
+          false,
+          rebaseCount,
+          rebaseLimit,
+          blaSkipCount,
+          blaStepCount
+        );
+      }
+      if (iter >= maxIter) return successResult(output, maxIter, mag2, -1, false, false, rebaseCount, rebaseLimit, blaSkipCount, blaStepCount);
+      const nextDerivativeRe = computeDistance ? 2 * (zRe * derivativeRe - zIm * derivativeIm) + pixelSpan : 0;
+      const nextDerivativeIm = computeDistance ? 2 * (zRe * derivativeIm + zIm * derivativeRe) : 0;
+      const nextRe = zRe * zRe - zIm * zIm + directCRe;
+      zIm = 2 * zRe * zIm + directCIm;
+      zRe = nextRe;
+      derivativeRe = nextDerivativeRe;
+      derivativeIm = nextDerivativeIm;
+      iter += 1;
+    }
+  }
+
   while (iter <= maxIter && refIndex <= limit) {
     const refRe = orbitRe[refIndex];
     const refIm = orbitIm[refIndex];
 
     const zRe = refRe + dzRe;
     const zIm = refIm + dzIm;
-    mag2 = zRe * zRe + zIm * zIm;
-    if (!Number.isFinite(mag2)) {
+    if (!Number.isFinite(zRe) || !Number.isFinite(zIm)) {
       glitch = true;
       break;
     }
-    if (mag2 > 4) {
+    const zNorm = Math.max(Math.abs(zRe), Math.abs(zIm));
+    mag2 = zRe * zRe + zIm * zIm;
+    if (zNorm > 2) {
       return successResult(
         output,
         iter,
@@ -464,56 +489,27 @@ function perturb(
     }
     if (iter >= maxIter) return successResult(output, maxIter, mag2, -1, false, false, rebaseCount, rebaseLimit, blaSkipCount, blaStepCount);
 
-    if (checkpointRe && checkpointIm && checkpointIter && iter > 32 && iter % 8 === 0) {
-      const cycleTolerance = 1e-20 * Math.max(1, mag2);
-      for (let checkpoint = 0; checkpoint < checkpointCount; checkpoint += 1) {
-        if (iter - checkpointIter[checkpoint] < 32) continue;
-        const cycleDeltaRe = zRe - checkpointRe[checkpoint];
-        const cycleDeltaIm = zIm - checkpointIm[checkpoint];
-        const cycleDelta2 = cycleDeltaRe * cycleDeltaRe + cycleDeltaIm * cycleDeltaIm;
-        if (Number.isFinite(cycleDelta2) && cycleDelta2 < cycleTolerance) {
-          return successResult(output, maxIter, mag2, -1, false, true, rebaseCount, rebaseLimit, blaSkipCount, blaStepCount);
-        }
-      }
-      checkpointRe[checkpointIndex] = zRe;
-      checkpointIm[checkpointIndex] = zIm;
-      checkpointIter[checkpointIndex] = iter;
-      checkpointIndex = (checkpointIndex + 1) % checkpointRe.length;
-      checkpointCount = Math.min(checkpointCount + 1, checkpointRe.length);
-    }
-
-    const refMag2 = refRe * refRe + refIm * refIm;
-    const dzMag2BeforeStep = dzRe * dzRe + dzIm * dzIm;
+    const dzNormBeforeStep = Math.max(Math.abs(dzRe), Math.abs(dzIm));
     let stepRefRe = refRe;
     let stepRefIm = refIm;
-    let stepRefMag2 = refMag2;
     if (
-      refIndex > 0 &&
-      Number.isFinite(dzMag2BeforeStep) &&
-      mag2 < dzMag2BeforeStep
+      refIndex > 0 && (zNorm < dzNormBeforeStep || refIndex === limit)
     ) {
-      if (rebaseCount >= MAX_REBASES_PER_PIXEL) {
-        glitch = true;
-        rebaseLimit = true;
-        break;
-      }
       dzRe = zRe;
       dzIm = zIm;
       refIndex = 0;
       stepRefRe = orbitRe[0] ?? 0;
       stepRefIm = orbitIm[0] ?? 0;
-      stepRefMag2 = stepRefRe * stepRefRe + stepRefIm * stepRefIm;
       rebaseCount += 1;
     } else if (
-      !Number.isFinite(refMag2) ||
-      !Number.isFinite(dzMag2BeforeStep) ||
-      (refMag2 > 1e-30 && dzMag2BeforeStep > 1e-30 && dzMag2BeforeStep > refMag2 * 1e-4 && mag2 < refMag2 * 1e-20)
+      !Number.isFinite(refRe) ||
+      !Number.isFinite(refIm) ||
+      !Number.isFinite(dzRe) ||
+      !Number.isFinite(dzIm)
     ) {
       glitch = true;
       break;
     }
-
-    if (refIndex === limit) break;
 
     const nextDerivativeRe = computeDistance ? 2 * (zRe * derivativeRe - zIm * derivativeIm) + pixelSpan : 0;
     const nextDerivativeIm = computeDistance ? 2 * (zRe * derivativeIm + zIm * derivativeRe) : 0;
@@ -528,8 +524,7 @@ function perturb(
     iter += 1;
     refIndex += 1;
 
-    const dzMag2 = dzRe * dzRe + dzIm * dzIm;
-    if (!Number.isFinite(dzMag2) || (stepRefMag2 > 1e-24 && dzMag2 > stepRefMag2 * 1e8)) {
+    if (!Number.isFinite(dzRe) || !Number.isFinite(dzIm)) {
       glitch = true;
       break;
     }
@@ -741,6 +736,15 @@ function applyBandlimitedBoundaryShading(
   }
 
   return { distanceEstimatedCount, paletteFilteredCount, distanceColorizedCount, boundaryCoverageCount, maxPaletteFootprint };
+}
+
+function parameterResolvesPixel(value: number, pixelSpan: number): boolean {
+  const span = Math.abs(pixelSpan);
+  if (!Number.isFinite(value) || !Number.isFinite(span) || span === 0) return false;
+  const plus = value + span - value;
+  const minus = value - (value - span);
+  const error = Math.max(Math.abs(plus - span), Math.abs(minus - span));
+  return error <= span * 1e-6;
 }
 
 function estimateDistancesFromSmooth(

@@ -2,7 +2,7 @@ export const BASE_VIEW_WIDTH = 3.5;
 export const TILE_SIZE = 128;
 export const TEXTURE_CACHE_BYTES = 256 * 1024 * 1024;
 export const REFERENCE_CACHE_SOFT_BYTES = 128 * 1024 * 1024;
-export const SERIES_DEGREE = 12;
+export const SERIES_DEGREE = 16;
 
 export interface ViewState {
   re: string;
@@ -51,7 +51,7 @@ export interface ReferenceSnapshot {
   screenY: number;
   precisionBits: number;
   escapedAt: number;
-  interiorRadius: number;
+  maxIterBoundedRadius: number;
   maxIter: number;
   revision: number;
   orbitRe: Float64Array;
@@ -66,23 +66,16 @@ export interface RenderTileMessage {
   viewScale?: string;
   pixelSpan: number;
   maxIter: number;
-  references: ReferenceSnapshot[];
+  reference?: ReferenceSnapshot;
   seriesDegree: number;
   paletteId: string;
-  refined: boolean;
-  refinementLevel: number;
   renderMode: "preview" | "final" | "exact";
   sampleStep: number;
   exactBaseRgba?: ArrayBuffer;
   exactUnresolvedMask?: ArrayBuffer;
-  refinementBaseRgba?: ArrayBuffer;
-  refinementUnresolvedMask?: ArrayBuffer;
-  refinementSmoothValues?: ArrayBuffer;
-  refinementDistanceValues?: ArrayBuffer;
-  refinementEscapedMask?: ArrayBuffer;
 }
 
-export type FailureKind = "earlyReferenceEscape" | "cancellationGlitch" | "deltaOverflow" | "rebaseLimit" | "seriesUnsafe";
+export type FailureKind = "earlyReferenceEscape" | "nonFiniteArithmetic" | "seriesUnsafe";
 
 export type FailureKindCounts = Record<FailureKind, number>;
 
@@ -98,7 +91,6 @@ export interface UnresolvedCluster {
   bestSurvivedIter?: number;
   sourceReferenceId?: string;
   failureKindCounts?: FailureKindCounts;
-  suggestedPrecisionBits?: number;
 }
 
 export interface TileStats {
@@ -142,23 +134,9 @@ export interface TileDoneMessage {
   height: number;
   rgba: ArrayBuffer;
   unresolvedMask?: ArrayBuffer;
-  refinementSmoothValues?: ArrayBuffer;
-  refinementDistanceValues?: ArrayBuffer;
-  refinementEscapedMask?: ArrayBuffer;
   stats: TileStats;
   needsReference: boolean;
 }
 
-export interface NeedReferenceMessage {
-  type: "needReference";
-  tile: TileDescriptor;
-  requiredPrecision: number;
-  maxIter: number;
-  targetScreenX: number;
-  targetScreenY: number;
-  refinementLevel: number;
-  sourceReferenceId: string;
-}
-
 export type TileWorkerInMessage = RenderTileMessage;
-export type TileWorkerOutMessage = TileDoneMessage | NeedReferenceMessage;
+export type TileWorkerOutMessage = TileDoneMessage;

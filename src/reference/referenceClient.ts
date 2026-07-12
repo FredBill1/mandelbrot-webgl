@@ -15,7 +15,7 @@ interface PendingReference {
 }
 
 type PendingWork = PendingReference;
-export type ReferenceWorkKind = "viewReference" | "localReference";
+export type ReferenceWorkKind = "viewReference";
 
 export interface ReferenceWorkOptions {
   revision?: number;
@@ -28,7 +28,7 @@ export interface RawReferenceResult {
   centerIm: string;
   precisionBits: number;
   escapedAt: number;
-  interiorRadius: number;
+  maxIterBoundedRadius: number;
   orbitRe: Float64Array;
   orbitIm: Float64Array;
 }
@@ -66,7 +66,7 @@ export class ReferenceClient {
         revision: options.revision,
         priority: options.priority ?? 10,
         sequence: ++this.sequence,
-        kind: options.kind ?? "localReference",
+        kind: "viewReference",
         centerRe,
         centerIm,
         scale,

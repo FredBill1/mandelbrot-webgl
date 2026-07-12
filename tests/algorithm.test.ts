@@ -1,6 +1,6 @@
 import { beforeAll, describe, expect, it } from "vitest";
 import { readFileSync } from "node:fs";
-import init, { apply_view_transform, compute_reference, compute_reference_3mul, compute_reference_sparse, direct_escape, estimate_reference_interior_radius } from "../src/wasm/pkg/mandelbrot_wasm";
+import init, { apply_view_transform, compute_reference, compute_reference_3mul, compute_reference_sparse, direct_escape, estimate_max_iter_bounded_radius } from "../src/wasm/pkg/mandelbrot_wasm";
 import { createVisibleTileShells } from "../src/tiles/tileKey";
 import { evaluateSeriesWithDerivative, type SeriesPlan } from "../src/math/series";
 import {
@@ -181,7 +181,7 @@ describe("perturbation renderer", () => {
       const point = highPrecisionPointAtScreen(view, screen.x, screen.y, 1912, 948);
       const referencePoint = highPrecisionPointAtScreen(view, referenceScreen.x, referenceScreen.y, 1912, 948);
       const reference = makeReference(referencePoint.re, referencePoint.im, view.maxIter, precisionBits, referenceScreen.x, referenceScreen.y);
-      const message = makeTileMessage(view, point, screen.x, screen.y, width, height, [reference], renderMode, sampleStep);
+      const message = makeTileMessage(view, point, screen.x, screen.y, width, height, reference, renderMode, sampleStep);
 
       const tsResult = renderPerturbationTile(message);
       resetWasmPerturbationCacheForTests();
@@ -205,7 +205,6 @@ describe("perturbation renderer", () => {
       expect(wasmResult.stats.unresolvedClusters.map(legacyClusterFields)).toEqual(tsResult.stats.unresolvedClusters.map(legacyClusterFields));
       if (wasmResult.stats.unresolvedClusters.length > 0) {
         expect(wasmResult.stats.unresolvedClusters[0].failureKindCounts).toBeDefined();
-        expect(wasmResult.stats.unresolvedClusters[0].suggestedPrecisionBits).toBeGreaterThanOrEqual(128);
       }
       expectSampledPixelsClose(wasmResult.rgba, tsResult.rgba, wasmResult.width * wasmResult.height, 200);
     }
@@ -251,11 +250,9 @@ describe("perturbation renderer", () => {
       canvasHeight: 1,
       pixelSpan: 3.5 / Number(scale) || 3.5e-100,
       maxIter,
-      references: [reference],
+      reference,
       seriesDegree: SERIES_DEGREE,
       paletteId: "cosine",
-      refined: true,
-      refinementLevel: 1,
       renderMode: "final",
       sampleStep: 1
     };
@@ -276,7 +273,7 @@ describe("perturbation renderer", () => {
     const direct = direct_escape(point.re, point.im, view.maxIter, 192);
     const reference = makeReference(view.re, view.im, view.maxIter, 192, 1912 * 0.5, 948 * 0.5);
 
-    const result = renderSinglePixel(view, point, screen.x, screen.y, reference, 0);
+    const result = renderSinglePixel(view, point, screen.x, screen.y, reference);
 
     expect(result.stats.seriesSkip).toBe(0);
     expect(result.stats.unresolvedCount).toBe(0);
@@ -297,7 +294,7 @@ describe("perturbation renderer", () => {
     expect(reference.escapedAt).toBeLessThan(view.maxIter);
     expect(direct).toBeLessThan(view.maxIter);
 
-    const result = renderSinglePixel(view, point, screen.x, screen.y, reference, 0);
+    const result = renderSinglePixel(view, point, screen.x, screen.y, reference);
 
     expect(result.stats.unresolvedCount).toBe(0);
     expect(result.needsReference).toBe(false);
@@ -332,11 +329,9 @@ describe("perturbation renderer", () => {
       canvasHeight: 948,
       pixelSpan: pixelSpan(view.scale, 1912),
       maxIter: view.maxIter,
-      references: [reference],
+      reference,
       seriesDegree: SERIES_DEGREE,
       paletteId: "cosine",
-      refined: false,
-      refinementLevel: 0,
       renderMode: "final",
       sampleStep: 1
     });
@@ -357,7 +352,7 @@ describe("perturbation renderer", () => {
     const direct = direct_escape(point.re, point.im, view.maxIter, 224);
     const reference = makeReference(point.re, point.im, view.maxIter, 224, screen.x, screen.y);
 
-    const result = renderSinglePixel(view, point, screen.x, screen.y, reference, 1);
+    const result = renderSinglePixel(view, point, screen.x, screen.y, reference);
 
     expect(direct).toBeLessThan(view.maxIter);
     expect(result.stats.unresolvedCount).toBe(0);
@@ -389,19 +384,14 @@ describe("perturbation renderer", () => {
     const point = pointAtScreen(view, screen.x, screen.y);
     const direct = direct_escape(point.re, point.im, view.maxIter, 224);
     const centerReference = makeReference(view.re, view.im, view.maxIter, 224, 1912 * 0.5, 948 * 0.5);
-    const pointReference = makeReference(point.re, point.im, view.maxIter, 224, screen.x, screen.y);
-
-    const rebased = renderSinglePixelWithReferences(view, point, screen.x, screen.y, [centerReference], 0);
+    const rebased = renderSinglePixelWithReference(view, point, screen.x, screen.y, centerReference);
     expect(centerReference.escapedAt).toBeLessThan(direct);
     expect(rebased.stats.unresolvedCount).toBe(0);
     expect(rebased.stats.escapedPixels).toBe(direct < view.maxIter ? 1 : 0);
 
-    const resolved = renderSinglePixelWithReferences(view, point, screen.x, screen.y, [centerReference, pointReference], 1);
-    expect(resolved.stats.unresolvedCount).toBe(0);
-    expect(resolved.stats.escapedPixels).toBe(direct < view.maxIter ? 1 : 0);
   });
 
-  it("matches multi-reference bandlimiting after single-reference rebasing", async () => {
+  it("matches a point reference after single-reference rebasing", async () => {
     const view = {
       re: "-1.7195312667941079545586189454398113271069746647515813505680542504632787025805573e0",
       im: "6.5505858903810377100204901499228868589789948177206009920848026920443700420219874e-4",
@@ -412,16 +402,14 @@ describe("perturbation renderer", () => {
     const point = pointAtScreen(view, screen.x, screen.y);
     const centerReference = makeReference(view.re, view.im, view.maxIter, 224, 956, 474);
     const pointReference = makeReference(point.re, point.im, view.maxIter, 224, screen.x, screen.y);
-    const base = makeTileMessage(view, point, screen.x, screen.y, 1, 1, [centerReference], "final", 1);
+    const base = makeTileMessage(view, point, screen.x, screen.y, 1, 1, centerReference, "final", 1);
 
     resetWasmPerturbationCacheForTests();
-    const rebased = await renderPerturbationTileWasm({ ...base, refined: false, refinementLevel: 0 });
+    const rebased = await renderPerturbationTileWasm(base);
     expect(rebased.stats.unresolvedCount).toBe(0);
     const onePass = await renderPerturbationTileWasm({
       ...base,
-      references: [centerReference, pointReference],
-      refined: false,
-      refinementLevel: 0
+      reference: pointReference
     });
 
     expect(new Uint8Array(rebased.rgba)).toEqual(new Uint8Array(onePass.rgba));
@@ -456,11 +444,9 @@ describe("perturbation renderer", () => {
       canvasHeight: 784,
       pixelSpan: pixelSpan(view.scale, 1170),
       maxIter: view.maxIter,
-      references: [reference],
+      reference,
       seriesDegree: SERIES_DEGREE,
       paletteId: "cosine",
-      refined: false,
-      refinementLevel: 0,
       renderMode: "final",
       sampleStep: 1
     });
@@ -502,11 +488,9 @@ describe("perturbation renderer", () => {
       canvasHeight: 948,
       pixelSpan: pixelSpan(view.scale, 1912),
       maxIter: view.maxIter,
-      references: [reference],
+      reference,
       seriesDegree: SERIES_DEGREE,
       paletteId: "cosine",
-      refined: true,
-      refinementLevel: 1,
       renderMode: "preview",
       sampleStep: 1
     };
@@ -552,11 +536,9 @@ describe("perturbation renderer", () => {
       canvasHeight: 948,
       pixelSpan: pixelSpan(view.scale, 1912),
       maxIter: view.maxIter,
-      references: [reference],
+      reference,
       seriesDegree: SERIES_DEGREE,
       paletteId: "cosine",
-      refined: true,
-      refinementLevel: 1,
       renderMode: "final",
       sampleStep: 1
     });
@@ -599,11 +581,9 @@ describe("perturbation renderer", () => {
       viewScale: view.scale,
       pixelSpan: pixelSpan(view.scale, 1912),
       maxIter: view.maxIter,
-      references: [reference],
+      reference,
       seriesDegree: SERIES_DEGREE,
       paletteId: "cosine",
-      refined: true,
-      refinementLevel: 1,
       renderMode: "final",
       sampleStep: 1
     });
@@ -640,11 +620,9 @@ describe("perturbation renderer", () => {
       viewScale: scale,
       pixelSpan: pixelSpan(scale, width),
       maxIter,
-      references: [reference],
+      reference,
       seriesDegree: SERIES_DEGREE,
       paletteId: "cosine",
-      refined: true,
-      refinementLevel: 1,
       renderMode: "final",
       sampleStep: 1
     });
@@ -671,12 +649,39 @@ describe("perturbation renderer", () => {
     const reference = makeReference(point.re, point.im, view.maxIter, 256, screen.x, screen.y);
     expect(reference.escapedAt).toBe(view.maxIter);
 
-    const result = renderSinglePixelWithReferences(view, point, screen.x, screen.y, [reference], 1);
+    const result = renderSinglePixelWithReference(view, point, screen.x, screen.y, reference);
 
     expect(result.stats.unresolvedCount).toBe(0);
     expect(result.stats.escapedPixels).toBe(0);
     expect(result.stats.periodicInteriorCount + result.stats.seriesSkip).toBeGreaterThan(0);
     expect(result.stats.blaStepCount).toBe(0);
+  });
+
+  it("resolves representative pixels from the reference-pressure view with one reference", () => {
+    const view = {
+      re: "-1.78638467787648365419207727720547018425703939706085767725832225881685228735410418701755894e0",
+      im: "-1.87892462354318380104774042945871534747473396966114579975399303084919971138018941887528654e-2",
+      scale: "1.7258385479561780535790570974260812707442099869376129800677603403441562714056599956588571e21",
+      maxIter: 1872
+    };
+    const reference = makeReference(view.re, view.im, view.maxIter, 320, 956, 474);
+    expect(reference.escapedAt).toBe(view.maxIter);
+
+    for (const screen of [{ x: 956, y: 474 }, { x: 640, y: 384 }, { x: 128, y: 128 }]) {
+      const point = highPrecisionPointAtScreen(view, screen.x, screen.y, 1912, 948);
+      const direct = direct_escape(point.re, point.im, view.maxIter, 320);
+      const result = renderSinglePixelWithReference(view, point, screen.x, screen.y, reference);
+      expect(result.stats.unresolvedCount).toBe(0);
+      expect(result.stats.escapedPixels).toBe(direct < view.maxIter ? 1 : 0);
+    }
+  });
+
+  it("computes a conservative max-iteration bounded radius", () => {
+    const bounded = makeReference("0", "0", 64, 192, 0, 0);
+    const escaped = makeReference("1", "0", 64, 192, 0, 0);
+    expect(bounded.maxIterBoundedRadius).toBeGreaterThan(0);
+    expect(bounded.maxIterBoundedRadius).toBeLessThanOrEqual(0.25);
+    expect(escaped.maxIterBoundedRadius).toBe(0);
   });
 
   it.each([
@@ -697,7 +702,7 @@ describe("perturbation renderer", () => {
     const direct = direct_escape(point.re, point.im, view.maxIter, 4096);
     const reference = makeReference(point.re, point.im, view.maxIter, 512, x, y);
 
-    const result = renderSinglePixelWithReferences(view, point, x, y, [reference], 1);
+    const result = renderSinglePixelWithReference(view, point, x, y, reference);
 
     expect(direct).toBeLessThan(view.maxIter);
     expect(result.stats.periodicInteriorCount).toBe(0);
@@ -776,12 +781,7 @@ describe("perturbation renderer", () => {
     const point = highPrecisionPointAtScreen(view, x, y, 1912, 948);
     const direct = direct_escape(point.re, point.im, view.maxIter, 512);
     const centerReference = makeReference(view.re, view.im, view.maxIter, 512, 1912 * 0.5, 948 * 0.5);
-    const localReference = makeReference(point.re, point.im, view.maxIter, 512, x, y);
-
-    const centerOnly = renderSinglePixelWithReferences(view, point, x, y, [centerReference], 0);
-    const result = centerOnly.stats.unresolvedCount === 0
-      ? centerOnly
-      : renderSinglePixelWithReferences(view, point, x, y, [centerReference, localReference], 1);
+    const result = renderSinglePixelWithReference(view, point, x, y, centerReference);
 
     expect(direct).toBe(view.maxIter);
     expect(result.stats.unresolvedCount).toBe(0);
@@ -826,8 +826,8 @@ describe("perturbation renderer", () => {
     const point = highPrecisionPointAtScreen(view, x, y, 1912, 948);
     const direct = direct_escape(point.re, point.im, view.maxIter, precisionBits);
     const reference = makeReference(point.re, point.im, view.maxIter, precisionBits, x, y);
-    const seriesEnabled = renderSinglePixelWithReferences(view, point, x, y, [reference], 1, SERIES_DEGREE);
-    const seriesDisabled = renderSinglePixelWithReferences(view, point, x, y, [reference], 1, 0);
+    const seriesEnabled = renderSinglePixelWithReference(view, point, x, y, reference, SERIES_DEGREE);
+    const seriesDisabled = renderSinglePixelWithReference(view, point, x, y, reference, 0);
     const escaped = direct < view.maxIter ? 1 : 0;
 
     expect(seriesEnabled.stats.unresolvedCount).toBe(0);
@@ -850,7 +850,7 @@ function makeReference(re: string, im: string, maxIter: number, precisionBits: n
     screenY,
     precisionBits: raw.precision_bits,
     escapedAt: raw.escaped_at,
-    interiorRadius: estimate_reference_interior_radius(raw.escaped_at, maxIter, orbitRe, orbitIm),
+    maxIterBoundedRadius: estimate_max_iter_bounded_radius(raw.escaped_at, maxIter, orbitRe, orbitIm),
     maxIter,
     revision: 1,
     orbitRe,
@@ -872,19 +872,17 @@ function renderSinglePixel(
   point: { re: string; im: string },
   screenX: number,
   screenY: number,
-  reference: ReferenceSnapshot,
-  refinementLevel: number
+  reference: ReferenceSnapshot
 ) {
-  return renderSinglePixelWithReferences(view, point, screenX, screenY, [reference], refinementLevel);
+  return renderSinglePixelWithReference(view, point, screenX, screenY, reference);
 }
 
-function renderSinglePixelWithReferences(
+function renderSinglePixelWithReference(
   view: { re: string; im: string; scale: string; maxIter: number },
   point: { re: string; im: string },
   screenX: number,
   screenY: number,
-  references: ReferenceSnapshot[],
-  refinementLevel: number,
+  reference: ReferenceSnapshot,
   seriesDegree = SERIES_DEGREE
 ) {
   const tile: TileDescriptor = {
@@ -904,11 +902,9 @@ function renderSinglePixelWithReferences(
     canvasHeight: 948,
     pixelSpan: pixelSpan(view.scale, 1912),
     maxIter: view.maxIter,
-    references,
+    reference,
     seriesDegree,
     paletteId: "cosine",
-    refined: refinementLevel > 0,
-    refinementLevel,
     renderMode: "final",
     sampleStep: 1
   };
@@ -922,7 +918,7 @@ function makeTileMessage(
   screenY: number,
   width: number,
   height: number,
-  references: ReferenceSnapshot[],
+  reference: ReferenceSnapshot,
   renderMode: "preview" | "final",
   sampleStep: number
 ): RenderTileMessage {
@@ -943,11 +939,9 @@ function makeTileMessage(
     canvasHeight: 948,
     pixelSpan: pixelSpan(view.scale, 1912),
     maxIter: view.maxIter,
-    references,
+    reference,
     seriesDegree: SERIES_DEGREE,
     paletteId: "cosine",
-    refined: true,
-    refinementLevel: 1,
     renderMode,
     sampleStep
   };

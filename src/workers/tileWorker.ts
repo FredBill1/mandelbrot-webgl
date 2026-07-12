@@ -24,10 +24,7 @@ self.onmessage = (event: MessageEvent<RenderTileMessage | ComputeReferenceMessag
   void renderPerturbationTileWasm(event.data).then((result) => {
     const transfer = [
       result.rgba,
-      result.unresolvedMask,
-      result.refinementSmoothValues,
-      result.refinementDistanceValues,
-      result.refinementEscapedMask
+      result.unresolvedMask
     ].filter((buffer): buffer is ArrayBuffer => buffer instanceof ArrayBuffer && buffer.byteLength > 0);
     self.postMessage(result satisfies TileWorkerOutMessage, [...new Set(transfer)]);
   });

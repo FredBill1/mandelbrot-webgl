@@ -1,5 +1,4 @@
 import type {
-  NeedReferenceMessage,
   RenderTileMessage,
   TileDoneMessage,
   TileWorkerInMessage,
@@ -47,10 +46,7 @@ export class TileWorkerPool implements ReferenceComputer {
   private sequence = 0;
   private requestId = 0;
 
-  constructor(
-    readonly size = resolveWorkerCount(),
-    private readonly onNeedReference?: (message: NeedReferenceMessage) => void
-  ) {
+  constructor(readonly size = resolveWorkerCount()) {
     this.idle.push(this.createWorker());
   }
 
@@ -179,31 +175,27 @@ export class TileWorkerPool implements ReferenceComputer {
 
   private prepareMessage(worker: Worker, message: RenderTileMessage): RenderTileMessage {
     const resident = this.residentReferences.get(worker);
-    if (!resident || message.references.length === 0) return message;
-    const references = message.references.map((reference) => {
-      const key = referenceTransportKey(reference);
-      if (!resident.has(key)) {
-        resident.add(key);
-        return reference;
-      }
-      return {
+    const reference = message.reference;
+    if (!resident || !reference) return message;
+    const key = referenceTransportKey(reference);
+    if (!resident.has(key)) {
+      resident.add(key);
+      return message;
+    }
+    return {
+      ...message,
+      reference: {
         ...reference,
         orbitRe: EMPTY_REFERENCE_ORBIT,
         orbitIm: EMPTY_REFERENCE_ORBIT
-      };
-    });
-    return { ...message, references };
+      }
+    };
   }
 
   private handleMessage(
     worker: Worker,
     message: TileWorkerOutMessage | { type: "referenceDone"; requestId: number; reference: RawReferenceResult } | { type: "referenceError"; requestId: number; message: string }
   ): void {
-    if (message.type === "needReference") {
-      this.onNeedReference?.(message);
-      return;
-    }
-
     const item = this.inFlight.get(worker);
     if (!item) return;
     this.inFlight.delete(worker);
@@ -235,31 +227,26 @@ export class TileWorkerPool implements ReferenceComputer {
 
 export function resolveWorkerCount(hardwareConcurrency = globalThis.navigator?.hardwareConcurrency ?? 4): number {
   if (hardwareConcurrency <= 1) return 1;
-  return Math.max(1, Math.floor(hardwareConcurrency * 2));
+  return Math.max(1, Math.floor(hardwareConcurrency));
 }
 
 const EMPTY_REFERENCE_ORBIT = new Float64Array();
 
-function referenceTransportKey(reference: RenderTileMessage["references"][number]): string {
-  return `${reference.revision}|${reference.id}|${reference.screenX}|${reference.screenY}|${reference.escapedAt}|${reference.maxIter}|${reference.interiorRadius}`;
+function referenceTransportKey(reference: NonNullable<RenderTileMessage["reference"]>): string {
+  return `${reference.revision}|${reference.id}|${reference.screenX}|${reference.screenY}|${reference.escapedAt}|${reference.maxIter}|${reference.maxIterBoundedRadius}`;
 }
 
 function renderTransferables(message: RenderTileMessage): ArrayBuffer[] {
   const buffers = [
     message.exactBaseRgba,
     message.exactUnresolvedMask,
-    message.refinementBaseRgba,
-    message.refinementUnresolvedMask,
-    message.refinementSmoothValues,
-    message.refinementDistanceValues,
-    message.refinementEscapedMask
   ].filter((buffer): buffer is ArrayBuffer => buffer instanceof ArrayBuffer && buffer.byteLength > 0);
   return [...new Set(buffers)];
 }
 
 function defaultPriority(message: RenderTileMessage): number {
   if (message.renderMode === "preview") return 0;
-  return message.refined ? 2 : 10;
+  return 10;
 }
 
 function recordDeepBench(event: Record<string, unknown>): void {
