@@ -70,8 +70,11 @@ interface LinearColor {
 
 interface PaletteFilterStats {
   paletteFootprintCount: number;
+  paletteFootprintFallbackCount: number;
   paletteFilteredCount: number;
+  paletteProxyCount: number;
   maxPaletteFootprint: number;
+  maxPaletteProxyLod: number;
 }
 
 const SERIES_MAX_SKIP = 8192;
@@ -90,11 +93,20 @@ const PALETTE_SIZE = 2048;
 const PALETTE_CYCLE_SCALE = 0.018;
 const PALETTE_FILTER_LOW = 0.25;
 const PALETTE_FILTER_HIGH = 0.5;
-const DIAGONAL_OFFSETS = [[-1, -1], [1, -1], [-1, 1], [1, 1]] as const;
+const PALETTE_PROXY_FILTER_LOW = 0.5;
+const PALETTE_PROXY_FILTER_HIGH = 1.0;
+const PALETTE_PROXY_TARGET_FOOTPRINT = 0.25;
+const PALETTE_PROXY_STRENGTH = 0.25;
+const PALETTE_PROXY_FADE_LOW = 32;
+const PALETTE_PROXY_FADE_HIGH = 64;
+const PALETTE_DIAGONAL_OFFSETS = [
+  [-1, -1], [1, -1], [-1, 1], [1, 1]
+] as const;
 const COSINE_PALETTE = createCosinePalette(PALETTE_SIZE);
 const SRGB_TO_LINEAR_LUT = createSrgbToLinearLut();
 const PALETTE_LINEAR_SAMPLES = createLinearPaletteSamples(COSINE_PALETTE);
 const PALETTE_LINEAR_PREFIX = createLinearPalettePrefix(PALETTE_LINEAR_SAMPLES);
+const PALETTE_LINEAR_MEAN = paletteLinearMean();
 const INV_LN2 = 1 / Math.LN2;
 const SMOOTH_LOG_SCALE = 0.5 * INV_LN2;
 
@@ -194,9 +206,16 @@ export function renderPerturbationTile(message: RenderTileMessage): TileDoneMess
     }
   }
 
-  if (message.renderMode === "final") {
-    estimatePaletteFootprintsFromSmooth(paletteFootprints!, smoothValues!, escapedMask!, unresolvedMask, width, height);
-  }
+  const paletteFootprintFallbackCount = message.renderMode === "final"
+    ? estimatePaletteFootprintsFromSmooth(
+      paletteFootprints!,
+      smoothValues!,
+      escapedMask!,
+      unresolvedMask,
+      width,
+      height
+    )
+    : 0;
 
   const paletteFilterStats = message.renderMode === "final"
     ? applyBandlimitedPaletteShading(
@@ -209,6 +228,7 @@ export function renderPerturbationTile(message: RenderTileMessage): TileDoneMess
         height
       )
     : emptyPaletteFilterStats();
+  paletteFilterStats.paletteFootprintFallbackCount = paletteFootprintFallbackCount;
 
   const unresolvedMaskOutput =
     message.renderMode === "final" && unresolvedCount > 0 ? unresolvedMask.slice().buffer : undefined;
@@ -251,8 +271,11 @@ export function renderPerturbationTile(message: RenderTileMessage): TileDoneMess
       seriesSkip,
       seriesReplayPixels,
       paletteFootprintCount: paletteFilterStats.paletteFootprintCount,
+      paletteFootprintFallbackCount: paletteFilterStats.paletteFootprintFallbackCount,
       paletteFilteredCount: paletteFilterStats.paletteFilteredCount,
+      paletteProxyCount: paletteFilterStats.paletteProxyCount,
       maxPaletteFootprint: paletteFilterStats.maxPaletteFootprint,
+      maxPaletteProxyLod: paletteFilterStats.maxPaletteProxyLod,
       referenceId: referenceIdsUsed[0] ?? contexts[0]?.reference.id ?? "",
       referenceIdsUsed,
       unresolvedScreenX,
@@ -703,7 +726,9 @@ function applyBandlimitedPaletteShading(
   if (pixelCount === 0 || smoothValues.length < pixelCount || paletteFootprints.length < pixelCount) return emptyPaletteFilterStats();
   let paletteFootprintCount = 0;
   let paletteFilteredCount = 0;
+  let paletteProxyCount = 0;
   let maxPaletteFootprint = 0;
+  let maxPaletteProxyLod = 0;
 
   for (let index = 0; index < pixelCount; index += 1) {
     if (unresolvedMask[index] !== 0 || escapedMask[index] === 0) continue;
@@ -715,7 +740,7 @@ function applyBandlimitedPaletteShading(
     const filterAmount = smoothstep(PALETTE_FILTER_LOW, PALETTE_FILTER_HIGH, footprint);
     if (filterAmount <= 0) continue;
     const offset = index * 4;
-    const color = blendLinearColor(
+    let color = blendLinearColor(
       byteColorToLinear({
         r: buffer[offset],
         g: buffer[offset + 1],
@@ -725,10 +750,25 @@ function applyBandlimitedPaletteShading(
       filterAmount
     );
     paletteFilteredCount += 1;
+
+    const proxyAmount = paletteProxyWeight(footprint);
+    if (proxyAmount > 0) {
+      const { color: proxyColor, lod } = paletteProxyLinearColor(smoothValues[index], footprint);
+      color = addPaletteProxyResidual(color, proxyColor, proxyAmount * PALETTE_PROXY_STRENGTH);
+      paletteProxyCount += 1;
+      maxPaletteProxyLod = Math.max(maxPaletteProxyLod, lod);
+    }
     writeLinearColor(buffer, offset, color);
   }
 
-  return { paletteFootprintCount, paletteFilteredCount, maxPaletteFootprint };
+  return {
+    paletteFootprintCount,
+    paletteFootprintFallbackCount: 0,
+    paletteFilteredCount,
+    paletteProxyCount,
+    maxPaletteFootprint,
+    maxPaletteProxyLod
+  };
 }
 
 function estimatePaletteFootprintsFromSmooth(
@@ -738,7 +778,8 @@ function estimatePaletteFootprintsFromSmooth(
   unresolvedMask: Uint8Array,
   width: number,
   height: number
-): void {
+): number {
+  let fallbackCount = 0;
   for (let y = 0; y < height; y += 1) {
     for (let x = 0; x < width; x += 1) {
       const index = y * width + x;
@@ -754,30 +795,45 @@ function estimatePaletteFootprintsFromSmooth(
       const right = x + 1 < width ? neighbor(x + 1, y) : undefined;
       const top = y > 0 ? neighbor(x, y - 1) : undefined;
       const bottom = y + 1 < height ? neighbor(x, y + 1) : undefined;
-      const gradientX = left !== undefined || right !== undefined
-        ? Math.max(left === undefined ? 0 : Math.abs(center - left), right === undefined ? 0 : Math.abs(right - center))
-        : Number.POSITIVE_INFINITY;
-      const gradientY = top !== undefined || bottom !== undefined
-        ? Math.max(top === undefined ? 0 : Math.abs(center - top), bottom === undefined ? 0 : Math.abs(bottom - center))
-        : Number.POSITIVE_INFINITY;
+      const gradientX = Math.max(
+        left === undefined ? 0 : Math.abs(center - left),
+        right === undefined ? 0 : Math.abs(right - center)
+      );
+      const gradientY = Math.max(
+        top === undefined ? 0 : Math.abs(center - top),
+        bottom === undefined ? 0 : Math.abs(bottom - center)
+      );
       let gradient = Math.hypot(gradientX, gradientY);
-      for (const [dx, dy] of DIAGONAL_OFFSETS) {
+      let neighborCount = Number(left !== undefined) + Number(right !== undefined)
+        + Number(top !== undefined) + Number(bottom !== undefined);
+      for (const [dx, dy] of PALETTE_DIAGONAL_OFFSETS) {
         const nx = x + dx;
         const ny = y + dy;
         if (nx < 0 || ny < 0 || nx >= width || ny >= height) continue;
-        const diagonal = neighbor(nx, ny);
-        if (diagonal !== undefined) gradient = Math.max(gradient, Math.abs(diagonal - center) * Math.SQRT1_2);
+        const sample = neighbor(nx, ny);
+        if (sample === undefined) continue;
+        gradient = Math.max(gradient, Math.abs(sample - center) * Math.SQRT1_2);
+        neighborCount += 1;
       }
-      paletteFootprints[index] = paletteFootprintFromGradient(gradient);
+      if (neighborCount === 0) {
+        paletteFootprints[index] = 1;
+        fallbackCount += 1;
+      } else {
+        paletteFootprints[index] = paletteFootprintFromGradient(gradient);
+      }
     }
   }
+  return fallbackCount;
 }
 
 function emptyPaletteFilterStats(): PaletteFilterStats {
   return {
     paletteFootprintCount: 0,
+    paletteFootprintFallbackCount: 0,
     paletteFilteredCount: 0,
-    maxPaletteFootprint: 0
+    paletteProxyCount: 0,
+    maxPaletteFootprint: 0,
+    maxPaletteProxyLod: 0
   };
 }
 
@@ -926,6 +982,50 @@ function integratedPaletteLinearColor(smooth: number, footprint: number): Linear
   };
 }
 
+function paletteLinearMean(): LinearColor {
+  const offset = PALETTE_SIZE * 3;
+  return {
+    r: PALETTE_LINEAR_PREFIX[offset],
+    g: PALETTE_LINEAR_PREFIX[offset + 1],
+    b: PALETTE_LINEAR_PREFIX[offset + 2]
+  };
+}
+
+function paletteProxyWeight(footprint: number): number {
+  const activation = smoothstep(PALETTE_PROXY_FILTER_LOW, PALETTE_PROXY_FILTER_HIGH, footprint);
+  const extremeFade = 1 - smoothstep(PALETTE_PROXY_FADE_LOW, PALETTE_PROXY_FADE_HIGH, footprint);
+  return activation * extremeFade;
+}
+
+function paletteProxyLinearColor(smooth: number, footprint: number): { color: LinearColor; lod: number } {
+  const phase = smooth * PALETTE_CYCLE_SCALE;
+  const lod = Math.max(1, Math.log2(Math.max(footprint, Number.EPSILON) / PALETTE_PROXY_TARGET_FOOTPRINT));
+  const lowLevel = Math.floor(lod);
+  const levelBlend = lod - lowLevel;
+  const lowColor = paletteLinearColorAtPhase(phase / 2 ** lowLevel);
+  const highColor = paletteLinearColorAtPhase(phase / 2 ** (lowLevel + 1));
+  return { color: blendLinearColor(lowColor, highColor, levelBlend), lod };
+}
+
+function paletteLinearColorAtPhase(phase: number): LinearColor {
+  const fraction = phase - Math.floor(phase);
+  const index = Math.min(PALETTE_SIZE - 1, Math.max(0, Math.floor(fraction * PALETTE_SIZE)));
+  const offset = index * 3;
+  return {
+    r: PALETTE_LINEAR_SAMPLES[offset],
+    g: PALETTE_LINEAR_SAMPLES[offset + 1],
+    b: PALETTE_LINEAR_SAMPLES[offset + 2]
+  };
+}
+
+function addPaletteProxyResidual(base: LinearColor, proxy: LinearColor, amount: number): LinearColor {
+  return {
+    r: clamp01(base.r + (proxy.r - PALETTE_LINEAR_MEAN.r) * amount),
+    g: clamp01(base.g + (proxy.g - PALETTE_LINEAR_MEAN.g) * amount),
+    b: clamp01(base.b + (proxy.b - PALETTE_LINEAR_MEAN.b) * amount)
+  };
+}
+
 export function sampleIntegratedPaletteForTests(smooth: number, footprint: number): readonly [number, number, number] {
   const color = integratedPaletteLinearColor(smooth, footprint);
   return [linearChannelToByte(color.r), linearChannelToByte(color.g), linearChannelToByte(color.b)] as const;
@@ -935,8 +1035,35 @@ export function paletteFilterWeightForTests(footprint: number): number {
   return smoothstep(PALETTE_FILTER_LOW, PALETTE_FILTER_HIGH, footprint);
 }
 
+export function paletteProxyWeightForTests(footprint: number): number {
+  return paletteProxyWeight(footprint);
+}
+
+export function paletteProxyLodForTests(footprint: number): number {
+  return paletteProxyLinearColor(0, footprint).lod;
+}
+
 export function paletteFootprintFromGradientForTests(gradientX: number, gradientY: number): number {
   return paletteFootprintFromGradient(Math.hypot(gradientX, gradientY));
+}
+
+export function estimatePaletteFootprintsForTests(
+  smoothValues: Float32Array,
+  escapedMask: Uint8Array,
+  unresolvedMask: Uint8Array,
+  width: number,
+  height: number
+): { footprints: Float32Array; fallbackCount: number } {
+  const footprints = new Float32Array(width * height);
+  const fallbackCount = estimatePaletteFootprintsFromSmooth(
+    footprints,
+    smoothValues,
+    escapedMask,
+    unresolvedMask,
+    width,
+    height
+  );
+  return { footprints, fallbackCount };
 }
 
 export function samplePaletteForTests(smooth: number): readonly [number, number, number] {

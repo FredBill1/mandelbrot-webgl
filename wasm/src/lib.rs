@@ -687,8 +687,11 @@ struct LinearColor64 {
 #[derive(Clone, Copy)]
 struct PaletteFilterStats64 {
     palette_footprint_count: u32,
+    palette_footprint_fallback_count: u32,
     palette_filtered_count: u32,
+    palette_proxy_count: u32,
     max_palette_footprint: f64,
+    max_palette_proxy_lod: f64,
 }
 
 struct RenderPaletteCache {
@@ -740,6 +743,12 @@ const RENDER_PALETTE_SIZE: usize = 2048;
 const RENDER_PALETTE_CYCLE_SCALE: f64 = 0.018;
 const RENDER_PALETTE_FILTER_LOW: f64 = 0.25;
 const RENDER_PALETTE_FILTER_HIGH: f64 = 0.5;
+const RENDER_PALETTE_PROXY_FILTER_LOW: f64 = 0.5;
+const RENDER_PALETTE_PROXY_FILTER_HIGH: f64 = 1.0;
+const RENDER_PALETTE_PROXY_TARGET_FOOTPRINT: f64 = 0.25;
+const RENDER_PALETTE_PROXY_STRENGTH: f64 = 0.25;
+const RENDER_PALETTE_PROXY_FADE_LOW: f64 = 32.0;
+const RENDER_PALETTE_PROXY_FADE_HIGH: f64 = 64.0;
 const RENDER_INV_LN2: f64 = std::f64::consts::LOG2_E;
 const RENDER_SMOOTH_LOG_SCALE: f64 = 0.5 * std::f64::consts::LOG2_E;
 const RENDER_REFERENCE_INTERIOR_RADIUS_SAFETY: f64 = 0.90;
@@ -1026,7 +1035,7 @@ pub fn render_tile_cached(
         }
     }
 
-    if render_mode == "final" {
+    let palette_footprint_fallback_count = if render_mode == "final" {
         estimate_render_palette_footprints_from_smooth(
             palette_footprints.as_mut().unwrap(),
             smooth_values.as_ref().unwrap(),
@@ -1035,10 +1044,12 @@ pub fn render_tile_cached(
             refinement_mask.as_deref(),
             width,
             height,
-        );
-    }
+        )
+    } else {
+        0
+    };
 
-    let palette_filter_stats = if render_mode == "final" {
+    let mut palette_filter_stats = if render_mode == "final" {
         apply_render_bandlimited_palette_shading(
             &mut rgba,
             smooth_values.as_ref().unwrap(),
@@ -1053,6 +1064,7 @@ pub fn render_tile_cached(
     } else {
         empty_render_palette_filter_stats()
     };
+    palette_filter_stats.palette_footprint_fallback_count = palette_footprint_fallback_count;
     if let (Some(cap_mask), Some(escaped_mask)) =
         (cap_hit_unknown_mask.as_ref(), escaped_mask.as_ref())
     {
@@ -1882,13 +1894,28 @@ fn build_render_tile_value(
     )?;
     set_js_property(
         &stats,
+        "paletteFootprintFallbackCount",
+        &JsValue::from_f64(palette_filter_stats.palette_footprint_fallback_count as f64),
+    )?;
+    set_js_property(
+        &stats,
         "paletteFilteredCount",
         &JsValue::from_f64(palette_filter_stats.palette_filtered_count as f64),
     )?;
     set_js_property(
         &stats,
+        "paletteProxyCount",
+        &JsValue::from_f64(palette_filter_stats.palette_proxy_count as f64),
+    )?;
+    set_js_property(
+        &stats,
         "maxPaletteFootprint",
         &JsValue::from_f64(palette_filter_stats.max_palette_footprint),
+    )?;
+    set_js_property(
+        &stats,
+        "maxPaletteProxyLod",
+        &JsValue::from_f64(palette_filter_stats.max_palette_proxy_lod),
     )?;
     let used_ids = Array::new();
     for id in &reference_ids_used {
@@ -2899,15 +2926,16 @@ fn estimate_render_palette_footprints_from_smooth(
     render_mask: Option<&[u8]>,
     width: usize,
     height: usize,
-) {
+) -> u32 {
     let pixel_count = width * height;
     if palette_footprints.len() < pixel_count
         || smooth_values.len() < pixel_count
         || escaped_mask.len() < pixel_count
         || unresolved_mask.len() < pixel_count
     {
-        return;
+        return 0;
     }
+    let mut fallback_count = 0u32;
     for y in 0..height {
         for x in 0..width {
             let index = y * width + x;
@@ -2927,38 +2955,39 @@ fn estimate_render_palette_footprints_from_smooth(
             let right = (x + 1 < width).then(|| neighbor(x + 1, y)).flatten();
             let top = (y > 0).then(|| neighbor(x, y - 1)).flatten();
             let bottom = (y + 1 < height).then(|| neighbor(x, y + 1)).flatten();
-            let gradient_x = match (left, right) {
-                (Some(a), Some(b)) => (center - a).abs().max((b - center).abs()),
-                (Some(a), None) => (center - a).abs(),
-                (None, Some(b)) => (b - center).abs(),
-                (None, None) => f64::INFINITY,
-            };
-            let gradient_y = match (top, bottom) {
-                (Some(a), Some(b)) => (center - a).abs().max((b - center).abs()),
-                (Some(a), None) => (center - a).abs(),
-                (None, Some(b)) => (b - center).abs(),
-                (None, None) => f64::INFINITY,
-            };
+            let gradient_x = left.map_or(0.0, |sample| (sample - center).abs())
+                .max(right.map_or(0.0, |sample| (sample - center).abs()));
+            let gradient_y = top.map_or(0.0, |sample| (sample - center).abs())
+                .max(bottom.map_or(0.0, |sample| (sample - center).abs()));
             let mut gradient = gradient_x.hypot(gradient_y);
+            let mut neighbor_count = [left, right, top, bottom]
+                .into_iter()
+                .flatten()
+                .count() as u32;
             for (dx, dy) in [(-1isize, -1isize), (1, -1), (-1, 1), (1, 1)] {
                 let nx = x as isize + dx;
                 let ny = y as isize + dy;
                 if nx < 0 || ny < 0 || nx >= width as isize || ny >= height as isize {
                     continue;
                 }
-                if let Some(diagonal) = neighbor(nx as usize, ny as usize) {
-                    gradient = gradient.max((diagonal - center).abs() * std::f64::consts::FRAC_1_SQRT_2);
+                if let Some(sample) = neighbor(nx as usize, ny as usize) {
+                    gradient = gradient.max(
+                        (sample - center).abs() * std::f64::consts::FRAC_1_SQRT_2,
+                    );
+                    neighbor_count += 1;
                 }
             }
-            palette_footprints[index] = if gradient.is_finite() && gradient > f64::EPSILON {
-                (RENDER_PALETTE_CYCLE_SCALE * gradient) as f32
-            } else if gradient.is_infinite() {
+            palette_footprints[index] = if neighbor_count == 0 {
+                fallback_count += 1;
                 1.0
+            } else if gradient.is_finite() && gradient > f64::EPSILON {
+                (RENDER_PALETTE_CYCLE_SCALE * gradient) as f32
             } else {
                 0.0
             };
         }
     }
+    fallback_count
 }
 
 fn apply_render_bandlimited_palette_shading(
@@ -2981,7 +3010,9 @@ fn apply_render_bandlimited_palette_shading(
     }
     let mut palette_footprint_count = 0u32;
     let mut palette_filtered_count = 0u32;
+    let mut palette_proxy_count = 0u32;
     let mut max_palette_footprint = 0.0f64;
+    let mut max_palette_proxy_lod = 0.0f64;
     for index in 0..pixel_count {
         if render_mask.is_some_and(|mask| mask[index] == 0) {
             continue;
@@ -3005,7 +3036,7 @@ fn apply_render_bandlimited_palette_shading(
             continue;
         }
         let offset = index * 4;
-        let color = blend_render_linear_color(
+        let mut color = blend_render_linear_color(
             LinearColor64 {
                 r: palette.srgb_to_linear[buffer[offset] as usize],
                 g: palette.srgb_to_linear[buffer[offset + 1] as usize],
@@ -3019,20 +3050,43 @@ fn apply_render_bandlimited_palette_shading(
             filter_amount,
         );
         palette_filtered_count += 1;
+
+        let proxy_amount = render_palette_proxy_weight(footprint);
+        if proxy_amount > 0.0 {
+            let (proxy_color, lod) = render_palette_proxy_linear_color(
+                smooth_values[index] as f64,
+                footprint,
+                palette,
+            );
+            color = add_render_palette_proxy_residual(
+                color,
+                proxy_color,
+                proxy_amount * RENDER_PALETTE_PROXY_STRENGTH,
+                palette,
+            );
+            palette_proxy_count += 1;
+            max_palette_proxy_lod = max_palette_proxy_lod.max(lod);
+        }
         write_render_linear_color(buffer, offset, color);
     }
     PaletteFilterStats64 {
         palette_footprint_count,
+        palette_footprint_fallback_count: 0,
         palette_filtered_count,
+        palette_proxy_count,
         max_palette_footprint,
+        max_palette_proxy_lod,
     }
 }
 
 fn empty_render_palette_filter_stats() -> PaletteFilterStats64 {
     PaletteFilterStats64 {
         palette_footprint_count: 0,
+        palette_footprint_fallback_count: 0,
         palette_filtered_count: 0,
+        palette_proxy_count: 0,
         max_palette_footprint: 0.0,
+        max_palette_proxy_lod: 0.0,
     }
 }
 
@@ -3292,6 +3346,78 @@ fn integrated_render_palette_linear_color(
         - render_palette_integral(low, 2, palette))
         / width;
     LinearColor64 { r: linear_r, g: linear_g, b: linear_b }
+}
+
+fn render_palette_linear_mean(palette: &RenderPaletteCache) -> LinearColor64 {
+    let offset = RENDER_PALETTE_SIZE * 3;
+    LinearColor64 {
+        r: palette.linear_prefix[offset],
+        g: palette.linear_prefix[offset + 1],
+        b: palette.linear_prefix[offset + 2],
+    }
+}
+
+fn render_palette_proxy_weight(footprint: f64) -> f64 {
+    let activation = smoothstep(
+        RENDER_PALETTE_PROXY_FILTER_LOW,
+        RENDER_PALETTE_PROXY_FILTER_HIGH,
+        footprint,
+    );
+    let extreme_fade = 1.0 - smoothstep(
+        RENDER_PALETTE_PROXY_FADE_LOW,
+        RENDER_PALETTE_PROXY_FADE_HIGH,
+        footprint,
+    );
+    activation * extreme_fade
+}
+
+fn render_palette_proxy_linear_color(
+    smooth: f64,
+    footprint: f64,
+    palette: &RenderPaletteCache,
+) -> (LinearColor64, f64) {
+    let phase = smooth * RENDER_PALETTE_CYCLE_SCALE;
+    let lod = 1.0f64.max(
+        (footprint.max(f64::EPSILON) / RENDER_PALETTE_PROXY_TARGET_FOOTPRINT).log2(),
+    );
+    let low_level = lod.floor();
+    let level_blend = lod - low_level;
+    let low_divisor = 2.0f64.powi(low_level as i32);
+    let low_color = render_palette_linear_color_at_phase(phase / low_divisor, palette);
+    let high_color = render_palette_linear_color_at_phase(phase / (low_divisor * 2.0), palette);
+    (
+        blend_render_linear_color(low_color, high_color, level_blend),
+        lod,
+    )
+}
+
+fn render_palette_linear_color_at_phase(
+    phase: f64,
+    palette: &RenderPaletteCache,
+) -> LinearColor64 {
+    let fraction = phase - phase.floor();
+    let index = ((fraction * RENDER_PALETTE_SIZE as f64).floor().max(0.0) as usize)
+        .min(RENDER_PALETTE_SIZE - 1);
+    let offset = index * 3;
+    LinearColor64 {
+        r: palette.linear_colors[offset],
+        g: palette.linear_colors[offset + 1],
+        b: palette.linear_colors[offset + 2],
+    }
+}
+
+fn add_render_palette_proxy_residual(
+    base: LinearColor64,
+    proxy: LinearColor64,
+    amount: f64,
+    palette: &RenderPaletteCache,
+) -> LinearColor64 {
+    let mean = render_palette_linear_mean(palette);
+    LinearColor64 {
+        r: clamp01(base.r + (proxy.r - mean.r) * amount),
+        g: clamp01(base.g + (proxy.g - mean.g) * amount),
+        b: clamp01(base.b + (proxy.b - mean.b) * amount),
+    }
 }
 
 fn render_palette_integral(position: f64, channel: usize, palette: &RenderPaletteCache) -> f64 {

@@ -365,8 +365,11 @@ function installWorkerProbe() {
       maxRefsUsed: 0,
       maxSeriesSkip: 0,
       paletteFootprintCount: 0,
+      paletteFootprintFallbackCount: 0,
       paletteFilteredCount: 0,
+      paletteProxyCount: 0,
       maxPaletteFootprint: 0,
+      maxPaletteProxyLod: 0,
       totalGlitches: 0,
       totalRebases: 0,
       totalPeriodicInterior: 0,
@@ -482,10 +485,16 @@ function installWorkerProbe() {
           bench.waves.maxRefsUsed = Math.max(bench.waves.maxRefsUsed, data.stats.referenceIdsUsed.length);
           bench.waves.maxSeriesSkip = Math.max(bench.waves.maxSeriesSkip, data.stats.seriesSkip);
           bench.waves.paletteFootprintCount += data.stats.paletteFootprintCount ?? 0;
+          bench.waves.paletteFootprintFallbackCount += data.stats.paletteFootprintFallbackCount ?? 0;
           bench.waves.paletteFilteredCount += data.stats.paletteFilteredCount ?? 0;
+          bench.waves.paletteProxyCount += data.stats.paletteProxyCount ?? 0;
           bench.waves.maxPaletteFootprint = Math.max(
             bench.waves.maxPaletteFootprint,
             data.stats.maxPaletteFootprint ?? 0
+          );
+          bench.waves.maxPaletteProxyLod = Math.max(
+            bench.waves.maxPaletteProxyLod,
+            data.stats.maxPaletteProxyLod ?? 0
           );
           bench.waves.totalGlitches += data.stats.glitchCount;
           bench.waves.totalRebases += data.stats.rebaseCount;
@@ -507,8 +516,11 @@ function installWorkerProbe() {
             periodicInterior: data.stats.periodicInteriorCount,
             seriesReplayPixels: data.stats.seriesReplayPixels ?? 0,
             paletteFootprints: data.stats.paletteFootprintCount,
+            paletteFootprintFallbacks: data.stats.paletteFootprintFallbackCount,
             paletteFiltered: data.stats.paletteFilteredCount,
+            paletteProxies: data.stats.paletteProxyCount,
             maxPaletteFootprint: data.stats.maxPaletteFootprint,
+            maxPaletteProxyLod: data.stats.maxPaletteProxyLod,
             refsUsed: data.stats.referenceIdsUsed.length,
             clusters: data.stats.unresolvedClusters.length
           });
@@ -538,8 +550,11 @@ function installWorkerProbe() {
               periodicInterior: data.stats.periodicInteriorCount,
               seriesReplayPixels: data.stats.seriesReplayPixels ?? 0,
               paletteFootprints: data.stats.paletteFootprintCount,
+              paletteFootprintFallbacks: data.stats.paletteFootprintFallbackCount,
               paletteFiltered: data.stats.paletteFilteredCount,
+              paletteProxies: data.stats.paletteProxyCount,
               maxPaletteFootprint: data.stats.maxPaletteFootprint,
+              maxPaletteProxyLod: data.stats.maxPaletteProxyLod,
               refsUsed: data.stats.referenceIdsUsed.length,
               clusters: data.stats.unresolvedClusters.length
             }
@@ -559,8 +574,11 @@ function installWorkerProbe() {
             periodicInterior: data.stats.periodicInteriorCount,
             seriesReplayPixels: data.stats.seriesReplayPixels ?? 0,
             paletteFootprints: data.stats.paletteFootprintCount,
+            paletteFootprintFallbacks: data.stats.paletteFootprintFallbackCount,
             paletteFiltered: data.stats.paletteFilteredCount,
+            paletteProxies: data.stats.paletteProxyCount,
             maxPaletteFootprint: data.stats.maxPaletteFootprint,
+            maxPaletteProxyLod: data.stats.maxPaletteProxyLod,
             refsUsed: data.stats.referenceIdsUsed.length,
             clusters: data.stats.unresolvedClusters.length
           };

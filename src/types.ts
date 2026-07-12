@@ -112,8 +112,11 @@ export interface TileStats {
   seriesSkip: number;
   seriesReplayPixels: number;
   paletteFootprintCount: number;
+  paletteFootprintFallbackCount: number;
   paletteFilteredCount: number;
+  paletteProxyCount: number;
   maxPaletteFootprint: number;
+  maxPaletteProxyLod: number;
   referenceId: string;
   referenceIdsUsed: string[];
   unresolvedScreenX: number | undefined;

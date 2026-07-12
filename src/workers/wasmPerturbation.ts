@@ -82,8 +82,11 @@ export async function renderPerturbationTileWasm(message: RenderTileMessage): Pr
         capHitUnknownCount: raw.stats.capHitUnknownCount ?? 0,
         capHitBoundaryCount: raw.stats.capHitBoundaryCount ?? 0,
         paletteFootprintCount: raw.stats.paletteFootprintCount ?? 0,
+        paletteFootprintFallbackCount: raw.stats.paletteFootprintFallbackCount ?? 0,
         paletteFilteredCount: raw.stats.paletteFilteredCount ?? 0,
+        paletteProxyCount: raw.stats.paletteProxyCount ?? 0,
         maxPaletteFootprint: raw.stats.maxPaletteFootprint ?? 0,
+        maxPaletteProxyLod: raw.stats.maxPaletteProxyLod ?? 0,
         referenceCacheMissCount: 0,
         seriesReplayPixels: raw.stats.seriesReplayPixels ?? 0,
         exactFallbackPixels: raw.stats.exactFallbackPixels ?? raw.width * raw.height
@@ -140,8 +143,11 @@ export async function renderPerturbationTileWasm(message: RenderTileMessage): Pr
       capHitUnknownCount: raw.stats.capHitUnknownCount ?? 0,
       capHitBoundaryCount: raw.stats.capHitBoundaryCount ?? 0,
       paletteFootprintCount: raw.stats.paletteFootprintCount ?? 0,
+      paletteFootprintFallbackCount: raw.stats.paletteFootprintFallbackCount ?? 0,
       paletteFilteredCount: raw.stats.paletteFilteredCount ?? 0,
+      paletteProxyCount: raw.stats.paletteProxyCount ?? 0,
       maxPaletteFootprint: raw.stats.maxPaletteFootprint ?? 0,
+      maxPaletteProxyLod: raw.stats.maxPaletteProxyLod ?? 0,
       referenceCacheMissCount: (raw.stats.referenceCacheMissCount ?? 0) + cacheMisses,
       seriesReplayPixels: raw.stats.seriesReplayPixels ?? 0,
       exactFallbackPixels: raw.stats.exactFallbackPixels ?? 0

@@ -4,8 +4,11 @@ import init, { apply_view_transform, compute_reference, compute_reference_3mul, 
 import { createVisibleTileShells } from "../src/tiles/tileKey";
 import { buildSeriesPlan, evaluateSeriesWithDerivative, type SeriesPlan } from "../src/math/series";
 import {
+  estimatePaletteFootprintsForTests,
   paletteFilterWeightForTests,
   paletteFootprintFromGradientForTests,
+  paletteProxyLodForTests,
+  paletteProxyWeightForTests,
   renderPerturbationTile,
   sampleIntegratedPaletteForTests,
   samplePaletteForTests,
@@ -58,17 +61,58 @@ describe("perturbation renderer", () => {
     expect(paletteFilterWeightForTests(0.3749)).toBeLessThan(paletteFilterWeightForTests(0.3751));
   });
 
+  it("introduces and retires the low-frequency proxy continuously", () => {
+    expect(paletteProxyWeightForTests(0.5)).toBe(0);
+    expect(paletteProxyWeightForTests(0.75)).toBeCloseTo(0.5, 12);
+    expect(paletteProxyWeightForTests(1)).toBe(1);
+    expect(paletteProxyWeightForTests(32)).toBe(1);
+    expect(paletteProxyWeightForTests(48)).toBeCloseTo(0.5, 12);
+    expect(paletteProxyWeightForTests(64)).toBe(0);
+    expect(paletteProxyLodForTests(0.5)).toBeCloseTo(1, 12);
+    expect(paletteProxyLodForTests(1)).toBeCloseTo(2, 12);
+    expect(paletteProxyLodForTests(2)).toBeCloseTo(3, 12);
+  });
+
   it("computes palette footprint directly from the smooth-value gradient", () => {
     expect(paletteFootprintFromGradientForTests(3, 4)).toBeCloseTo(0.09, 12);
     expect(paletteFootprintFromGradientForTests(0, 0)).toBe(0);
     expect(paletteFootprintFromGradientForTests(Number.POSITIVE_INFINITY, 0)).toBe(1);
   });
 
-  it("preserves resolved palette colors and analytically averages super-Nyquist pixels", () => {
+  it("preserves resolved colors and adds only a muted residual above Nyquist", () => {
     const smooth = 37.25;
     expect(shadePaletteFootprintForTests(smooth, 0.25)).toEqual(samplePaletteForTests(smooth));
     expect(shadePaletteFootprintForTests(smooth, 0.5)).toEqual(sampleIntegratedPaletteForTests(smooth, 0.5));
-    expect(shadePaletteFootprintForTests(smooth, 1)).toEqual(sampleIntegratedPaletteForTests(smooth, 1));
+    const proxy = shadePaletteFootprintForTests(smooth, 1);
+    const mean = sampleIntegratedPaletteForTests(smooth, 1);
+    expect(proxy).not.toEqual(mean);
+    expect(Math.max(...proxy) - Math.min(...proxy)).toBeGreaterThan(4);
+
+    const below = shadePaletteFootprintForTests(smooth, 0.9999);
+    const above = shadePaletteFootprintForTests(smooth, 1.0001);
+    expect(Math.max(...below.map((channel, index) => Math.abs(channel - above[index])))).toBeLessThanOrEqual(1);
+  });
+
+  it("uses an available gradient axis instead of treating it as an unknown full cycle", () => {
+    const line = estimatePaletteFootprintsForTests(
+      Float32Array.of(10, 20, 30),
+      Uint8Array.of(1, 1, 1),
+      Uint8Array.of(0, 0, 0),
+      3,
+      1
+    );
+    expect(line.fallbackCount).toBe(0);
+    expect(line.footprints[1]).toBeCloseTo(0.18, 6);
+
+    const isolated = estimatePaletteFootprintsForTests(
+      Float32Array.of(20),
+      Uint8Array.of(1),
+      Uint8Array.of(0),
+      1,
+      1
+    );
+    expect(isolated.fallbackCount).toBe(1);
+    expect(isolated.footprints[0]).toBe(1);
   });
 
   it.each([
@@ -183,8 +227,11 @@ describe("perturbation renderer", () => {
       expect(wasmResult.stats.seriesSkip).toBe(tsResult.stats.seriesSkip);
       expect(wasmResult.stats.seriesReplayPixels).toBe(tsResult.stats.seriesReplayPixels);
       expect(wasmResult.stats.paletteFootprintCount).toBe(tsResult.stats.paletteFootprintCount);
+      expect(wasmResult.stats.paletteFootprintFallbackCount).toBe(tsResult.stats.paletteFootprintFallbackCount);
       expect(wasmResult.stats.paletteFilteredCount).toBe(tsResult.stats.paletteFilteredCount);
+      expect(wasmResult.stats.paletteProxyCount).toBe(tsResult.stats.paletteProxyCount);
       expect(wasmResult.stats.maxPaletteFootprint).toBeCloseTo(tsResult.stats.maxPaletteFootprint, 5);
+      expect(wasmResult.stats.maxPaletteProxyLod).toBeCloseTo(tsResult.stats.maxPaletteProxyLod, 5);
       expect(wasmResult.stats.referenceIdsUsed).toEqual(tsResult.stats.referenceIdsUsed);
       expect(wasmResult.stats.unresolvedClusters.map(legacyClusterFields)).toEqual(tsResult.stats.unresolvedClusters.map(legacyClusterFields));
       if (wasmResult.stats.unresolvedClusters.length > 0) {
@@ -398,7 +445,9 @@ describe("perturbation renderer", () => {
 
     expect(new Uint8Array(rebased.rgba)).toEqual(new Uint8Array(onePass.rgba));
     expect(rebased.stats.paletteFootprintCount).toBe(onePass.stats.paletteFootprintCount);
+    expect(rebased.stats.paletteFootprintFallbackCount).toBe(onePass.stats.paletteFootprintFallbackCount);
     expect(rebased.stats.paletteFilteredCount).toBe(onePass.stats.paletteFilteredCount);
+    expect(rebased.stats.paletteProxyCount).toBe(onePass.stats.paletteProxyCount);
   });
 
   it("uses safe series or adaptive unresolved clusters for the 1170x784 near-real performance regression", () => {
@@ -484,7 +533,9 @@ describe("perturbation renderer", () => {
     expect(final.stats.escapedPixels).toBe(preview.stats.escapedPixels);
     expect(final.stats.unresolvedCount).toBe(preview.stats.unresolvedCount);
     expect(preview.stats.paletteFootprintCount).toBe(0);
+    expect(preview.stats.paletteFootprintFallbackCount).toBe(0);
     expect(preview.stats.paletteFilteredCount).toBe(0);
+    expect(preview.stats.paletteProxyCount).toBe(0);
     if (final.stats.unresolvedCount > 0) {
       expect(final.stats.paletteFootprintCount).toBeLessThanOrEqual(final.width * final.height - final.stats.unresolvedCount);
     } else {

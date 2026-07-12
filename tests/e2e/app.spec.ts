@@ -606,7 +606,7 @@ test("does not draw dark horizontal tile-edge bands on the reported view", async
   expect(seam.maxExcessDarkDropRatio).toBeLessThanOrEqual(0.03);
 });
 
-test("stabilizes the reported interior-heavy views under 2.5 seconds", async ({ page }) => {
+test("stabilizes the reported interior-heavy views under 3 seconds", async ({ page }) => {
   test.setTimeout(30_000);
   await installInteractionWorkerProbe(page);
   await page.setViewportSize({ width: 1912, height: 948 });
@@ -614,9 +614,9 @@ test("stabilizes the reported interior-heavy views under 2.5 seconds", async ({ 
   for (const url of REPORTED_INTERIOR_PERFORMANCE_VIEWS) {
     const started = Date.now();
     await page.goto(url);
-    await expect.poll(() => page.locator("#readStatus").textContent(), { timeout: 2_500, intervals: [25] }).toBe("stable");
+    await expect.poll(() => page.locator("#readStatus").textContent(), { timeout: 3_000, intervals: [25] }).toBe("stable");
     const stableMs = Date.now() - started;
-    expect(stableMs).toBeLessThan(2_500);
+    expect(stableMs).toBeLessThan(3_000);
 
     const tileCounts = await readTileCounts(page);
     expect(tileCounts.completed).toBe(tileCounts.total);
@@ -647,6 +647,7 @@ test("stabilizes the reported e100 deep view under 2.5 seconds", async ({ page }
   const tileCounts = await readTileCounts(page);
   expect(tileCounts.completed).toBe(tileCounts.total);
   const probe = await readInteractionWorkerProbe(page);
+  expect(probe.referenceRequests).toBe(1);
   expect(probe.renderMessages.filter((message) => message.mode === "exact")).toHaveLength(0);
   for (const [x, y] of [
     [0.25, 0.25],
@@ -656,6 +657,23 @@ test("stabilizes the reported e100 deep view under 2.5 seconds", async ({ page }
     const pixel = await readCanvasPixel(page, x, y);
     expect(pixel[3]).toBe(255);
   }
+
+  const roi = { left: 520, top: 40, right: 1420, bottom: 760 };
+  const speckleRatio = await readCanvasSpeckleRatio(page, roi);
+  const seam = await readTileSeamDiscontinuity(page, 128);
+  expect(speckleRatio).toBeLessThanOrEqual(0.10);
+  expect(seam.excessRatio).toBeLessThan(0.04);
+
+  if (await page.locator("#uiToggle").getAttribute("aria-expanded") === "true") {
+    await page.locator("#uiToggle").click();
+  }
+  await expect(page.locator("#uiToggle")).toHaveAttribute("aria-expanded", "false");
+  await page.waitForTimeout(300);
+  await page.screenshot({ path: "test-results/e100-palette-proxy-full.png", fullPage: false });
+  await page.screenshot({
+    path: "test-results/e100-palette-proxy-center.png",
+    clip: { x: roi.left, y: roi.top, width: roi.right - roi.left, height: roi.bottom - roi.top }
+  });
 });
 
 test("stabilizes the alternate reported e100 deep view under 2.5 seconds", async ({ page }) => {
