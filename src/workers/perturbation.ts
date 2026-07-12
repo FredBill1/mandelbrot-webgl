@@ -68,11 +68,9 @@ interface LinearColor {
   b: number;
 }
 
-interface BoundaryStats {
-  distanceEstimatedCount: number;
+interface PaletteFilterStats {
+  paletteFootprintCount: number;
   paletteFilteredCount: number;
-  distanceColorizedCount: number;
-  boundaryCoverageCount: number;
   maxPaletteFootprint: number;
 }
 
@@ -87,24 +85,16 @@ const ZERO_SERIES_PLAN: ReturnType<typeof buildSeriesPlan> = {
   coeffIm: new Float64Array(1)
 };
 const DISTANCE_EXTRA_ITERATIONS = 1;
-const DISTANCE_COVERAGE_NONE_PX = 0.75;
-const DISTANCE_COVERAGE_STRENGTH = 0.5;
 const INTERIOR_COLOR = { r: 4, g: 8, b: 16 } as const;
 const PALETTE_SIZE = 2048;
 const PALETTE_CYCLE_SCALE = 0.018;
 const PALETTE_FILTER_LOW = 0.25;
 const PALETTE_FILTER_HIGH = 0.5;
-const DISTANCE_COLOR_FILTER_LOW = 0.5;
-const DISTANCE_COLOR_FILTER_HIGH = 1.0;
-const DISTANCE_COLOR_FULL_PX = 0.5;
-const DISTANCE_COLOR_NONE_PX = 2.0;
-const DISTANCE_COLOR_PALETTE_PHASE = 0.64;
+const DIAGONAL_OFFSETS = [[-1, -1], [1, -1], [-1, 1], [1, 1]] as const;
 const COSINE_PALETTE = createCosinePalette(PALETTE_SIZE);
 const SRGB_TO_LINEAR_LUT = createSrgbToLinearLut();
 const PALETTE_LINEAR_SAMPLES = createLinearPaletteSamples(COSINE_PALETTE);
 const PALETTE_LINEAR_PREFIX = createLinearPalettePrefix(PALETTE_LINEAR_SAMPLES);
-const DISTANCE_EDGE_LINEAR_COLOR = paletteLinearColorAtPhase(DISTANCE_COLOR_PALETTE_PHASE);
-const INTERIOR_LINEAR_COLOR = byteColorToLinear(INTERIOR_COLOR);
 const INV_LN2 = 1 / Math.LN2;
 const SMOOTH_LOG_SCALE = 0.5 * INV_LN2;
 
@@ -154,7 +144,7 @@ export function renderPerturbationTile(message: RenderTileMessage): TileDoneMess
   const unresolvedMask = new Uint8Array(width * height);
   const escapedMask = message.renderMode === "final" ? new Uint8Array(width * height) : undefined;
   const smoothValues = message.renderMode === "final" ? new Float32Array(width * height) : undefined;
-  const distanceValues = message.renderMode === "final" ? new Float32Array(width * height).fill(-1) : undefined;
+  const paletteFootprints = message.renderMode === "final" ? new Float32Array(width * height).fill(-1) : undefined;
   const screenXs = new Float64Array(width);
   const screenYs = new Float64Array(height);
   for (let px = 0; px < width; px += 1) {
@@ -200,26 +190,25 @@ export function renderPerturbationTile(message: RenderTileMessage): TileDoneMess
       }
       const smooth = smoothIteration(result.iter, maxIter, result.mag2);
       if (smoothValues) smoothValues[pixelIndex] = smooth;
-      if (distanceValues) distanceValues[pixelIndex] = result.distancePx;
       writeColorForSmooth(rgba, offset, result.iter >= maxIter, smooth);
     }
   }
 
   if (message.renderMode === "final") {
-    estimateDistancesFromSmooth(distanceValues!, smoothValues!, escapedMask!, unresolvedMask, width, height);
+    estimatePaletteFootprintsFromSmooth(paletteFootprints!, smoothValues!, escapedMask!, unresolvedMask, width, height);
   }
 
-  const boundaryStats = message.renderMode === "final"
-    ? applyBandlimitedBoundaryShading(
+  const paletteFilterStats = message.renderMode === "final"
+    ? applyBandlimitedPaletteShading(
         rgba,
         smoothValues!,
-        distanceValues!,
+        paletteFootprints!,
         escapedMask!,
         unresolvedMask,
         width,
         height
       )
-    : emptyBoundaryStats();
+    : emptyPaletteFilterStats();
 
   const unresolvedMaskOutput =
     message.renderMode === "final" && unresolvedCount > 0 ? unresolvedMask.slice().buffer : undefined;
@@ -261,11 +250,9 @@ export function renderPerturbationTile(message: RenderTileMessage): TileDoneMess
       referenceCacheMissCount: 0,
       seriesSkip,
       seriesReplayPixels,
-      distanceEstimatedCount: boundaryStats.distanceEstimatedCount,
-      paletteFilteredCount: boundaryStats.paletteFilteredCount,
-      distanceColorizedCount: boundaryStats.distanceColorizedCount,
-      boundaryCoverageCount: boundaryStats.boundaryCoverageCount,
-      maxPaletteFootprint: boundaryStats.maxPaletteFootprint,
+      paletteFootprintCount: paletteFilterStats.paletteFootprintCount,
+      paletteFilteredCount: paletteFilterStats.paletteFilteredCount,
+      maxPaletteFootprint: paletteFilterStats.maxPaletteFootprint,
       referenceId: referenceIdsUsed[0] ?? contexts[0]?.reference.id ?? "",
       referenceIdsUsed,
       unresolvedScreenX,
@@ -703,62 +690,49 @@ function clusterBounds(cluster: ClusterAccumulator): { x: number; y: number; wid
   return { x: left, y: top, width: right - left, height: bottom - top };
 }
 
-function applyBandlimitedBoundaryShading(
+function applyBandlimitedPaletteShading(
   buffer: Uint8ClampedArray,
   smoothValues: Float32Array,
-  distanceValues: Float32Array,
+  paletteFootprints: Float32Array,
   escapedMask: Uint8Array,
   unresolvedMask: Uint8Array,
   width: number,
   height: number
-): BoundaryStats {
+): PaletteFilterStats {
   const pixelCount = width * height;
-  if (pixelCount === 0 || smoothValues.length < pixelCount || distanceValues.length < pixelCount) return emptyBoundaryStats();
-  let distanceEstimatedCount = 0;
+  if (pixelCount === 0 || smoothValues.length < pixelCount || paletteFootprints.length < pixelCount) return emptyPaletteFilterStats();
+  let paletteFootprintCount = 0;
   let paletteFilteredCount = 0;
-  let distanceColorizedCount = 0;
-  let boundaryCoverageCount = 0;
   let maxPaletteFootprint = 0;
 
   for (let index = 0; index < pixelCount; index += 1) {
     if (unresolvedMask[index] !== 0 || escapedMask[index] === 0) continue;
-    const distancePx = distanceValues[index];
-    if (!Number.isFinite(distancePx) || distancePx < 0) continue;
-    distanceEstimatedCount += 1;
-    const footprint = PALETTE_CYCLE_SCALE / (Math.LN2 * Math.max(distancePx, Number.EPSILON));
+    const footprint = paletteFootprints[index];
+    if (!Number.isFinite(footprint) || footprint < 0) continue;
+    paletteFootprintCount += 1;
     maxPaletteFootprint = Math.max(maxPaletteFootprint, footprint);
-    const offset = index * 4;
-    let color = byteColorToLinear({
-      r: buffer[offset],
-      g: buffer[offset + 1],
-      b: buffer[offset + 2]
-    });
 
     const filterAmount = smoothstep(PALETTE_FILTER_LOW, PALETTE_FILTER_HIGH, footprint);
-    if (filterAmount > 0) {
-      color = blendLinearColor(color, integratedPaletteLinearColor(smoothValues[index], footprint), filterAmount);
-      paletteFilteredCount += 1;
-    }
-
-    const distanceColorAmount = distanceColorWeight(footprint, distancePx);
-    if (distanceColorAmount > 0) {
-      color = blendLinearColor(color, DISTANCE_EDGE_LINEAR_COLOR, distanceColorAmount);
-      distanceColorizedCount += 1;
-    }
-
-    const coverage = boundaryCoverageWeight(distancePx);
-    if (coverage > 0) {
-      color = blendLinearColor(color, INTERIOR_LINEAR_COLOR, coverage);
-      boundaryCoverageCount += 1;
-    }
+    if (filterAmount <= 0) continue;
+    const offset = index * 4;
+    const color = blendLinearColor(
+      byteColorToLinear({
+        r: buffer[offset],
+        g: buffer[offset + 1],
+        b: buffer[offset + 2]
+      }),
+      integratedPaletteLinearColor(smoothValues[index], footprint),
+      filterAmount
+    );
+    paletteFilteredCount += 1;
     writeLinearColor(buffer, offset, color);
   }
 
-  return { distanceEstimatedCount, paletteFilteredCount, distanceColorizedCount, boundaryCoverageCount, maxPaletteFootprint };
+  return { paletteFootprintCount, paletteFilteredCount, maxPaletteFootprint };
 }
 
-function estimateDistancesFromSmooth(
-  distanceValues: Float32Array,
+function estimatePaletteFootprintsFromSmooth(
+  paletteFootprints: Float32Array,
   smoothValues: Float32Array,
   escapedMask: Uint8Array,
   unresolvedMask: Uint8Array,
@@ -780,26 +754,29 @@ function estimateDistancesFromSmooth(
       const right = x + 1 < width ? neighbor(x + 1, y) : undefined;
       const top = y > 0 ? neighbor(x, y - 1) : undefined;
       const bottom = y + 1 < height ? neighbor(x, y + 1) : undefined;
-      const gradientX = left !== undefined
-        ? right !== undefined ? (right - left) * 0.5 : center - left
-        : right !== undefined ? right - center : Number.POSITIVE_INFINITY;
-      const gradientY = top !== undefined
-        ? bottom !== undefined ? (bottom - top) * 0.5 : center - top
-        : bottom !== undefined ? bottom - center : Number.POSITIVE_INFINITY;
-      const gradient = Math.hypot(gradientX, gradientY);
-      distanceValues[index] = Number.isFinite(gradient) && gradient > Number.EPSILON
-        ? 1 / (Math.LN2 * gradient)
-        : gradient === Number.POSITIVE_INFINITY ? 0 : Number.MAX_VALUE;
+      const gradientX = left !== undefined || right !== undefined
+        ? Math.max(left === undefined ? 0 : Math.abs(center - left), right === undefined ? 0 : Math.abs(right - center))
+        : Number.POSITIVE_INFINITY;
+      const gradientY = top !== undefined || bottom !== undefined
+        ? Math.max(top === undefined ? 0 : Math.abs(center - top), bottom === undefined ? 0 : Math.abs(bottom - center))
+        : Number.POSITIVE_INFINITY;
+      let gradient = Math.hypot(gradientX, gradientY);
+      for (const [dx, dy] of DIAGONAL_OFFSETS) {
+        const nx = x + dx;
+        const ny = y + dy;
+        if (nx < 0 || ny < 0 || nx >= width || ny >= height) continue;
+        const diagonal = neighbor(nx, ny);
+        if (diagonal !== undefined) gradient = Math.max(gradient, Math.abs(diagonal - center) * Math.SQRT1_2);
+      }
+      paletteFootprints[index] = paletteFootprintFromGradient(gradient);
     }
   }
 }
 
-function emptyBoundaryStats(): BoundaryStats {
+function emptyPaletteFilterStats(): PaletteFilterStats {
   return {
-    distanceEstimatedCount: 0,
+    paletteFootprintCount: 0,
     paletteFilteredCount: 0,
-    distanceColorizedCount: 0,
-    boundaryCoverageCount: 0,
     maxPaletteFootprint: 0
   };
 }
@@ -958,12 +935,8 @@ export function paletteFilterWeightForTests(footprint: number): number {
   return smoothstep(PALETTE_FILTER_LOW, PALETTE_FILTER_HIGH, footprint);
 }
 
-export function distanceColorWeightForTests(footprint: number, distancePx = Number.MAX_VALUE): number {
-  return distanceColorWeight(footprint, distancePx);
-}
-
-export function boundaryCoverageWeightForTests(distancePx: number): number {
-  return boundaryCoverageWeight(distancePx);
+export function paletteFootprintFromGradientForTests(gradientX: number, gradientY: number): number {
+  return paletteFootprintFromGradient(Math.hypot(gradientX, gradientY));
 }
 
 export function samplePaletteForTests(smooth: number): readonly [number, number, number] {
@@ -971,13 +944,13 @@ export function samplePaletteForTests(smooth: number): readonly [number, number,
   return [COSINE_PALETTE[offset], COSINE_PALETTE[offset + 1], COSINE_PALETTE[offset + 2]] as const;
 }
 
-export function shadeBoundaryPixelForTests(smooth: number, distancePx: number): readonly [number, number, number] {
+export function shadePaletteFootprintForTests(smooth: number, footprint: number): readonly [number, number, number] {
   const buffer = new Uint8ClampedArray(4);
   writeColorForSmooth(buffer, 0, false, smooth);
-  applyBandlimitedBoundaryShading(
+  applyBandlimitedPaletteShading(
     buffer,
     Float32Array.of(smooth),
-    Float32Array.of(distancePx),
+    Float32Array.of(footprint),
     Uint8Array.of(1),
     Uint8Array.of(0),
     1,
@@ -1004,25 +977,9 @@ function paletteIndex(smooth: number): number {
   return Math.min(PALETTE_SIZE - 1, Math.max(0, Math.floor(fraction * PALETTE_SIZE)));
 }
 
-function paletteLinearColorAtPhase(phase: number): LinearColor {
-  const fraction = phase - Math.floor(phase);
-  const index = Math.min(PALETTE_SIZE - 1, Math.max(0, Math.floor(fraction * PALETTE_SIZE)));
-  const offset = index * 3;
-  return {
-    r: PALETTE_LINEAR_SAMPLES[offset],
-    g: PALETTE_LINEAR_SAMPLES[offset + 1],
-    b: PALETTE_LINEAR_SAMPLES[offset + 2]
-  };
-}
-
-function distanceColorWeight(footprint: number, distancePx: number): number {
-  const aliasWeight = smoothstep(DISTANCE_COLOR_FILTER_LOW, DISTANCE_COLOR_FILTER_HIGH, footprint);
-  const proximityWeight = 1 - smoothstep(DISTANCE_COLOR_FULL_PX, DISTANCE_COLOR_NONE_PX, distancePx);
-  return Math.max(aliasWeight, proximityWeight);
-}
-
-function boundaryCoverageWeight(distancePx: number): number {
-  return DISTANCE_COVERAGE_STRENGTH * (1 - smoothstep(0, DISTANCE_COVERAGE_NONE_PX, distancePx));
+function paletteFootprintFromGradient(gradient: number): number {
+  if (gradient === Number.POSITIVE_INFINITY) return 1;
+  return Number.isFinite(gradient) && gradient > Number.EPSILON ? PALETTE_CYCLE_SCALE * gradient : 0;
 }
 
 function smoothIteration(iter: number, maxIter: number, mag2: number): number {

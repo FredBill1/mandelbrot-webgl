@@ -4,13 +4,12 @@ import init, { apply_view_transform, compute_reference, compute_reference_3mul, 
 import { createVisibleTileShells } from "../src/tiles/tileKey";
 import { buildSeriesPlan, evaluateSeriesWithDerivative, type SeriesPlan } from "../src/math/series";
 import {
-  boundaryCoverageWeightForTests,
-  distanceColorWeightForTests,
   paletteFilterWeightForTests,
+  paletteFootprintFromGradientForTests,
   renderPerturbationTile,
   sampleIntegratedPaletteForTests,
   samplePaletteForTests,
-  shadeBoundaryPixelForTests
+  shadePaletteFootprintForTests
 } from "../src/workers/perturbation";
 import { renderPerturbationTileWasm, resetWasmPerturbationCacheForTests } from "../src/workers/wasmPerturbation";
 import { SERIES_DEGREE, type ReferenceSnapshot, type RenderTileMessage, type TileDescriptor } from "../src/types";
@@ -59,33 +58,17 @@ describe("perturbation renderer", () => {
     expect(paletteFilterWeightForTests(0.3749)).toBeLessThan(paletteFilterWeightForTests(0.3751));
   });
 
-  it("uses a continuous super-Nyquist transition for distance color", () => {
-    expect(distanceColorWeightForTests(0.5)).toBe(0);
-    expect(distanceColorWeightForTests(1)).toBe(1);
-    expect(distanceColorWeightForTests(0.75)).toBeCloseTo(0.5, 12);
-    expect(distanceColorWeightForTests(0.7499)).toBeLessThan(distanceColorWeightForTests(0.7501));
+  it("computes palette footprint directly from the smooth-value gradient", () => {
+    expect(paletteFootprintFromGradientForTests(3, 4)).toBeCloseTo(0.09, 12);
+    expect(paletteFootprintFromGradientForTests(0, 0)).toBe(0);
+    expect(paletteFootprintFromGradientForTests(Number.POSITIVE_INFINITY, 0)).toBe(1);
   });
 
-  it("turns the former desaturated distance band into a smooth color contour", () => {
-    expect(distanceColorWeightForTests(0, 0.5)).toBe(1);
-    expect(distanceColorWeightForTests(0, 2)).toBe(0);
-    expect(distanceColorWeightForTests(0, 1.25)).toBeCloseTo(0.5, 12);
-  });
-
-  it("limits exterior-pixel interior coverage to one half", () => {
-    expect(boundaryCoverageWeightForTests(0)).toBe(0.5);
-    expect(boundaryCoverageWeightForTests(0.75)).toBe(0);
-    expect(boundaryCoverageWeightForTests(0.375)).toBeCloseTo(0.25, 12);
-    expect(boundaryCoverageWeightForTests(1)).toBe(0);
-  });
-
-  it("preserves resolved palette colors and keeps super-Nyquist pixels chromatic", () => {
+  it("preserves resolved palette colors and analytically averages super-Nyquist pixels", () => {
     const smooth = 37.25;
-    expect(shadeBoundaryPixelForTests(smooth, 10)).toEqual(samplePaletteForTests(smooth));
-
-    const colorized = shadeBoundaryPixelForTests(smooth, 1e-6);
-    const chroma = Math.max(...colorized) - Math.min(...colorized);
-    expect(chroma).toBeGreaterThanOrEqual(80);
+    expect(shadePaletteFootprintForTests(smooth, 0.25)).toEqual(samplePaletteForTests(smooth));
+    expect(shadePaletteFootprintForTests(smooth, 0.5)).toEqual(sampleIntegratedPaletteForTests(smooth, 0.5));
+    expect(shadePaletteFootprintForTests(smooth, 1)).toEqual(sampleIntegratedPaletteForTests(smooth, 1));
   });
 
   it.each([
@@ -199,10 +182,8 @@ describe("perturbation renderer", () => {
       expect(wasmResult.stats.rebaseLimitCount).toBe(tsResult.stats.rebaseLimitCount);
       expect(wasmResult.stats.seriesSkip).toBe(tsResult.stats.seriesSkip);
       expect(wasmResult.stats.seriesReplayPixels).toBe(tsResult.stats.seriesReplayPixels);
-      expect(wasmResult.stats.distanceEstimatedCount).toBe(tsResult.stats.distanceEstimatedCount);
+      expect(wasmResult.stats.paletteFootprintCount).toBe(tsResult.stats.paletteFootprintCount);
       expect(wasmResult.stats.paletteFilteredCount).toBe(tsResult.stats.paletteFilteredCount);
-      expect(wasmResult.stats.distanceColorizedCount).toBe(tsResult.stats.distanceColorizedCount);
-      expect(wasmResult.stats.boundaryCoverageCount).toBe(tsResult.stats.boundaryCoverageCount);
       expect(wasmResult.stats.maxPaletteFootprint).toBeCloseTo(tsResult.stats.maxPaletteFootprint, 5);
       expect(wasmResult.stats.referenceIdsUsed).toEqual(tsResult.stats.referenceIdsUsed);
       expect(wasmResult.stats.unresolvedClusters.map(legacyClusterFields)).toEqual(tsResult.stats.unresolvedClusters.map(legacyClusterFields));
@@ -340,7 +321,7 @@ describe("perturbation renderer", () => {
     });
 
     expect(result.stats.unresolvedCount).toBe(0);
-    expect(result.stats.distanceEstimatedCount).toBeLessThanOrEqual(result.width * result.height);
+    expect(result.stats.paletteFootprintCount).toBeLessThanOrEqual(result.width * result.height);
   });
 
   it("resolves the early-reference regression pixel after rebasing to that location", () => {
@@ -416,9 +397,8 @@ describe("perturbation renderer", () => {
     });
 
     expect(new Uint8Array(rebased.rgba)).toEqual(new Uint8Array(onePass.rgba));
+    expect(rebased.stats.paletteFootprintCount).toBe(onePass.stats.paletteFootprintCount);
     expect(rebased.stats.paletteFilteredCount).toBe(onePass.stats.paletteFilteredCount);
-    expect(rebased.stats.distanceColorizedCount).toBe(onePass.stats.distanceColorizedCount);
-    expect(rebased.stats.boundaryCoverageCount).toBe(onePass.stats.boundaryCoverageCount);
   });
 
   it("uses safe series or adaptive unresolved clusters for the 1170x784 near-real performance regression", () => {
@@ -503,17 +483,16 @@ describe("perturbation renderer", () => {
 
     expect(final.stats.escapedPixels).toBe(preview.stats.escapedPixels);
     expect(final.stats.unresolvedCount).toBe(preview.stats.unresolvedCount);
-    expect(preview.stats.distanceEstimatedCount).toBe(0);
+    expect(preview.stats.paletteFootprintCount).toBe(0);
     expect(preview.stats.paletteFilteredCount).toBe(0);
-    expect(preview.stats.distanceColorizedCount).toBe(0);
     if (final.stats.unresolvedCount > 0) {
-      expect(final.stats.distanceEstimatedCount).toBeLessThanOrEqual(final.width * final.height - final.stats.unresolvedCount);
+      expect(final.stats.paletteFootprintCount).toBeLessThanOrEqual(final.width * final.height - final.stats.unresolvedCount);
     } else {
-      expect(final.stats.distanceEstimatedCount).toBeGreaterThan(0);
+      expect(final.stats.paletteFootprintCount).toBeGreaterThan(0);
     }
   });
 
-  it("keeps distance-estimator bandlimiting for completed final tiles", () => {
+  it("keeps palette-footprint bandlimiting for completed final tiles", () => {
     const view = {
       re: "-7.5e-1",
       im: "1e-1",
@@ -549,8 +528,8 @@ describe("perturbation renderer", () => {
     expect(result.stats.unresolvedCount).toBe(0);
     expect(result.stats.escapedPixels).toBeGreaterThan(0);
     expect(result.stats.escapedPixels).toBeLessThan(result.width * result.height);
-    expect(result.stats.distanceEstimatedCount).toBeGreaterThan(0);
-    expect(result.stats.boundaryCoverageCount).toBeGreaterThan(0);
+    expect(result.stats.paletteFootprintCount).toBeGreaterThan(0);
+    expect(result.stats.maxPaletteFootprint).toBeGreaterThan(0);
   });
 
   it("does not certify the reported 1e27 false periodic sample in the WASM cached renderer", async () => {

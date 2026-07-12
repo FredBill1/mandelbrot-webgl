@@ -111,10 +111,8 @@ export interface TileStats {
   referenceCacheMissCount: number;
   seriesSkip: number;
   seriesReplayPixels: number;
-  distanceEstimatedCount: number;
+  paletteFootprintCount: number;
   paletteFilteredCount: number;
-  distanceColorizedCount: number;
-  boundaryCoverageCount: number;
   maxPaletteFootprint: number;
   referenceId: string;
   referenceIdsUsed: string[];

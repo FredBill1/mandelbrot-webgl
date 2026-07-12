@@ -685,11 +685,9 @@ struct LinearColor64 {
 }
 
 #[derive(Clone, Copy)]
-struct BoundaryStats64 {
-    distance_estimated_count: u32,
+struct PaletteFilterStats64 {
+    palette_footprint_count: u32,
     palette_filtered_count: u32,
-    distance_colorized_count: u32,
-    boundary_coverage_count: u32,
     max_palette_footprint: f64,
 }
 
@@ -735,8 +733,6 @@ const RENDER_SERIES_ERROR_SCALE: f64 = 2.9e-2;
 const RENDER_SERIES_SKIP_SATURATION: f64 = 0.7;
 const RENDER_SERIES_PIXEL_ERROR_SCALE: f64 = 0.25;
 const RENDER_DISTANCE_EXTRA_ITERATIONS: u32 = 1;
-const RENDER_DISTANCE_COVERAGE_NONE_PX: f64 = 0.75;
-const RENDER_DISTANCE_COVERAGE_STRENGTH: f64 = 0.5;
 const RENDER_INTERIOR_R: u8 = 4;
 const RENDER_INTERIOR_G: u8 = 8;
 const RENDER_INTERIOR_B: u8 = 16;
@@ -744,11 +740,6 @@ const RENDER_PALETTE_SIZE: usize = 2048;
 const RENDER_PALETTE_CYCLE_SCALE: f64 = 0.018;
 const RENDER_PALETTE_FILTER_LOW: f64 = 0.25;
 const RENDER_PALETTE_FILTER_HIGH: f64 = 0.5;
-const RENDER_DISTANCE_COLOR_FILTER_LOW: f64 = 0.5;
-const RENDER_DISTANCE_COLOR_FILTER_HIGH: f64 = 1.0;
-const RENDER_DISTANCE_COLOR_FULL_PX: f64 = 0.5;
-const RENDER_DISTANCE_COLOR_NONE_PX: f64 = 2.0;
-const RENDER_DISTANCE_COLOR_PALETTE_PHASE: f64 = 0.64;
 const RENDER_INV_LN2: f64 = std::f64::consts::LOG2_E;
 const RENDER_SMOOTH_LOG_SCALE: f64 = 0.5 * std::f64::consts::LOG2_E;
 const RENDER_REFERENCE_INTERIOR_RADIUS_SAFETY: f64 = 0.90;
@@ -815,7 +806,7 @@ pub fn render_tile_cached(
     refinement_base_rgba: Uint8Array,
     refinement_mask: Uint8Array,
     refinement_smooth_values: Float32Array,
-    refinement_distance_values: Float32Array,
+    refinement_palette_footprints: Float32Array,
     refinement_escaped_mask: Uint8Array,
 ) -> Result<JsValue, JsValue> {
     let started = js_sys::Date::now();
@@ -841,7 +832,7 @@ pub fn render_tile_cached(
             refinement_base_rgba,
             refinement_mask,
             refinement_smooth_values,
-            refinement_distance_values,
+            refinement_palette_footprints,
             refinement_escaped_mask,
         )
     } else {
@@ -853,14 +844,14 @@ pub fn render_tile_cached(
         mut rgba,
         refinement_mask,
         refinement_smooth_values,
-        refinement_distance_values,
+        refinement_palette_footprints,
         refinement_escaped_mask,
     ) = if let Some(input) = refinement_input {
         (
             input.rgba,
             Some(input.mask),
             Some(input.smooth_values),
-            Some(input.distance_values),
+            Some(input.palette_footprints),
             Some(input.escaped_mask),
         )
     } else {
@@ -904,8 +895,8 @@ pub fn render_tile_cached(
     } else {
         None
     };
-    let mut distance_values = if render_mode == "final" {
-        Some(refinement_distance_values.unwrap_or_else(|| vec![-1f32; width * height]))
+    let mut palette_footprints = if render_mode == "final" {
+        Some(refinement_palette_footprints.unwrap_or_else(|| vec![-1f32; width * height]))
     } else {
         None
     };
@@ -1025,9 +1016,6 @@ pub fn render_tile_cached(
             if let Some(values) = smooth_values.as_mut() {
                 values[pixel_index] = smooth as f32;
             }
-            if let Some(values) = distance_values.as_mut() {
-                values[pixel_index] = result.distance_px as f32;
-            }
             write_render_color_for_smooth(
                 &mut rgba,
                 offset,
@@ -1039,8 +1027,8 @@ pub fn render_tile_cached(
     }
 
     if render_mode == "final" {
-        estimate_render_distances_from_smooth(
-            distance_values.as_mut().unwrap(),
+        estimate_render_palette_footprints_from_smooth(
+            palette_footprints.as_mut().unwrap(),
             smooth_values.as_ref().unwrap(),
             escaped_mask.as_ref().unwrap(),
             &unresolved_mask,
@@ -1050,11 +1038,11 @@ pub fn render_tile_cached(
         );
     }
 
-    let boundary_stats = if render_mode == "final" {
-        apply_render_bandlimited_shading(
+    let palette_filter_stats = if render_mode == "final" {
+        apply_render_bandlimited_palette_shading(
             &mut rgba,
             smooth_values.as_ref().unwrap(),
-            distance_values.as_ref().unwrap(),
+            palette_footprints.as_ref().unwrap(),
             escaped_mask.as_ref().unwrap(),
             &unresolved_mask,
             refinement_mask.as_deref(),
@@ -1063,7 +1051,7 @@ pub fn render_tile_cached(
             palette.as_ref(),
         )
     } else {
-        empty_render_boundary_stats()
+        empty_render_palette_filter_stats()
     };
     if let (Some(cap_mask), Some(escaped_mask)) =
         (cap_hit_unknown_mask.as_ref(), escaped_mask.as_ref())
@@ -1083,8 +1071,8 @@ pub fn render_tile_cached(
     } else {
         None
     };
-    let refinement_distance_values_output = if render_mode == "final" && unresolved_count > 0 {
-        distance_values.clone()
+    let refinement_palette_footprints_output = if render_mode == "final" && unresolved_count > 0 {
+        palette_footprints.clone()
     } else {
         None
     };
@@ -1120,7 +1108,7 @@ pub fn render_tile_cached(
         rgba,
         unresolved_mask_output,
         refinement_smooth_values_output,
-        refinement_distance_values_output,
+        refinement_palette_footprints_output,
         refinement_escaped_mask_output,
         unresolved_clusters,
         elapsed_ms,
@@ -1135,7 +1123,7 @@ pub fn render_tile_cached(
         bla_step_count,
         series_replay_pixels,
         series_skip as u32,
-        boundary_stats,
+        palette_filter_stats,
         reference_ids_used,
         if unresolved_count > 0 {
             Some(unresolved_screen_x_sum / unresolved_count as f64)
@@ -1203,7 +1191,7 @@ pub fn render_tile_exact(
     let mut cap_hit_unknown_mask = vec![0u8; width * height];
     let unresolved_mask = vec![0u8; width * height];
     let mut smooth_values = vec![0f32; width * height];
-    let mut distance_values = vec![-1f32; width * height];
+    let mut palette_footprints = vec![-1f32; width * height];
 
     for py in 0..height {
         let screen_y = (rect.y + rect.height - 0.5).min(rect.y + py as f64 + 0.5);
@@ -1223,7 +1211,7 @@ pub fn render_tile_exact(
                 escaped_pixels += 1;
                 record_render_escaped_iter(&mut iter_stats, exact.iter, max_iter);
                 escaped_mask[pixel_index] = 1;
-                distance_values[pixel_index] = exact.distance_px as f32;
+                palette_footprints[pixel_index] = render_palette_footprint_from_distance(exact.distance_px) as f32;
             } else {
                 iter_stats.cap_hit_unknown_count += 1;
                 cap_hit_unknown_mask[pixel_index] = 1;
@@ -1241,10 +1229,10 @@ pub fn render_tile_exact(
     }
     iter_stats.cap_hit_boundary_count =
         count_render_cap_hit_boundary(&cap_hit_unknown_mask, &escaped_mask, &unresolved_mask, width, height);
-    let boundary_stats = apply_render_bandlimited_shading(
+    let palette_filter_stats = apply_render_bandlimited_palette_shading(
         &mut rgba,
         &smooth_values,
-        &distance_values,
+        &palette_footprints,
         &escaped_mask,
         &unresolved_mask,
         mask.as_deref(),
@@ -1278,7 +1266,7 @@ pub fn render_tile_exact(
         0,
         0,
         0,
-        boundary_stats,
+        palette_filter_stats,
         Vec::new(),
         None,
         None,
@@ -1296,7 +1284,7 @@ struct RefinementInput {
     rgba: Vec<u8>,
     mask: Vec<u8>,
     smooth_values: Vec<f32>,
-    distance_values: Vec<f32>,
+    palette_footprints: Vec<f32>,
     escaped_mask: Vec<u8>,
 }
 
@@ -1321,7 +1309,7 @@ fn prepare_refinement_input(
     base_rgba: Uint8Array,
     refinement_mask: Uint8Array,
     refinement_smooth_values: Float32Array,
-    refinement_distance_values: Float32Array,
+    refinement_palette_footprints: Float32Array,
     refinement_escaped_mask: Uint8Array,
 ) -> Option<RefinementInput> {
     let pixel_count = width * height;
@@ -1336,8 +1324,8 @@ fn prepare_refinement_input(
         rgba: base_rgba.to_vec(),
         mask: refinement_mask.to_vec(),
         smooth_values: refinement_smooth_values.to_vec(),
-        distance_values: if refinement_distance_values.length() as usize == pixel_count {
-            refinement_distance_values.to_vec()
+        palette_footprints: if refinement_palette_footprints.length() as usize == pixel_count {
+            refinement_palette_footprints.to_vec()
         } else {
             vec![-1f32; pixel_count]
         },
@@ -1760,7 +1748,7 @@ fn build_render_tile_value(
     rgba: Vec<u8>,
     unresolved_mask: Option<Vec<u8>>,
     refinement_smooth_values: Option<Vec<f32>>,
-    refinement_distance_values: Option<Vec<f32>>,
+    refinement_palette_footprints: Option<Vec<f32>>,
     refinement_escaped_mask: Option<Vec<u8>>,
     unresolved_clusters: Vec<UnresolvedCluster64>,
     elapsed_ms: f64,
@@ -1775,7 +1763,7 @@ fn build_render_tile_value(
     bla_step_count: u32,
     series_replay_pixels: u32,
     series_skip: u32,
-    boundary_stats: BoundaryStats64,
+    palette_filter_stats: PaletteFilterStats64,
     reference_ids_used: Vec<String>,
     unresolved_screen_x: Option<f64>,
     unresolved_screen_y: Option<f64>,
@@ -1799,9 +1787,9 @@ fn build_render_tile_value(
         let values_array = Float32Array::from(values.as_slice());
         set_js_property(&object, "refinementSmoothValues", &values_array.buffer().into())?;
     }
-    if let Some(values) = refinement_distance_values {
+    if let Some(values) = refinement_palette_footprints {
         let values_array = Float32Array::from(values.as_slice());
-        set_js_property(&object, "refinementDistanceValues", &values_array.buffer().into())?;
+        set_js_property(&object, "refinementPaletteFootprints", &values_array.buffer().into())?;
     }
     if let Some(mask) = refinement_escaped_mask {
         let mask_array = Uint8Array::from(mask.as_slice());
@@ -1889,28 +1877,18 @@ fn build_render_tile_value(
     )?;
     set_js_property(
         &stats,
-        "distanceEstimatedCount",
-        &JsValue::from_f64(boundary_stats.distance_estimated_count as f64),
+        "paletteFootprintCount",
+        &JsValue::from_f64(palette_filter_stats.palette_footprint_count as f64),
     )?;
     set_js_property(
         &stats,
         "paletteFilteredCount",
-        &JsValue::from_f64(boundary_stats.palette_filtered_count as f64),
-    )?;
-    set_js_property(
-        &stats,
-        "distanceColorizedCount",
-        &JsValue::from_f64(boundary_stats.distance_colorized_count as f64),
-    )?;
-    set_js_property(
-        &stats,
-        "boundaryCoverageCount",
-        &JsValue::from_f64(boundary_stats.boundary_coverage_count as f64),
+        &JsValue::from_f64(palette_filter_stats.palette_filtered_count as f64),
     )?;
     set_js_property(
         &stats,
         "maxPaletteFootprint",
-        &JsValue::from_f64(boundary_stats.max_palette_footprint),
+        &JsValue::from_f64(palette_filter_stats.max_palette_footprint),
     )?;
     let used_ids = Array::new();
     for id in &reference_ids_used {
@@ -2913,8 +2891,8 @@ fn failure_kind_key(index: usize) -> &'static str {
     }
 }
 
-fn estimate_render_distances_from_smooth(
-    distance_values: &mut [f32],
+fn estimate_render_palette_footprints_from_smooth(
+    palette_footprints: &mut [f32],
     smooth_values: &[f32],
     escaped_mask: &[u8],
     unresolved_mask: &[u8],
@@ -2923,7 +2901,7 @@ fn estimate_render_distances_from_smooth(
     height: usize,
 ) {
     let pixel_count = width * height;
-    if distance_values.len() < pixel_count
+    if palette_footprints.len() < pixel_count
         || smooth_values.len() < pixel_count
         || escaped_mask.len() < pixel_count
         || unresolved_mask.len() < pixel_count
@@ -2950,54 +2928,60 @@ fn estimate_render_distances_from_smooth(
             let top = (y > 0).then(|| neighbor(x, y - 1)).flatten();
             let bottom = (y + 1 < height).then(|| neighbor(x, y + 1)).flatten();
             let gradient_x = match (left, right) {
-                (Some(a), Some(b)) => (b - a) * 0.5,
-                (Some(a), None) => center - a,
-                (None, Some(b)) => b - center,
+                (Some(a), Some(b)) => (center - a).abs().max((b - center).abs()),
+                (Some(a), None) => (center - a).abs(),
+                (None, Some(b)) => (b - center).abs(),
                 (None, None) => f64::INFINITY,
             };
             let gradient_y = match (top, bottom) {
-                (Some(a), Some(b)) => (b - a) * 0.5,
-                (Some(a), None) => center - a,
-                (None, Some(b)) => b - center,
+                (Some(a), Some(b)) => (center - a).abs().max((b - center).abs()),
+                (Some(a), None) => (center - a).abs(),
+                (None, Some(b)) => (b - center).abs(),
                 (None, None) => f64::INFINITY,
             };
-            let gradient = gradient_x.hypot(gradient_y);
-            distance_values[index] = if gradient.is_finite() && gradient > f64::EPSILON {
-                (1.0 / (std::f64::consts::LN_2 * gradient)) as f32
+            let mut gradient = gradient_x.hypot(gradient_y);
+            for (dx, dy) in [(-1isize, -1isize), (1, -1), (-1, 1), (1, 1)] {
+                let nx = x as isize + dx;
+                let ny = y as isize + dy;
+                if nx < 0 || ny < 0 || nx >= width as isize || ny >= height as isize {
+                    continue;
+                }
+                if let Some(diagonal) = neighbor(nx as usize, ny as usize) {
+                    gradient = gradient.max((diagonal - center).abs() * std::f64::consts::FRAC_1_SQRT_2);
+                }
+            }
+            palette_footprints[index] = if gradient.is_finite() && gradient > f64::EPSILON {
+                (RENDER_PALETTE_CYCLE_SCALE * gradient) as f32
             } else if gradient.is_infinite() {
-                0.0
+                1.0
             } else {
-                f32::MAX
+                0.0
             };
         }
     }
 }
 
-fn apply_render_bandlimited_shading(
+fn apply_render_bandlimited_palette_shading(
     buffer: &mut [u8],
     smooth_values: &[f32],
-    distance_values: &[f32],
+    palette_footprints: &[f32],
     escaped_mask: &[u8],
     unresolved_mask: &[u8],
     render_mask: Option<&[u8]>,
     width: usize,
     height: usize,
     palette: &RenderPaletteCache,
-) -> BoundaryStats64 {
+) -> PaletteFilterStats64 {
     let pixel_count = width * height;
     if pixel_count == 0
         || smooth_values.len() < pixel_count
-        || distance_values.len() < pixel_count
+        || palette_footprints.len() < pixel_count
     {
-        return empty_render_boundary_stats();
+        return empty_render_palette_filter_stats();
     }
-    let mut distance_estimated_count = 0u32;
+    let mut palette_footprint_count = 0u32;
     let mut palette_filtered_count = 0u32;
-    let mut distance_colorized_count = 0u32;
-    let mut boundary_coverage_count = 0u32;
     let mut max_palette_footprint = 0.0f64;
-    let distance_edge_color =
-        render_palette_linear_color_at_phase(RENDER_DISTANCE_COLOR_PALETTE_PHASE, palette);
     for index in 0..pixel_count {
         if render_mask.is_some_and(|mask| mask[index] == 0) {
             continue;
@@ -3005,86 +2989,58 @@ fn apply_render_bandlimited_shading(
         if unresolved_mask[index] != 0 || escaped_mask[index] == 0 {
             continue;
         }
-        let distance_px = distance_values[index] as f64;
-        if !distance_px.is_finite() || distance_px < 0.0 {
+        let footprint = palette_footprints[index] as f64;
+        if !footprint.is_finite() || footprint < 0.0 {
             continue;
         }
-        distance_estimated_count += 1;
-        let footprint =
-            RENDER_PALETTE_CYCLE_SCALE / (std::f64::consts::LN_2 * distance_px.max(f64::EPSILON));
+        palette_footprint_count += 1;
         max_palette_footprint = max_palette_footprint.max(footprint);
-        let offset = index * 4;
-        let mut color = LinearColor64 {
-            r: palette.srgb_to_linear[buffer[offset] as usize],
-            g: palette.srgb_to_linear[buffer[offset + 1] as usize],
-            b: palette.srgb_to_linear[buffer[offset + 2] as usize],
-        };
 
         let filter_amount = smoothstep(
             RENDER_PALETTE_FILTER_LOW,
             RENDER_PALETTE_FILTER_HIGH,
             footprint,
         );
-        if filter_amount > 0.0 {
-            let filtered = integrated_render_palette_linear_color(
+        if filter_amount <= 0.0 {
+            continue;
+        }
+        let offset = index * 4;
+        let color = blend_render_linear_color(
+            LinearColor64 {
+                r: palette.srgb_to_linear[buffer[offset] as usize],
+                g: palette.srgb_to_linear[buffer[offset + 1] as usize],
+                b: palette.srgb_to_linear[buffer[offset + 2] as usize],
+            },
+            integrated_render_palette_linear_color(
                 smooth_values[index] as f64,
                 footprint,
                 palette,
-            );
-            color = blend_render_linear_color(color, filtered, filter_amount);
-            palette_filtered_count += 1;
-        }
-
-        let alias_color_amount = smoothstep(
-            RENDER_DISTANCE_COLOR_FILTER_LOW,
-            RENDER_DISTANCE_COLOR_FILTER_HIGH,
-            footprint,
+            ),
+            filter_amount,
         );
-        let proximity_color_amount = 1.0
-            - smoothstep(
-                RENDER_DISTANCE_COLOR_FULL_PX,
-                RENDER_DISTANCE_COLOR_NONE_PX,
-                distance_px,
-            );
-        let distance_color_amount = alias_color_amount.max(proximity_color_amount);
-        if distance_color_amount > 0.0 {
-            color = blend_render_linear_color(color, distance_edge_color, distance_color_amount);
-            distance_colorized_count += 1;
-        }
-
-        let coverage = RENDER_DISTANCE_COVERAGE_STRENGTH
-            * (1.0 - smoothstep(0.0, RENDER_DISTANCE_COVERAGE_NONE_PX, distance_px));
-        if coverage > 0.0 {
-            color = blend_render_linear_color(
-                color,
-                LinearColor64 {
-                    r: palette.srgb_to_linear[RENDER_INTERIOR_R as usize],
-                    g: palette.srgb_to_linear[RENDER_INTERIOR_G as usize],
-                    b: palette.srgb_to_linear[RENDER_INTERIOR_B as usize],
-                },
-                coverage,
-            );
-            boundary_coverage_count += 1;
-        }
+        palette_filtered_count += 1;
         write_render_linear_color(buffer, offset, color);
     }
-    BoundaryStats64 {
-        distance_estimated_count,
+    PaletteFilterStats64 {
+        palette_footprint_count,
         palette_filtered_count,
-        distance_colorized_count,
-        boundary_coverage_count,
         max_palette_footprint,
     }
 }
 
-fn empty_render_boundary_stats() -> BoundaryStats64 {
-    BoundaryStats64 {
-        distance_estimated_count: 0,
+fn empty_render_palette_filter_stats() -> PaletteFilterStats64 {
+    PaletteFilterStats64 {
+        palette_footprint_count: 0,
         palette_filtered_count: 0,
-        distance_colorized_count: 0,
-        boundary_coverage_count: 0,
         max_palette_footprint: 0.0,
     }
+}
+
+fn render_palette_footprint_from_distance(distance_px: f64) -> f64 {
+    if !distance_px.is_finite() || distance_px < 0.0 {
+        return -1.0;
+    }
+    RENDER_PALETTE_CYCLE_SCALE / (std::f64::consts::LN_2 * distance_px.max(f64::EPSILON))
 }
 
 fn empty_render_iter_stats(_max_iter: u32) -> RenderIterStats64 {
@@ -3356,18 +3312,6 @@ fn render_palette_index(smooth: f64) -> usize {
     let value = smooth * RENDER_PALETTE_CYCLE_SCALE;
     let fraction = value - value.floor();
     ((fraction * RENDER_PALETTE_SIZE as f64).floor().max(0.0) as usize).min(RENDER_PALETTE_SIZE - 1)
-}
-
-fn render_palette_linear_color_at_phase(phase: f64, palette: &RenderPaletteCache) -> LinearColor64 {
-    let fraction = phase - phase.floor();
-    let index = ((fraction * RENDER_PALETTE_SIZE as f64).floor().max(0.0) as usize)
-        .min(RENDER_PALETTE_SIZE - 1);
-    let offset = index * 3;
-    LinearColor64 {
-        r: palette.linear_colors[offset],
-        g: palette.linear_colors[offset + 1],
-        b: palette.linear_colors[offset + 2],
-    }
 }
 
 fn render_smooth_iteration(iter: u32, max_iter: u32, mag2: f64) -> f64 {
