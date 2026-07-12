@@ -880,11 +880,7 @@ export async function startApp(root: HTMLElement): Promise<void> {
     const reset = requireElement(root, resetSelector, HTMLButtonElement);
     const read = (target: HTMLInputElement) => clampControlNumber(target.valueAsNumber, min, max);
     range.addEventListener("input", () => apply(read(range)));
-    input.addEventListener("input", () => apply(read(input)));
-    input.addEventListener("change", () => {
-      syncIterControls();
-      apply(read(input));
-    });
+    input.addEventListener("change", () => apply(read(input)));
     reset.addEventListener("click", () => apply(clampControlNumber(resetValue(), min, max)));
     range.setAttribute("aria-label", name);
     input.setAttribute("aria-label", name);
