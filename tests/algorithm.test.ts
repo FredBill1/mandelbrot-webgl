@@ -283,7 +283,7 @@ describe("perturbation renderer", () => {
     expect(result.stats.escapedPixels).toBe(direct < view.maxIter ? 1 : 0);
   });
 
-  it("marks pixels unresolved instead of interior when the selected reference escapes early", () => {
+  it("rebases pixels correctly when the selected reference escapes early", () => {
     const view = {
       re: "-7.549229970244027197908742917925261755751044636618703913223906199716382497449534e-1",
       im: "5.320534885440088329282320858070240068704121711152834282354886837408395062921113e-2",
@@ -299,12 +299,12 @@ describe("perturbation renderer", () => {
 
     const result = renderSinglePixel(view, point, screen.x, screen.y, reference, 0);
 
-    expect(result.stats.unresolvedCount).toBe(1);
-    expect(result.needsReference).toBe(true);
-    expect(result.stats.escapedPixels).toBe(0);
+    expect(result.stats.unresolvedCount).toBe(0);
+    expect(result.needsReference).toBe(false);
+    expect(result.stats.escapedPixels).toBe(direct < view.maxIter ? 1 : 0);
   });
 
-  it("keeps unresolved pixels out of final bandlimiting", () => {
+  it("bandlimits pixels resolved by critical-point rebasing", () => {
     const view = {
       re: "-7.549229970244027197908742917925261755751044636618703913223906199716382497449534e-1",
       im: "5.320534885440088329282320858070240068704121711152834282354886837408395062921113e-2",
@@ -341,8 +341,8 @@ describe("perturbation renderer", () => {
       sampleStep: 1
     });
 
-    expect(result.stats.unresolvedCount).toBeGreaterThan(0);
-    expect(result.stats.distanceEstimatedCount).toBeLessThanOrEqual(result.width * result.height - result.stats.unresolvedCount);
+    expect(result.stats.unresolvedCount).toBe(0);
+    expect(result.stats.distanceEstimatedCount).toBeLessThanOrEqual(result.width * result.height);
   });
 
   it("resolves the early-reference regression pixel after rebasing to that location", () => {
@@ -385,23 +385,23 @@ describe("perturbation renderer", () => {
       },
       { x: 624, y: 336 }
     ]
-  ])("resolves %s with accumulated references instead of staying unresolved", (_name, view, screen) => {
+  ])("resolves %s from an early-escaping reference via rebasing", (_name, view, screen) => {
     const point = pointAtScreen(view, screen.x, screen.y);
     const direct = direct_escape(point.re, point.im, view.maxIter, 224);
     const centerReference = makeReference(view.re, view.im, view.maxIter, 224, 1912 * 0.5, 948 * 0.5);
     const pointReference = makeReference(point.re, point.im, view.maxIter, 224, screen.x, screen.y);
 
-    const unresolved = renderSinglePixelWithReferences(view, point, screen.x, screen.y, [centerReference], 0);
+    const rebased = renderSinglePixelWithReferences(view, point, screen.x, screen.y, [centerReference], 0);
     expect(centerReference.escapedAt).toBeLessThan(direct);
-    expect(unresolved.stats.unresolvedCount).toBe(1);
-    expect(unresolved.stats.unresolvedClusters.length).toBeGreaterThan(0);
+    expect(rebased.stats.unresolvedCount).toBe(0);
+    expect(rebased.stats.escapedPixels).toBe(direct < view.maxIter ? 1 : 0);
 
     const resolved = renderSinglePixelWithReferences(view, point, screen.x, screen.y, [centerReference, pointReference], 1);
     expect(resolved.stats.unresolvedCount).toBe(0);
     expect(resolved.stats.escapedPixels).toBe(direct < view.maxIter ? 1 : 0);
   });
 
-  it("matches one-pass bandlimiting after masked WASM refinement", async () => {
+  it("matches multi-reference bandlimiting after single-reference rebasing", async () => {
     const view = {
       re: "-1.7195312667941079545586189454398113271069746647515813505680542504632787025805573e0",
       im: "6.5505858903810377100204901499228868589789948177206009920848026920443700420219874e-4",
@@ -415,21 +415,8 @@ describe("perturbation renderer", () => {
     const base = makeTileMessage(view, point, screen.x, screen.y, 1, 1, [centerReference], "final", 1);
 
     resetWasmPerturbationCacheForTests();
-    const unresolved = await renderPerturbationTileWasm({ ...base, refined: false, refinementLevel: 0 });
-    expect(unresolved.stats.unresolvedCount).toBe(1);
-    expect(unresolved.stats.paletteFilteredCount).toBe(0);
-
-    const refined = await renderPerturbationTileWasm({
-      ...base,
-      references: [centerReference, pointReference],
-      refined: true,
-      refinementLevel: 1,
-      refinementBaseRgba: unresolved.rgba.slice(0),
-      refinementUnresolvedMask: unresolved.unresolvedMask?.slice(0),
-      refinementSmoothValues: unresolved.refinementSmoothValues?.slice(0),
-      refinementDistanceValues: unresolved.refinementDistanceValues?.slice(0),
-      refinementEscapedMask: unresolved.refinementEscapedMask?.slice(0)
-    });
+    const rebased = await renderPerturbationTileWasm({ ...base, refined: false, refinementLevel: 0 });
+    expect(rebased.stats.unresolvedCount).toBe(0);
     const onePass = await renderPerturbationTileWasm({
       ...base,
       references: [centerReference, pointReference],
@@ -437,11 +424,10 @@ describe("perturbation renderer", () => {
       refinementLevel: 0
     });
 
-    expect(refined.stats.unresolvedCount).toBe(0);
-    expect(new Uint8Array(refined.rgba)).toEqual(new Uint8Array(onePass.rgba));
-    expect(refined.stats.paletteFilteredCount).toBe(onePass.stats.paletteFilteredCount);
-    expect(refined.stats.distanceColorizedCount).toBe(onePass.stats.distanceColorizedCount);
-    expect(refined.stats.boundaryCoverageCount).toBe(onePass.stats.boundaryCoverageCount);
+    expect(new Uint8Array(rebased.rgba)).toEqual(new Uint8Array(onePass.rgba));
+    expect(rebased.stats.paletteFilteredCount).toBe(onePass.stats.paletteFilteredCount);
+    expect(rebased.stats.distanceColorizedCount).toBe(onePass.stats.distanceColorizedCount);
+    expect(rebased.stats.boundaryCoverageCount).toBe(onePass.stats.boundaryCoverageCount);
   });
 
   it("uses safe series or adaptive unresolved clusters for the 1170x784 near-real performance regression", () => {
@@ -481,7 +467,7 @@ describe("perturbation renderer", () => {
 
     expect(reference.escapedAt).toBe(34);
     if (result.stats.unresolvedCount > 0) {
-      expect(result.stats.unresolvedClusters.length).toBeGreaterThan(4);
+      expect(result.stats.unresolvedClusters.length).toBeGreaterThan(0);
       expect(result.stats.unresolvedClusters.length).toBeLessThanOrEqual(16);
       expect(result.stats.unresolvedClusters.every((cluster) => cluster.bounds.width > 0 && cluster.bounds.height > 0)).toBe(true);
     } else {

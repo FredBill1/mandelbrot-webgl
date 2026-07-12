@@ -79,7 +79,6 @@ interface BoundaryStats {
 }
 
 const MIN_PIXEL_SPAN_FOR_PERIODIC_INTERIOR = 1e-18;
-const REBASE_G = 1e-8;
 const MAX_REBASES_PER_PIXEL = 64;
 const SERIES_MAX_SKIP = 8192;
 const DISTANCE_EXTRA_ITERATIONS = 1;
@@ -177,7 +176,7 @@ export function renderPerturbationTile(message: RenderTileMessage): TileDoneMess
         contexts,
         scratch,
         allowPeriodicInterior,
-        message.renderMode === "final"
+        false
       );
       const offset = pixelIndex * 4;
       if (result.iter < maxIter) escapedPixels += 1;
@@ -203,6 +202,10 @@ export function renderPerturbationTile(message: RenderTileMessage): TileDoneMess
       if (distanceValues) distanceValues[pixelIndex] = result.distancePx;
       writeColorForSmooth(rgba, offset, result.iter >= maxIter, smooth);
     }
+  }
+
+  if (message.renderMode === "final") {
+    estimateDistancesFromSmooth(distanceValues!, smoothValues!, escapedMask!, unresolvedMask, width, height);
   }
 
   const boundaryStats = message.renderMode === "final"
@@ -486,9 +489,8 @@ function perturb(
     let stepRefMag2 = refMag2;
     if (
       refIndex > 0 &&
-      Number.isFinite(refMag2) &&
-      refMag2 > 1e-30 &&
-      mag2 < refMag2 * REBASE_G
+      Number.isFinite(dzMag2BeforeStep) &&
+      mag2 < dzMag2BeforeStep
     ) {
       if (rebaseCount >= MAX_REBASES_PER_PIXEL) {
         glitch = true;
@@ -739,6 +741,43 @@ function applyBandlimitedBoundaryShading(
   }
 
   return { distanceEstimatedCount, paletteFilteredCount, distanceColorizedCount, boundaryCoverageCount, maxPaletteFootprint };
+}
+
+function estimateDistancesFromSmooth(
+  distanceValues: Float32Array,
+  smoothValues: Float32Array,
+  escapedMask: Uint8Array,
+  unresolvedMask: Uint8Array,
+  width: number,
+  height: number
+): void {
+  for (let y = 0; y < height; y += 1) {
+    for (let x = 0; x < width; x += 1) {
+      const index = y * width + x;
+      if (escapedMask[index] === 0 || unresolvedMask[index] !== 0) continue;
+      const center = smoothValues[index];
+      const neighbor = (nx: number, ny: number): number | undefined => {
+        const neighborIndex = ny * width + nx;
+        return escapedMask[neighborIndex] !== 0 && unresolvedMask[neighborIndex] === 0
+          ? smoothValues[neighborIndex]
+          : undefined;
+      };
+      const left = x > 0 ? neighbor(x - 1, y) : undefined;
+      const right = x + 1 < width ? neighbor(x + 1, y) : undefined;
+      const top = y > 0 ? neighbor(x, y - 1) : undefined;
+      const bottom = y + 1 < height ? neighbor(x, y + 1) : undefined;
+      const gradientX = left !== undefined
+        ? right !== undefined ? (right - left) * 0.5 : center - left
+        : right !== undefined ? right - center : Number.POSITIVE_INFINITY;
+      const gradientY = top !== undefined
+        ? bottom !== undefined ? (bottom - top) * 0.5 : center - top
+        : bottom !== undefined ? bottom - center : Number.POSITIVE_INFINITY;
+      const gradient = Math.hypot(gradientX, gradientY);
+      distanceValues[index] = Number.isFinite(gradient) && gradient > Number.EPSILON
+        ? 1 / (Math.LN2 * gradient)
+        : gradient === Number.POSITIVE_INFINITY ? 0 : Number.MAX_VALUE;
+    }
+  }
 }
 
 function emptyBoundaryStats(): BoundaryStats {

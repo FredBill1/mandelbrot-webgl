@@ -1,9 +1,34 @@
-import { renderPerturbationTileWasm } from "./wasmPerturbation";
+import { computeReferenceWasm, renderPerturbationTileWasm } from "./wasmPerturbation";
 import type { RenderTileMessage, TileWorkerOutMessage } from "../types";
 
-self.onmessage = (event: MessageEvent<RenderTileMessage>) => {
-  if (event.data.type !== "renderTile") return;
+interface ComputeReferenceMessage {
+  type: "computeReference";
+  requestId: number;
+  centerRe: string;
+  centerIm: string;
+  scale: string;
+  maxIter: number;
+  minPrecisionBits: number;
+}
+
+self.onmessage = (event: MessageEvent<RenderTileMessage | ComputeReferenceMessage>) => {
+  if (event.data.type === "computeReference") {
+    const request = event.data;
+    void computeReferenceWasm(request).then((reference) => {
+      self.postMessage({ type: "referenceDone", requestId: request.requestId, reference }, [reference.orbitRe.buffer, reference.orbitIm.buffer]);
+    }).catch((error) => {
+      self.postMessage({ type: "referenceError", requestId: request.requestId, message: error instanceof Error ? error.message : String(error) });
+    });
+    return;
+  }
   void renderPerturbationTileWasm(event.data).then((result) => {
-    self.postMessage(result satisfies TileWorkerOutMessage, [result.rgba]);
+    const transfer = [
+      result.rgba,
+      result.unresolvedMask,
+      result.refinementSmoothValues,
+      result.refinementDistanceValues,
+      result.refinementEscapedMask
+    ].filter((buffer): buffer is ArrayBuffer => buffer instanceof ArrayBuffer && buffer.byteLength > 0);
+    self.postMessage(result satisfies TileWorkerOutMessage, [...new Set(transfer)]);
   });
 };

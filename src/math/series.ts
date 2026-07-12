@@ -16,7 +16,7 @@ export interface SeriesEvaluation {
 }
 
 const MAX_SERIES_TILE_RADIUS = 1e-3;
-const SERIES_ERROR_SCALE = 1e-7;
+const SERIES_ERROR_SCALE = 2.9e-2;
 const SERIES_SKIP_SATURATION = 0.7;
 
 export function buildSeriesPlan(

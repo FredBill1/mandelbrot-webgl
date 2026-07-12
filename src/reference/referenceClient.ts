@@ -33,6 +33,12 @@ export interface RawReferenceResult {
   orbitIm: Float64Array;
 }
 
+export interface ReferenceComputer {
+  compute(centerRe: string, centerIm: string, scale: string, maxIter: number, minPrecisionBits?: number, options?: ReferenceWorkOptions): Promise<RawReferenceResult>;
+  cancelObsoleteWork(currentRevision: number): void;
+  dispose(): void;
+}
+
 export class ReferenceClient {
   private readonly workers: Worker[] = [];
   private readonly idle: Worker[] = [];

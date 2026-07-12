@@ -1,5 +1,6 @@
-import init, { estimate_precision_bits, put_render_reference, render_tile_cached, render_tile_exact, reset_render_cache } from "../wasm/pkg/mandelbrot_wasm";
+import init, { compute_reference, estimate_precision_bits, estimate_reference_interior_radius, put_render_reference, render_tile_cached, render_tile_exact, reset_render_cache } from "../wasm/pkg/mandelbrot_wasm";
 import type { ReferenceSnapshot, RenderTileMessage, TileDoneMessage } from "../types";
+import type { RawReferenceResult } from "../reference/referenceClient";
 
 interface CachedReferenceState {
   revision: number;
@@ -14,6 +15,36 @@ const cacheState: CachedReferenceState = {
 };
 
 let ready: Promise<void> | undefined;
+
+export async function computeReferenceWasm(input: {
+  centerRe: string;
+  centerIm: string;
+  scale: string;
+  maxIter: number;
+  minPrecisionBits: number;
+}): Promise<RawReferenceResult> {
+  await initRenderWasm();
+  const precisionBits = Math.max(input.minPrecisionBits, estimate_precision_bits(input.scale, input.maxIter));
+  const raw = compute_reference(input.centerRe, input.centerIm, input.maxIter, precisionBits) as {
+    center_re: string;
+    center_im: string;
+    precision_bits: number;
+    escaped_at: number;
+    orbit_re: Float64Array | number[];
+    orbit_im: Float64Array | number[];
+  };
+  const orbitRe = raw.orbit_re instanceof Float64Array ? raw.orbit_re : new Float64Array(raw.orbit_re);
+  const orbitIm = raw.orbit_im instanceof Float64Array ? raw.orbit_im : new Float64Array(raw.orbit_im);
+  return {
+    centerRe: raw.center_re,
+    centerIm: raw.center_im,
+    precisionBits: raw.precision_bits,
+    escapedAt: raw.escaped_at,
+    interiorRadius: estimate_reference_interior_radius(raw.escaped_at, input.maxIter, orbitRe, orbitIm),
+    orbitRe,
+    orbitIm
+  };
+}
 
 export async function renderPerturbationTileWasm(message: RenderTileMessage): Promise<TileDoneMessage> {
   await initRenderWasm();

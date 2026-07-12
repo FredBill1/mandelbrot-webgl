@@ -641,11 +641,7 @@ struct PixelSelection64 {
     skip: usize,
 }
 
-struct PeriodicScratch64 {
-    checkpoint_re: [f64; 32],
-    checkpoint_im: [f64; 32],
-    checkpoint_iter: [u32; 32],
-}
+struct PeriodicScratch64;
 
 #[derive(Clone, Copy)]
 struct PeriodDerivatives64 {
@@ -743,11 +739,10 @@ thread_local! {
 }
 
 const RENDER_MIN_PIXEL_SPAN_FOR_PERIODIC_INTERIOR: f64 = 1e-18;
-const RENDER_REBASE_G: f64 = 1e-8;
 const RENDER_MAX_REBASES_PER_PIXEL: u32 = 64;
 const RENDER_SERIES_MAX_SKIP: usize = 8192;
 const RENDER_MAX_SERIES_TILE_RADIUS: f64 = 1e-3;
-const RENDER_SERIES_ERROR_SCALE: f64 = 1e-7;
+const RENDER_SERIES_ERROR_SCALE: f64 = 2.9e-2;
 const RENDER_SERIES_SKIP_SATURATION: f64 = 0.7;
 const RENDER_DISTANCE_EXTRA_ITERATIONS: u32 = 1;
 const RENDER_DISTANCE_COVERAGE_NONE_PX: f64 = 0.75;
@@ -868,7 +863,7 @@ pub fn render_tile_cached(
         None
     };
     let using_refinement_mask = refinement_input.is_some();
-    let inline_distance = render_mode == "final" && !using_refinement_mask;
+    let inline_distance = false;
     let (
         mut rgba,
         refinement_mask,
@@ -891,11 +886,7 @@ pub fn render_tile_cached(
     } else {
         None
     };
-    let mut scratch = PeriodicScratch64 {
-        checkpoint_re: [0.0; 32],
-        checkpoint_im: [0.0; 32],
-        checkpoint_iter: [0; 32],
-    };
+    let mut scratch = PeriodicScratch64;
 
     let mut glitch_count = 0u32;
     let mut unresolved_count = 0u32;
@@ -1058,34 +1049,16 @@ pub fn render_tile_cached(
         }
     }
 
-    if render_mode == "final" && !inline_distance {
-        for py in 0..height {
-            for px in 0..width {
-                let pixel_index = py * width + px;
-                if refinement_mask
-                    .as_ref()
-                    .is_some_and(|mask| mask[pixel_index] == 0)
-                    || unresolved_mask[pixel_index] != 0
-                    || escaped_mask.as_ref().unwrap()[pixel_index] == 0
-                {
-                    continue;
-                }
-                let result = render_pixel_with_references64(
-                    screen_xs[px],
-                    screen_ys[py],
-                    pixel_span,
-                    max_iter,
-                    series_degree as usize,
-                    &mut contexts,
-                    &mut scratch,
-                    true,
-                )
-                .result;
-                if !result.unresolved && result.iter < max_iter {
-                    distance_values.as_mut().unwrap()[pixel_index] = result.distance_px as f32;
-                }
-            }
-        }
+    if render_mode == "final" {
+        estimate_render_distances_from_smooth(
+            distance_values.as_mut().unwrap(),
+            smooth_values.as_ref().unwrap(),
+            escaped_mask.as_ref().unwrap(),
+            &unresolved_mask,
+            refinement_mask.as_deref(),
+            width,
+            height,
+        );
     }
 
     let boundary_stats = if render_mode == "final" {
@@ -2388,7 +2361,7 @@ fn perturb64(
     series: &SeriesPlan64,
     allow_periodic_interior: bool,
     compute_distance: bool,
-    scratch: &mut PeriodicScratch64,
+    _scratch: &mut PeriodicScratch64,
 ) -> PixelResult64 {
     let mut dz_re = 0.0;
     let mut dz_im = 0.0;
@@ -2403,8 +2376,11 @@ fn perturb64(
     let mut rebase_limit = false;
     let bla_skip_count = 0u32;
     let bla_step_count = 0u32;
-    let mut checkpoint_count = 0usize;
-    let mut checkpoint_index = 0usize;
+    let mut periodic_checkpoint_re = 0.0;
+    let mut periodic_checkpoint_im = 0.0;
+    let mut periodic_power = 1u32;
+    let mut periodic_lam = 0u32;
+    let mut periodic_initialized = false;
 
     if series.skip > 0 {
         if compute_distance {
@@ -2492,35 +2468,39 @@ fn perturb64(
             );
         }
 
-        if allow_periodic_interior && iter > 32 && iter % 8 == 0 {
-            let cycle_tolerance = 1e-20 * 1.0f64.max(mag2);
-            for checkpoint in 0..checkpoint_count {
-                if iter - scratch.checkpoint_iter[checkpoint] < 32 {
-                    continue;
+        if allow_periodic_interior && iter >= 32 {
+            if !periodic_initialized {
+                periodic_checkpoint_re = z_re;
+                periodic_checkpoint_im = z_im;
+                periodic_initialized = true;
+            } else {
+                periodic_lam += 1;
+                if periodic_lam >= 32 {
+                    let cycle_tolerance = 1e-20 * 1.0f64.max(mag2);
+                    let cycle_delta_re = z_re - periodic_checkpoint_re;
+                    let cycle_delta_im = z_im - periodic_checkpoint_im;
+                    let cycle_delta2 = cycle_delta_re * cycle_delta_re + cycle_delta_im * cycle_delta_im;
+                    if cycle_delta2.is_finite() && cycle_delta2 < cycle_tolerance {
+                        return success_result64(
+                            max_iter,
+                            mag2,
+                            -1.0,
+                            false,
+                            true,
+                            rebase_count,
+                            rebase_limit,
+                            bla_skip_count,
+                            bla_step_count,
+                        );
+                    }
                 }
-                let cycle_delta_re = z_re - scratch.checkpoint_re[checkpoint];
-                let cycle_delta_im = z_im - scratch.checkpoint_im[checkpoint];
-                let cycle_delta2 =
-                    cycle_delta_re * cycle_delta_re + cycle_delta_im * cycle_delta_im;
-                if cycle_delta2.is_finite() && cycle_delta2 < cycle_tolerance {
-                    return success_result64(
-                        max_iter,
-                        mag2,
-                        -1.0,
-                        false,
-                        true,
-                        rebase_count,
-                        rebase_limit,
-                        bla_skip_count,
-                        bla_step_count,
-                    );
+                if periodic_lam == periodic_power {
+                    periodic_checkpoint_re = z_re;
+                    periodic_checkpoint_im = z_im;
+                    periodic_power = periodic_power.saturating_mul(2).max(1);
+                    periodic_lam = 0;
                 }
             }
-            scratch.checkpoint_re[checkpoint_index] = z_re;
-            scratch.checkpoint_im[checkpoint_index] = z_im;
-            scratch.checkpoint_iter[checkpoint_index] = iter;
-            checkpoint_index = (checkpoint_index + 1) % scratch.checkpoint_re.len();
-            checkpoint_count = (checkpoint_count + 1).min(scratch.checkpoint_re.len());
         }
 
         let ref_mag2 = ref_re * ref_re + ref_im * ref_im;
@@ -2530,9 +2510,8 @@ fn perturb64(
         let mut step_ref_mag2 = ref_mag2;
         if ref_index > 0
             && mag2.is_finite()
-            && ref_mag2.is_finite()
-            && ref_mag2 > 1e-30
-            && mag2 < ref_mag2 * RENDER_REBASE_G
+            && dz_mag2_before_step.is_finite()
+            && mag2 < dz_mag2_before_step
         {
             if rebase_count >= RENDER_MAX_REBASES_PER_PIXEL {
                 glitch = true;
@@ -3148,6 +3127,66 @@ fn suggested_precision_bits_for_cluster(survived_iter: u32) -> u32 {
     (128 + orbit_margin).clamp(128, 4096)
 }
 
+fn estimate_render_distances_from_smooth(
+    distance_values: &mut [f32],
+    smooth_values: &[f32],
+    escaped_mask: &[u8],
+    unresolved_mask: &[u8],
+    render_mask: Option<&[u8]>,
+    width: usize,
+    height: usize,
+) {
+    let pixel_count = width * height;
+    if distance_values.len() < pixel_count
+        || smooth_values.len() < pixel_count
+        || escaped_mask.len() < pixel_count
+        || unresolved_mask.len() < pixel_count
+    {
+        return;
+    }
+    for y in 0..height {
+        for x in 0..width {
+            let index = y * width + x;
+            if render_mask.is_some_and(|mask| mask[index] == 0)
+                || escaped_mask[index] == 0
+                || unresolved_mask[index] != 0
+            {
+                continue;
+            }
+            let center = smooth_values[index] as f64;
+            let neighbor = |nx: usize, ny: usize| -> Option<f64> {
+                let neighbor_index = ny * width + nx;
+                (escaped_mask[neighbor_index] != 0 && unresolved_mask[neighbor_index] == 0)
+                    .then_some(smooth_values[neighbor_index] as f64)
+            };
+            let left = (x > 0).then(|| neighbor(x - 1, y)).flatten();
+            let right = (x + 1 < width).then(|| neighbor(x + 1, y)).flatten();
+            let top = (y > 0).then(|| neighbor(x, y - 1)).flatten();
+            let bottom = (y + 1 < height).then(|| neighbor(x, y + 1)).flatten();
+            let gradient_x = match (left, right) {
+                (Some(a), Some(b)) => (b - a) * 0.5,
+                (Some(a), None) => center - a,
+                (None, Some(b)) => b - center,
+                (None, None) => f64::INFINITY,
+            };
+            let gradient_y = match (top, bottom) {
+                (Some(a), Some(b)) => (b - a) * 0.5,
+                (Some(a), None) => center - a,
+                (None, Some(b)) => b - center,
+                (None, None) => f64::INFINITY,
+            };
+            let gradient = gradient_x.hypot(gradient_y);
+            distance_values[index] = if gradient.is_finite() && gradient > f64::EPSILON {
+                (1.0 / (std::f64::consts::LN_2 * gradient)) as f32
+            } else if gradient.is_infinite() {
+                0.0
+            } else {
+                f32::MAX
+            };
+        }
+    }
+}
+
 fn apply_render_bandlimited_shading(
     buffer: &mut [u8],
     smooth_values: &[f32],
@@ -3281,12 +3320,13 @@ fn record_render_escaped_iter(stats: &mut RenderIterStats64, iter: u32, max_iter
 }
 
 fn summarize_render_iter_stats(mut stats: RenderIterStats64) -> RenderIterSummary64 {
-    stats.escaped_iters.sort_unstable();
     let p95_escaped_iter = if stats.escaped_iters.is_empty() {
         0
     } else {
         let index = ((stats.escaped_iters.len() as f64 - 1.0) * 0.95).round() as usize;
-        stats.escaped_iters[index.min(stats.escaped_iters.len() - 1)]
+        let bounded_index = index.min(stats.escaped_iters.len() - 1);
+        stats.escaped_iters.select_nth_unstable(bounded_index);
+        stats.escaped_iters[bounded_index]
     };
     RenderIterSummary64 {
         max_escaped_iter: stats.max_escaped_iter,

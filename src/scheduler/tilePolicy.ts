@@ -1,8 +1,8 @@
 import type { Rect } from "../types";
 
-export const MAX_CLUSTER_REFERENCES_PER_PASS = 8;
-export const FIRST_CLUSTER_REFERENCES = 4;
-export const STALLED_CLUSTER_REFERENCES = 8;
+export const MAX_CLUSTER_REFERENCES_PER_PASS = 16;
+export const FIRST_CLUSTER_REFERENCES = 8;
+export const STALLED_CLUSTER_REFERENCES = 16;
 export const MAX_TILE_REFERENCES_LARGE = 48;
 export const MAX_TILE_REFERENCES_SMALL = 32;
 export const MIN_NORMAL_SUBTILE_SIZE = 8;

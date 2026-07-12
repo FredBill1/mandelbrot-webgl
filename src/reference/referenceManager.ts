@@ -1,5 +1,5 @@
 import { REFERENCE_CACHE_SOFT_BYTES, type ReferenceSnapshot, type RuntimeView, type TileDescriptor } from "../types";
-import { ReferenceClient, type ReferenceWorkOptions } from "./referenceClient";
+import type { ReferenceComputer, ReferenceWorkOptions } from "./referenceClient";
 
 const REFERENCE_CACHE_MAX_ENTRIES = 180;
 
@@ -17,7 +17,7 @@ export class ReferenceManager {
   private currentViewReference: ReferenceSnapshot | undefined;
   private sequence = 0;
 
-  constructor(private readonly client = new ReferenceClient()) {}
+  constructor(private readonly client: ReferenceComputer) {}
 
   get size(): number {
     return this.references.size;

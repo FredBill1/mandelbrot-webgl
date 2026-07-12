@@ -571,7 +571,7 @@ test("does not draw dark horizontal tile-edge bands on the reported view", async
   expect(seam.maxExcessDarkDropRatio).toBeLessThanOrEqual(0.03);
 });
 
-test("stabilizes the reported interior-heavy views under six seconds", async ({ page }) => {
+test("stabilizes the reported interior-heavy views under 2.5 seconds", async ({ page }) => {
   test.setTimeout(30_000);
   await installInteractionWorkerProbe(page);
   await page.setViewportSize({ width: 1912, height: 948 });
@@ -579,9 +579,9 @@ test("stabilizes the reported interior-heavy views under six seconds", async ({ 
   for (const url of REPORTED_INTERIOR_PERFORMANCE_VIEWS) {
     const started = Date.now();
     await page.goto(url);
-    await expect(page.locator("#readStatus")).toHaveText("stable", { timeout: 6_000 });
+    await expect.poll(() => page.locator("#readStatus").textContent(), { timeout: 2_500, intervals: [25] }).toBe("stable");
     const stableMs = Date.now() - started;
-    expect(stableMs).toBeLessThan(6_000);
+    expect(stableMs).toBeLessThan(2_500);
 
     const tileCounts = await readTileCounts(page);
     expect(tileCounts.completed).toBe(tileCounts.total);
@@ -598,16 +598,16 @@ test("stabilizes the reported interior-heavy views under six seconds", async ({ 
   }
 });
 
-test("stabilizes the reported e100 deep view under six seconds", async ({ page }) => {
+test("stabilizes the reported e100 deep view under 2.5 seconds", async ({ page }) => {
   test.setTimeout(30_000);
   await installInteractionWorkerProbe(page);
   await page.setViewportSize({ width: 1912, height: 948 });
 
   const started = Date.now();
   await page.goto(REPORTED_DEEP_PERFORMANCE_VIEW);
-  await expect(page.locator("#readStatus")).toHaveText("stable", { timeout: 6_000 });
+  await expect.poll(() => page.locator("#readStatus").textContent(), { timeout: 2_500, intervals: [25] }).toBe("stable");
   const stableMs = Date.now() - started;
-  expect(stableMs).toBeLessThan(6_000);
+  expect(stableMs).toBeLessThan(2_500);
 
   const tileCounts = await readTileCounts(page);
   expect(tileCounts.completed).toBe(tileCounts.total);
@@ -623,16 +623,16 @@ test("stabilizes the reported e100 deep view under six seconds", async ({ page }
   }
 });
 
-test("stabilizes the alternate reported e100 deep view under six seconds", async ({ page }) => {
+test("stabilizes the alternate reported e100 deep view under 2.5 seconds", async ({ page }) => {
   test.setTimeout(30_000);
   await installInteractionWorkerProbe(page);
   await page.setViewportSize({ width: 1912, height: 948 });
 
   const started = Date.now();
   await page.goto(ALT_REPORTED_DEEP_PERFORMANCE_VIEW);
-  await expect(page.locator("#readStatus")).toHaveText("stable", { timeout: 6_000 });
+  await expect.poll(() => page.locator("#readStatus").textContent(), { timeout: 2_500, intervals: [25] }).toBe("stable");
   const stableMs = Date.now() - started;
-  expect(stableMs).toBeLessThan(6_000);
+  expect(stableMs).toBeLessThan(2_500);
 
   const tileCounts = await readTileCounts(page);
   expect(tileCounts.completed).toBe(tileCounts.total);

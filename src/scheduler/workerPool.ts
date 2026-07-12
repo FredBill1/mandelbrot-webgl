@@ -5,8 +5,10 @@ import type {
   TileWorkerInMessage,
   TileWorkerOutMessage
 } from "../types";
+import type { RawReferenceResult, ReferenceComputer, ReferenceWorkOptions } from "../reference/referenceClient";
 
-interface QueueItem {
+interface RenderQueueItem {
+  kind: "render";
   message: RenderTileMessage;
   priority: number;
   sequence: number;
@@ -15,20 +17,41 @@ interface QueueItem {
   reject: (error: Error) => void;
 }
 
-export class TileWorkerPool {
+interface ReferenceQueueItem {
+  kind: "reference";
+  message: {
+    type: "computeReference";
+    requestId: number;
+    centerRe: string;
+    centerIm: string;
+    scale: string;
+    maxIter: number;
+    minPrecisionBits: number;
+  };
+  revision: number | undefined;
+  priority: number;
+  sequence: number;
+  queuedAt: number;
+  resolve: (result: RawReferenceResult) => void;
+  reject: (error: Error) => void;
+}
+
+type QueueItem = RenderQueueItem | ReferenceQueueItem;
+
+export class TileWorkerPool implements ReferenceComputer {
   private readonly workers: Worker[] = [];
   private readonly idle: Worker[] = [];
   private readonly queue: QueueItem[] = [];
   private readonly inFlight = new Map<Worker, QueueItem>();
+  private readonly residentReferences = new Map<Worker, Set<string>>();
   private sequence = 0;
+  private requestId = 0;
 
   constructor(
     readonly size = resolveWorkerCount(),
     private readonly onNeedReference?: (message: NeedReferenceMessage) => void
   ) {
-    for (let i = 0; i < size; i += 1) {
-      this.idle.push(this.createWorker());
-    }
+    this.idle.push(this.createWorker());
   }
 
   get pending(): number {
@@ -40,9 +63,10 @@ export class TileWorkerPool {
   }
 
   render(message: RenderTileMessage, priority = defaultPriority(message)): Promise<TileDoneMessage> {
+    this.ensureRenderCapacity();
     const promise = new Promise<TileDoneMessage>((resolve, reject) => {
       const queuedAt = performance.now();
-      this.queue.push({ message, priority, sequence: ++this.sequence, queuedAt, resolve, reject });
+      this.queue.push({ kind: "render", message, priority, sequence: ++this.sequence, queuedAt, resolve, reject });
       this.queue.sort((a, b) => a.priority - b.priority || a.sequence - b.sequence);
       recordDeepBench({ type: "tileQueued", tileId: message.tile.id, revision: message.tile.revision, renderMode: message.renderMode, priority, queuedAt });
     });
@@ -50,17 +74,50 @@ export class TileWorkerPool {
     return promise;
   }
 
+  compute(
+    centerRe: string,
+    centerIm: string,
+    scale: string,
+    maxIter: number,
+    minPrecisionBits = 128,
+    options: ReferenceWorkOptions = {}
+  ): Promise<RawReferenceResult> {
+    const requestId = ++this.requestId;
+    const promise = new Promise<RawReferenceResult>((resolve, reject) => {
+      this.queue.push({
+        kind: "reference",
+        message: { type: "computeReference", requestId, centerRe, centerIm, scale, maxIter, minPrecisionBits },
+        revision: options.revision,
+        priority: options.kind === "viewReference" ? -5 : -2.25,
+        sequence: ++this.sequence,
+        queuedAt: performance.now(),
+        resolve,
+        reject
+      });
+      this.queue.sort((a, b) => a.priority - b.priority || a.sequence - b.sequence);
+    });
+    this.pump();
+    return promise;
+  }
+
+  cancelObsoleteWork(currentRevision: number): void {
+    this.clearQueueForOldRevisions(currentRevision);
+  }
+
   clearQueueForOldRevisions(currentRevision: number): void {
     for (let i = this.queue.length - 1; i >= 0; i -= 1) {
-      if (this.queue[i].message.tile.revision !== currentRevision) {
+      const item = this.queue[i];
+      const itemRevision = item.kind === "render" ? item.message.tile.revision : item.revision;
+      if (itemRevision !== undefined && itemRevision !== currentRevision) {
         const [item] = this.queue.splice(i, 1);
-        item?.reject(new Error("stale render revision"));
+        item?.reject(new Error("stale work revision"));
       }
     }
     for (const [worker, item] of [...this.inFlight.entries()]) {
-      if (item.message.tile.revision === currentRevision) continue;
+      const itemRevision = item.kind === "render" ? item.message.tile.revision : item.revision;
+      if (itemRevision === undefined || itemRevision === currentRevision) continue;
       this.inFlight.delete(worker);
-      item.reject(new Error("stale render revision"));
+      item.reject(new Error("stale work revision"));
       this.replaceWorker(worker);
     }
     this.pump();
@@ -71,6 +128,7 @@ export class TileWorkerPool {
     this.queue.splice(0);
     this.inFlight.clear();
     this.idle.splice(0);
+    this.residentReferences.clear();
   }
 
   private pump(): void {
@@ -79,23 +137,29 @@ export class TileWorkerPool {
       const item = this.queue.shift();
       if (!worker || !item) break;
       this.inFlight.set(worker, item);
-      recordDeepBench({
-        type: "tileStarted",
-        tileId: item.message.tile.id,
-        revision: item.message.tile.revision,
-        renderMode: item.message.renderMode,
-        queuedAt: item.queuedAt,
-        startedAt: performance.now()
-      });
-      worker.postMessage(item.message satisfies TileWorkerInMessage);
+      if (item.kind === "render") {
+        recordDeepBench({
+          type: "tileStarted",
+          tileId: item.message.tile.id,
+          revision: item.message.tile.revision,
+          renderMode: item.message.renderMode,
+          queuedAt: item.queuedAt,
+          startedAt: performance.now()
+        });
+        const message = this.prepareMessage(worker, item.message);
+        worker.postMessage(message satisfies TileWorkerInMessage, renderTransferables(message));
+      } else {
+        worker.postMessage(item.message);
+      }
     }
   }
 
   private createWorker(): Worker {
     const worker = new Worker(new URL("../workers/tileWorker.ts", import.meta.url), { type: "module" });
-    worker.onmessage = (event: MessageEvent<TileWorkerOutMessage>) => this.handleMessage(worker, event.data);
+    worker.onmessage = (event: MessageEvent) => this.handleMessage(worker, event.data);
     worker.onerror = (event) => this.handleError(worker, new Error(event.message));
     this.workers.push(worker);
+    this.residentReferences.set(worker, new Set());
     return worker;
   }
 
@@ -105,10 +169,36 @@ export class TileWorkerPool {
     if (idleIndex >= 0) this.idle.splice(idleIndex, 1);
     const workerIndex = this.workers.indexOf(worker);
     if (workerIndex >= 0) this.workers.splice(workerIndex, 1);
+    this.residentReferences.delete(worker);
     this.idle.push(this.createWorker());
   }
 
-  private handleMessage(worker: Worker, message: TileWorkerOutMessage): void {
+  private ensureRenderCapacity(): void {
+    while (this.workers.length < this.size) this.idle.push(this.createWorker());
+  }
+
+  private prepareMessage(worker: Worker, message: RenderTileMessage): RenderTileMessage {
+    const resident = this.residentReferences.get(worker);
+    if (!resident || message.references.length === 0) return message;
+    const references = message.references.map((reference) => {
+      const key = referenceTransportKey(reference);
+      if (!resident.has(key)) {
+        resident.add(key);
+        return reference;
+      }
+      return {
+        ...reference,
+        orbitRe: EMPTY_REFERENCE_ORBIT,
+        orbitIm: EMPTY_REFERENCE_ORBIT
+      };
+    });
+    return { ...message, references };
+  }
+
+  private handleMessage(
+    worker: Worker,
+    message: TileWorkerOutMessage | { type: "referenceDone"; requestId: number; reference: RawReferenceResult } | { type: "referenceError"; requestId: number; message: string }
+  ): void {
     if (message.type === "needReference") {
       this.onNeedReference?.(message);
       return;
@@ -118,7 +208,17 @@ export class TileWorkerPool {
     if (!item) return;
     this.inFlight.delete(worker);
     this.idle.push(worker);
-    item.resolve(message);
+    if (item.kind === "render" && message.type === "tileDone") {
+      item.resolve(message);
+    } else if (item.kind === "reference" && message.type === "referenceDone") {
+      item.resolve({
+        ...message.reference,
+        orbitRe: message.reference.orbitRe instanceof Float64Array ? message.reference.orbitRe : Float64Array.from(message.reference.orbitRe),
+        orbitIm: message.reference.orbitIm instanceof Float64Array ? message.reference.orbitIm : Float64Array.from(message.reference.orbitIm)
+      });
+    } else {
+      item.reject(new Error(message.type === "referenceError" ? message.message : "Worker returned mismatched response"));
+    }
     this.pump();
   }
 
@@ -136,6 +236,25 @@ export class TileWorkerPool {
 export function resolveWorkerCount(hardwareConcurrency = globalThis.navigator?.hardwareConcurrency ?? 4): number {
   if (hardwareConcurrency <= 1) return 1;
   return Math.max(1, Math.floor(hardwareConcurrency * 2));
+}
+
+const EMPTY_REFERENCE_ORBIT = new Float64Array();
+
+function referenceTransportKey(reference: RenderTileMessage["references"][number]): string {
+  return `${reference.revision}|${reference.id}|${reference.screenX}|${reference.screenY}|${reference.escapedAt}|${reference.maxIter}|${reference.interiorRadius}`;
+}
+
+function renderTransferables(message: RenderTileMessage): ArrayBuffer[] {
+  const buffers = [
+    message.exactBaseRgba,
+    message.exactUnresolvedMask,
+    message.refinementBaseRgba,
+    message.refinementUnresolvedMask,
+    message.refinementSmoothValues,
+    message.refinementDistanceValues,
+    message.refinementEscapedMask
+  ].filter((buffer): buffer is ArrayBuffer => buffer instanceof ArrayBuffer && buffer.byteLength > 0);
+  return [...new Set(buffers)];
 }
 
 function defaultPriority(message: RenderTileMessage): number {
