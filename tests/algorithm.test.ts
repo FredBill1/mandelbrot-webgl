@@ -65,6 +65,63 @@ describe("single perturbation path", () => {
     expect(first.stats.seriesSkip).toBeGreaterThanOrEqual(0);
   });
 
+  it("certifies target periodic interiors without changing their RGBA", async () => {
+    const message = await makeMessage({
+      re: "-1.76854392069529079967435552147905380619071646671631558221721367158317146672961987405313343e0",
+      im: "-7.30078926394540958134620082008361635055501804364889844988162485821612638368665062006680955e-4",
+      scale: "5.16675442717597361866334085449662625942340146464132181028971962586112670232698885953242576e3",
+      maxIter: 5000,
+      width: 1912,
+      height: 948,
+      revision: 19
+    });
+
+    for (const [x, y] of [
+      [704, 448],
+      [1216, 448]
+    ] as const) {
+      const result = await renderPerturbationTileWasm({
+        ...message,
+        tile: {
+          id: `periodic:${x}:${y}`,
+          rect: { x, y, width: 3, height: 1 },
+          revision: message.tile.revision
+        }
+      });
+      expect(result.stats.periodicInteriorCount).toBeGreaterThan(0);
+      expect(result.stats.escapedPixels + result.stats.periodicInteriorCount + result.stats.capHitUnknownCount).toBe(3);
+      expect(Array.from(new Uint8Array(result.rgba))).toEqual([
+        4, 8, 16, 255,
+        4, 8, 16, 255,
+        4, 8, 16, 255
+      ]);
+    }
+  });
+
+  it("falls back for the target center that escapes near iteration 226", async () => {
+    const message = await makeMessage({
+      re: "-1.76854392069529079967435552147905380619071646671631558221721367158317146672961987405313343e0",
+      im: "-7.30078926394540958134620082008361635055501804364889844988162485821612638368665062006680955e-4",
+      scale: "5.16675442717597361866334085449662625942340146464132181028971962586112670232698885953242576e3",
+      maxIter: 5000,
+      width: 1912,
+      height: 948,
+      revision: 20
+    });
+    const result = await renderPerturbationTileWasm({
+      ...message,
+      tile: {
+        id: "escaping-center",
+        rect: { x: 955.5, y: 473.5, width: 1, height: 1 },
+        revision: message.tile.revision
+      }
+    });
+
+    expect(result.stats.escapedPixels).toBe(1);
+    expect(result.stats.periodicInteriorCount).toBe(0);
+    expect(result.stats.capHitUnknownCount).toBe(0);
+  });
+
   it("keeps high-precision view transforms finite at 1e100", () => {
     const transformed = apply_view_transform(
       { re: "-0.75", im: "0.1", scale: "1e100", width: 1912, height: 948 },

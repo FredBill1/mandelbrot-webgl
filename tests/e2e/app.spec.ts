@@ -68,6 +68,8 @@ const REPORTED_INTERIOR_PERFORMANCE_VIEWS = [
 ] as const;
 const REPORTED_DEEP_PERFORMANCE_VIEW =
   "/?re=-7.46883943431692760541919532714409859232606639886333750701092541165643808224287821342188522092587382149759799587046156756309863566112516698524311312263708365547443519e-1&im=-1.00525982411215876752593698920114371641511074291356983067885243750788193219078894211160534174388216978954526887172496458449660477900264112017850945405489228557321858e-1&scale=1e100";
+const PERIODIC_INTERIOR_PERFORMANCE_VIEW =
+  "/?re=-1.76854392069529079967435552147905380619071646671631558221721367158317146672961987405313343e0&im=-7.30078926394540958134620082008361635055501804364889844988162485821612638368665062006680955e-4&scale=5.16675442717597361866334085449662625942340146464132181028971962586112670232698885953242576e3&iter=5000";
 const ALT_REPORTED_DEEP_PERFORMANCE_VIEW = `/?re=${ALT_DEEP_PRESET.re}&im=${ALT_DEEP_PRESET.im}&scale=${ALT_DEEP_PRESET.scale}`;
 const REFERENCE_PRESSURE_PERFORMANCE_VIEW =
   "/?re=-1.78638467787648365419207727720547018425703939706085767725832225881685228735410418701755894e0&im=-1.87892462354318380104774042945871534747473396966114579975399303084919971138018941887528654e-2&scale=1.7258385479561780535790570974260812707442099869376129800677603403441562714056599956588571e21";
@@ -697,6 +699,31 @@ test("stabilizes the reported e100 deep view under 2.5 seconds", async ({ page }
     path: "test-results/e100-palette-proxy-center.png",
     clip: { x: roi.left, y: roi.top, width: roi.right - roi.left, height: roi.bottom - roi.top }
   });
+});
+
+test("stabilizes the iter=5000 periodic-interior view under 2.5 seconds", async ({ page }) => {
+  test.setTimeout(30_000);
+  await installInteractionWorkerProbe(page);
+  await page.setViewportSize({ width: 1912, height: 948 });
+
+  const started = Date.now();
+  await page.goto(PERIODIC_INTERIOR_PERFORMANCE_VIEW);
+  await expect.poll(() => page.locator("#readStatus").textContent(), { timeout: 2_500, intervals: [25] }).toBe("stable");
+  const stableMs = Date.now() - started;
+  expect(stableMs).toBeLessThan(2_500);
+
+  const tileCounts = await readTileCounts(page);
+  expect(tileCounts).toEqual({ completed: 120, total: 120 });
+  const probe = await readInteractionWorkerProbe(page);
+  expect(probe.referenceRequests).toBe(1);
+  for (const [x, y] of [
+    [0.25, 0.25],
+    [0.5, 0.5],
+    [0.75, 0.75]
+  ] as const) {
+    const pixel = await readCanvasPixel(page, x, y);
+    expect(pixel[3]).toBe(255);
+  }
 });
 
 test("stabilizes the alternate reported e100 deep view under 2.5 seconds", async ({ page }) => {

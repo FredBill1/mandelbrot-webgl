@@ -406,6 +406,18 @@ struct Complex64 {
     im: f64,
 }
 
+#[derive(Clone, Copy)]
+struct ComplexBall64 {
+    center: Complex64,
+    radius: f64,
+}
+
+#[derive(Clone, Copy)]
+struct AttractingCycle64 {
+    root: Complex64,
+    period: u32,
+}
+
 #[derive(Clone)]
 struct CachedRenderReference {
     screen_x: f64,
@@ -434,6 +446,9 @@ struct PixelResult64 {
     iter: u32,
     mag2: f64,
     rebase_count: u32,
+    periodic_interior: bool,
+    attracting_cycle: Option<AttractingCycle64>,
+    interior_probe_failed: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -493,6 +508,10 @@ const RENDER_INV_LN2: f64 = std::f64::consts::LOG2_E;
 const RENDER_SMOOTH_LOG_SCALE: f64 = 0.5 * std::f64::consts::LOG2_E;
 const RENDER_REFERENCE_INTERIOR_RADIUS_SAFETY: f64 = 0.90;
 const RENDER_REFERENCE_INTERIOR_MIN_BLOCK_SIZE: usize = 16;
+const RENDER_INTERIOR_PROBE_MAX_ITER: u32 = 256;
+const RENDER_INTERIOR_NEWTON_MAX_STEPS: usize = 16;
+const RENDER_INTERIOR_PROBE_FAILURE_COOLDOWN: u32 = 32;
+const RENDER_CLAMPED_SCALE_PIXEL_SPAN_THRESHOLD: f64 = 1e-290;
 
 #[wasm_bindgen]
 pub fn reset_render_cache() {
@@ -549,7 +568,7 @@ pub fn render_tile(
     let mut rgba = vec![0u8; width * height * 4];
     let mut certified_interior_mask = vec![0u8; width * height];
     let mut escaped_pixels = 0u32;
-    let periodic_interior_count = certify_render_blocks64(
+    let mut periodic_interior_count = certify_render_blocks64(
         &mut certified_interior_mask,
         &mut rgba,
         width,
@@ -567,21 +586,57 @@ pub fn render_tile(
     let mut palette_footprints = vec![-1f32; width * height];
     let screen_xs: Vec<f64> = (0..width).map(|px| rect.x + px as f64 + 0.5).collect();
     let screen_ys: Vec<f64> = (0..height).map(|py| rect.y + py as f64 + 0.5).collect();
+    let mut adjacent_interior = false;
+    let mut adjacent_cycle = None;
+    let mut interior_probe_cooldown = 0u32;
     for py in 0..height {
         let screen_y = screen_ys[py];
-        for px in 0..width {
+        let scan_start = if py & 1 == 0 {
+            0
+        } else {
+            width.saturating_sub(1)
+        };
+        for scan_offset in 0..width {
+            let px = if py & 1 == 0 {
+                scan_start + scan_offset
+            } else {
+                scan_start - scan_offset
+            };
             let pixel_index = py * width + px;
             if certified_interior_mask[pixel_index] != 0 {
+                adjacent_interior = true;
+                adjacent_cycle = None;
+                interior_probe_cooldown = 0;
                 continue;
             }
             let screen_x = screen_xs[px];
-            let result = render_pixel64(screen_x, screen_y, pixel_span, max_iter, &context);
+            let should_probe_interior = adjacent_interior && interior_probe_cooldown == 0;
+            let result = render_pixel64(
+                screen_x,
+                screen_y,
+                pixel_span,
+                max_iter,
+                should_probe_interior,
+                adjacent_cycle,
+                &context,
+            );
             let offset = pixel_index * 4;
             if result.iter < max_iter {
                 escaped_pixels += 1;
                 escaped_mask[pixel_index] = 1;
+            } else if result.periodic_interior {
+                periodic_interior_count += 1;
             } else {
                 cap_hit_unknown_count += 1;
+            }
+            adjacent_interior = result.iter >= max_iter;
+            adjacent_cycle = result.attracting_cycle;
+            if result.periodic_interior || result.iter < max_iter {
+                interior_probe_cooldown = 0;
+            } else if result.interior_probe_failed {
+                interior_probe_cooldown = RENDER_INTERIOR_PROBE_FAILURE_COOLDOWN;
+            } else {
+                interior_probe_cooldown = interior_probe_cooldown.saturating_sub(1);
             }
             rebase_count += result.rebase_count;
             let smooth = render_smooth_iteration(result.iter, max_iter, result.mag2);
@@ -1003,18 +1058,490 @@ fn render_pixel64(
     screen_y: f64,
     pixel_span: f64,
     max_iter: u32,
+    probe_interior: bool,
+    interior_hint: Option<AttractingCycle64>,
     context: &RenderContext,
 ) -> PixelResult64 {
-    let c_re = (screen_x - context.reference.screen_x) * pixel_span;
-    let c_im = (screen_y - context.reference.screen_y) * pixel_span;
-    perturb64(
+    let screen_dx = screen_x - context.reference.screen_x;
+    let screen_dy = screen_y - context.reference.screen_y;
+    let c_re = screen_dx * pixel_span;
+    let c_im = screen_dy * pixel_span;
+    if probe_interior {
+        if let Some((parameter, parameter_error)) = render_parameter_ball64(
+            screen_dx,
+            screen_dy,
+            c_re,
+            c_im,
+            pixel_span,
+            &context.reference.orbit_re,
+            &context.reference.orbit_im,
+        ) {
+            if let Some(cycle) =
+                certify_attracting_interior64(parameter, parameter_error, max_iter, interior_hint)
+            {
+                return PixelResult64 {
+                    iter: max_iter,
+                    mag2: 0.0,
+                    rebase_count: 0,
+                    periodic_interior: true,
+                    attracting_cycle: Some(cycle),
+                    interior_probe_failed: false,
+                };
+            }
+        }
+    }
+    let mut result = perturb64(
         c_re,
         c_im,
         &context.reference.orbit_re,
         &context.reference.orbit_im,
         max_iter,
         context.series.as_ref().expect("series plan is initialized"),
-    )
+    );
+    result.interior_probe_failed = probe_interior;
+    result
+}
+
+fn render_parameter_ball64(
+    screen_dx: f64,
+    screen_dy: f64,
+    c_delta_re: f64,
+    c_delta_im: f64,
+    pixel_span: f64,
+    orbit_re: &[f64],
+    orbit_im: &[f64],
+) -> Option<(Complex64, f64)> {
+    let reference_re = *orbit_re.get(1)?;
+    let reference_im = *orbit_im.get(1)?;
+    let center = Complex64 {
+        re: reference_re + c_delta_re,
+        im: reference_im + c_delta_im,
+    };
+    if !complex_is_finite64(center) || !pixel_span.is_finite() {
+        return None;
+    }
+
+    // orbit[1] is the high-precision view center truncated to f64. The remaining
+    // terms cover the screen-offset subtraction, the f64 pixel-span conversion,
+    // the offset multiplication, and the final addition. Full ULPs (rather than
+    // half ULPs) keep this enclosure conservative across native and Wasm builds.
+    let component_error = |screen_delta: f64, delta: f64, reference: f64, value: f64| {
+        let clamped_scale_error = if pixel_span.abs() < RENDER_CLAMPED_SCALE_PIXEL_SPAN_THRESHOLD {
+            // scaleToNumber clamps URL scales above 1e300. Enclose the whole
+            // f64 screen delta at that depth so the true, smaller delta remains
+            // inside the parameter ball even when the URL coordinate is not
+            // representable by f64.
+            outward_mul_nonnegative64(screen_delta.abs(), pixel_span.abs())
+        } else {
+            0.0
+        };
+        outward_sum_nonnegative64(&[
+            outward_mul_nonnegative64(2.0, ulp_bound64(reference)),
+            outward_mul_nonnegative64(
+                4.0,
+                outward_mul_nonnegative64(ulp_bound64(screen_delta), pixel_span.abs()),
+            ),
+            outward_mul_nonnegative64(
+                8.0,
+                outward_mul_nonnegative64(screen_delta.abs(), ulp_bound64(pixel_span)),
+            ),
+            outward_mul_nonnegative64(4.0, ulp_bound64(delta)),
+            outward_mul_nonnegative64(4.0, ulp_bound64(value)),
+            clamped_scale_error,
+        ])
+    };
+    let error_re = component_error(screen_dx, c_delta_re, reference_re, center.re);
+    let error_im = component_error(screen_dy, c_delta_im, reference_im, center.im);
+    let radius = outward_hypot_nonnegative64(error_re, error_im);
+    if radius.is_finite() {
+        Some((center, radius))
+    } else {
+        None
+    }
+}
+
+fn certify_attracting_interior64(
+    c: Complex64,
+    c_error: f64,
+    max_iter: u32,
+    hint: Option<AttractingCycle64>,
+) -> Option<AttractingCycle64> {
+    if !complex_is_finite64(c) || !c_error.is_finite() || c_error < 0.0 {
+        return None;
+    }
+    let probe_limit = max_iter.min(RENDER_INTERIOR_PROBE_MAX_ITER);
+    if let Some(cycle) = hint {
+        if let Some(proven) = certify_hint_attracting_interior64(c, c_error, probe_limit, cycle) {
+            return Some(proven);
+        }
+    }
+
+    let mut z = Complex64 { re: 0.0, im: 0.0 };
+    let mut minimum_mag2 = f64::INFINITY;
+
+    for period in 1..=probe_limit {
+        z = complex_add64(complex_square64(z), c);
+        if !complex_is_finite64(z) || z.re.abs().max(z.im.abs()) > 2.0 {
+            return None;
+        }
+        let mag2 = z.re * z.re + z.im * z.im;
+        if !mag2.is_finite() || mag2 >= minimum_mag2 {
+            continue;
+        }
+        minimum_mag2 = mag2;
+
+        let Some(mut root) = newton_periodic_point64(c, z, period) else {
+            continue;
+        };
+        let reduced_period = reduce_period64(c, root, period);
+        if reduced_period != period {
+            let Some(reduced_root) = newton_periodic_point64(c, root, reduced_period) else {
+                continue;
+            };
+            root = reduced_root;
+        }
+        if prove_attracting_cycle64(c, c_error, root, reduced_period) {
+            return Some(AttractingCycle64 {
+                root,
+                period: reduced_period,
+            });
+        }
+    }
+    None
+}
+
+fn certify_hint_attracting_interior64(
+    c: Complex64,
+    c_error: f64,
+    probe_limit: u32,
+    hint: AttractingCycle64,
+) -> Option<AttractingCycle64> {
+    if hint.period == 0 || hint.period > probe_limit {
+        return None;
+    }
+    let mut z = Complex64 { re: 0.0, im: 0.0 };
+    let mut minimum_mag2 = f64::INFINITY;
+    let mut is_candidate = false;
+    for period in 1..=hint.period {
+        z = complex_add64(complex_square64(z), c);
+        if !complex_is_finite64(z) || z.re.abs().max(z.im.abs()) > 2.0 {
+            return None;
+        }
+        let mag2 = z.re * z.re + z.im * z.im;
+        if !mag2.is_finite() {
+            return None;
+        }
+        let new_minimum = mag2 < minimum_mag2;
+        if new_minimum {
+            minimum_mag2 = mag2;
+        }
+        if period == hint.period {
+            is_candidate = new_minimum;
+        }
+    }
+    if !is_candidate {
+        return None;
+    }
+
+    let root = newton_periodic_point64(c, hint.root, hint.period)
+        .or_else(|| newton_periodic_point64(c, z, hint.period))?;
+    let reduced_period = reduce_period64(c, root, hint.period);
+    let root = if reduced_period == hint.period {
+        root
+    } else {
+        newton_periodic_point64(c, root, reduced_period)?
+    };
+    prove_attracting_cycle64(c, c_error, root, reduced_period).then_some(AttractingCycle64 {
+        root,
+        period: reduced_period,
+    })
+}
+
+fn newton_periodic_point64(c: Complex64, initial: Complex64, period: u32) -> Option<Complex64> {
+    let mut z = initial;
+    for _ in 0..RENDER_INTERIOR_NEWTON_MAX_STEPS {
+        let (mapped, derivative) = periodic_map_and_derivative64(c, z, period)?;
+        let residual = complex_sub64(mapped, z);
+        let jacobian = complex_sub64(derivative, Complex64 { re: 1.0, im: 0.0 });
+        let residual_norm = complex_abs_upper64(residual);
+        if residual_norm <= 64.0 * f64::EPSILON * complex_abs_upper64(z).max(1.0) {
+            break;
+        }
+        let correction = complex_div64(residual, jacobian)?;
+        z = complex_sub64(z, correction);
+        if !complex_is_finite64(z) {
+            return None;
+        }
+    }
+    let (mapped, _) = periodic_map_and_derivative64(c, z, period)?;
+    let residual = complex_abs_upper64(complex_sub64(mapped, z));
+    if residual.is_finite() && residual <= 1e-7 * complex_abs_upper64(z).max(1.0) {
+        Some(z)
+    } else {
+        None
+    }
+}
+
+fn reduce_period64(c: Complex64, root: Complex64, period: u32) -> u32 {
+    let tolerance = 1e-7 * complex_abs_upper64(root).max(1.0);
+    for divisor in 1..period {
+        if period % divisor != 0 {
+            continue;
+        }
+        let Some((mapped, _)) = periodic_map_and_derivative64(c, root, divisor) else {
+            continue;
+        };
+        if complex_abs_upper64(complex_sub64(mapped, root)) <= tolerance {
+            return divisor;
+        }
+    }
+    period
+}
+
+fn periodic_map_and_derivative64(
+    c: Complex64,
+    initial: Complex64,
+    period: u32,
+) -> Option<(Complex64, Complex64)> {
+    let mut z = initial;
+    let mut derivative = Complex64 { re: 1.0, im: 0.0 };
+    for _ in 0..period {
+        derivative = complex_scale64(complex_mul64(z, derivative), 2.0);
+        z = complex_add64(complex_square64(z), c);
+        if !complex_is_finite64(z) || !complex_is_finite64(derivative) {
+            return None;
+        }
+    }
+    Some((z, derivative))
+}
+
+fn prove_attracting_cycle64(c: Complex64, c_error: f64, root: Complex64, period: u32) -> bool {
+    if period == 0 || !complex_is_finite64(root) {
+        return false;
+    }
+    let Some((mapped, _)) = periodic_map_and_derivative64(c, root, period) else {
+        return false;
+    };
+    let residual = complex_abs_upper64(complex_sub64(mapped, root));
+    let root_roundoff = outward_hypot_nonnegative64(ulp_bound64(root.re), ulp_bound64(root.im));
+    let mut radius = outward_mul_nonnegative64(
+        2.0,
+        c_error
+            .max(outward_mul_nonnegative64(32.0, root_roundoff))
+            .max(outward_mul_nonnegative64(4.0, residual)),
+    );
+    if !radius.is_finite() || radius <= 0.0 {
+        return false;
+    }
+    let parameter = ComplexBall64 {
+        center: c,
+        radius: c_error,
+    };
+
+    for _ in 0..48 {
+        let mut state = ComplexBall64 {
+            center: root,
+            radius,
+        };
+        let mut derivative_bound = 1.0;
+        for _ in 0..period {
+            let state_norm =
+                outward_sum_nonnegative64(&[complex_abs_upper64(state.center), state.radius]);
+            derivative_bound = outward_mul_nonnegative64(
+                derivative_bound,
+                outward_mul_nonnegative64(2.0, state_norm),
+            );
+            state = ball_add64(ball_mul64(state, state), parameter);
+        }
+        if !ball_is_finite64(state) || !derivative_bound.is_finite() {
+            return false;
+        }
+
+        let (mapped_delta, mapped_delta_roundoff) = complex_sub_with_error64(state.center, root);
+        let mapped_radius = outward_sum_nonnegative64(&[
+            complex_abs_upper64(mapped_delta),
+            mapped_delta_roundoff,
+            state.radius,
+        ]);
+        if mapped_radius < radius && derivative_bound < 1.0 {
+            return true;
+        }
+        if derivative_bound >= 1.0 || !mapped_radius.is_finite() {
+            return false;
+        }
+        let contraction_slack = 1.0 - derivative_bound;
+        let fixed_ball_estimate = outward_mul_nonnegative64(
+            1.125,
+            next_up_nonnegative(mapped_radius / contraction_slack),
+        );
+        let next_radius = outward_mul_nonnegative64(1.5, radius).max(fixed_ball_estimate);
+        if !next_radius.is_finite() || next_radius <= radius || next_radius > 0.25 {
+            return false;
+        }
+        radius = next_radius;
+    }
+    false
+}
+
+fn ball_add64(left: ComplexBall64, right: ComplexBall64) -> ComplexBall64 {
+    let (center, roundoff) = complex_add_with_error64(left.center, right.center);
+    ComplexBall64 {
+        center,
+        radius: outward_sum_nonnegative64(&[left.radius, right.radius, roundoff]),
+    }
+}
+
+fn ball_mul64(left: ComplexBall64, right: ComplexBall64) -> ComplexBall64 {
+    let (center, roundoff) = complex_mul_with_error64(left.center, right.center);
+    let left_norm = complex_abs_upper64(left.center);
+    let right_norm = complex_abs_upper64(right.center);
+    ComplexBall64 {
+        center,
+        radius: outward_sum_nonnegative64(&[
+            outward_mul_nonnegative64(left_norm, right.radius),
+            outward_mul_nonnegative64(right_norm, left.radius),
+            outward_mul_nonnegative64(left.radius, right.radius),
+            roundoff,
+        ]),
+    }
+}
+
+fn ball_is_finite64(value: ComplexBall64) -> bool {
+    complex_is_finite64(value.center) && value.radius.is_finite() && value.radius >= 0.0
+}
+
+fn complex_add_with_error64(left: Complex64, right: Complex64) -> (Complex64, f64) {
+    let center = complex_add64(left, right);
+    let error = outward_hypot_nonnegative64(ulp_bound64(center.re), ulp_bound64(center.im));
+    (center, error)
+}
+
+fn complex_sub_with_error64(left: Complex64, right: Complex64) -> (Complex64, f64) {
+    let center = complex_sub64(left, right);
+    let error = outward_hypot_nonnegative64(ulp_bound64(center.re), ulp_bound64(center.im));
+    (center, error)
+}
+
+fn complex_mul_with_error64(left: Complex64, right: Complex64) -> (Complex64, f64) {
+    let ac = left.re * right.re;
+    let bd = left.im * right.im;
+    let ad = left.re * right.im;
+    let bc = left.im * right.re;
+    let center = Complex64 {
+        re: ac - bd,
+        im: ad + bc,
+    };
+    let error_re =
+        outward_sum_nonnegative64(&[ulp_bound64(ac), ulp_bound64(bd), ulp_bound64(center.re)]);
+    let error_im =
+        outward_sum_nonnegative64(&[ulp_bound64(ad), ulp_bound64(bc), ulp_bound64(center.im)]);
+    (center, outward_hypot_nonnegative64(error_re, error_im))
+}
+
+fn complex_add64(left: Complex64, right: Complex64) -> Complex64 {
+    Complex64 {
+        re: left.re + right.re,
+        im: left.im + right.im,
+    }
+}
+
+fn complex_sub64(left: Complex64, right: Complex64) -> Complex64 {
+    Complex64 {
+        re: left.re - right.re,
+        im: left.im - right.im,
+    }
+}
+
+fn complex_mul64(left: Complex64, right: Complex64) -> Complex64 {
+    Complex64 {
+        re: left.re * right.re - left.im * right.im,
+        im: left.re * right.im + left.im * right.re,
+    }
+}
+
+fn complex_square64(value: Complex64) -> Complex64 {
+    Complex64 {
+        re: value.re * value.re - value.im * value.im,
+        im: 2.0 * value.re * value.im,
+    }
+}
+
+fn complex_scale64(value: Complex64, factor: f64) -> Complex64 {
+    Complex64 {
+        re: value.re * factor,
+        im: value.im * factor,
+    }
+}
+
+fn complex_div64(numerator: Complex64, denominator: Complex64) -> Option<Complex64> {
+    let norm = denominator.re * denominator.re + denominator.im * denominator.im;
+    if !norm.is_finite() || norm <= f64::MIN_POSITIVE {
+        return None;
+    }
+    let value = Complex64 {
+        re: (numerator.re * denominator.re + numerator.im * denominator.im) / norm,
+        im: (numerator.im * denominator.re - numerator.re * denominator.im) / norm,
+    };
+    complex_is_finite64(value).then_some(value)
+}
+
+fn complex_is_finite64(value: Complex64) -> bool {
+    value.re.is_finite() && value.im.is_finite()
+}
+
+fn complex_abs_upper64(value: Complex64) -> f64 {
+    outward_hypot_nonnegative64(value.re.abs(), value.im.abs())
+}
+
+fn outward_hypot_nonnegative64(left: f64, right: f64) -> f64 {
+    next_up_nonnegative(next_up_nonnegative(left).hypot(next_up_nonnegative(right)))
+}
+
+fn outward_sum_nonnegative64(values: &[f64]) -> f64 {
+    values.iter().fold(0.0, |sum, value| {
+        next_up_nonnegative(sum + next_up_nonnegative(*value))
+    })
+}
+
+fn outward_mul_nonnegative64(left: f64, right: f64) -> f64 {
+    next_up_nonnegative(left * right)
+}
+
+fn ulp_bound64(value: f64) -> f64 {
+    if !value.is_finite() {
+        return f64::INFINITY;
+    }
+    let upper = (next_up64(value) - value).abs();
+    let lower = (value - next_down64(value)).abs();
+    next_up_nonnegative(upper.max(lower))
+}
+
+fn next_up64(value: f64) -> f64 {
+    if value.is_nan() || value == f64::INFINITY {
+        return value;
+    }
+    if value == 0.0 {
+        return f64::from_bits(1);
+    }
+    if value > 0.0 {
+        f64::from_bits(value.to_bits() + 1)
+    } else {
+        f64::from_bits(value.to_bits() - 1)
+    }
+}
+
+fn next_down64(value: f64) -> f64 {
+    if value.is_nan() || value == f64::NEG_INFINITY {
+        return value;
+    }
+    if value == 0.0 {
+        return -f64::from_bits(1);
+    }
+    if value > 0.0 {
+        f64::from_bits(value.to_bits() - 1)
+    } else {
+        f64::from_bits(value.to_bits() + 1)
+    }
 }
 
 fn ensure_render_series(context: &mut RenderContext, series_degree: usize, pixel_span: f64) {
@@ -1065,6 +1592,9 @@ fn perturb64(
                 iter,
                 mag2: f64::INFINITY,
                 rebase_count,
+                periodic_interior: false,
+                attracting_cycle: None,
+                interior_probe_failed: false,
             };
         }
 
@@ -1075,6 +1605,9 @@ fn perturb64(
                 iter,
                 mag2: f64::INFINITY,
                 rebase_count,
+                periodic_interior: false,
+                attracting_cycle: None,
+                interior_probe_failed: false,
             };
         }
         let z_norm = z_re.abs().max(z_im.abs());
@@ -1084,6 +1617,9 @@ fn perturb64(
                 iter,
                 mag2,
                 rebase_count,
+                periodic_interior: false,
+                attracting_cycle: None,
+                interior_probe_failed: false,
             };
         }
         if iter >= max_iter {
@@ -1091,6 +1627,9 @@ fn perturb64(
                 iter: max_iter,
                 mag2,
                 rebase_count,
+                periodic_interior: false,
+                attracting_cycle: None,
+                interior_probe_failed: false,
             };
         }
 
@@ -1120,6 +1659,9 @@ fn perturb64(
                 iter,
                 mag2: f64::INFINITY,
                 rebase_count,
+                periodic_interior: false,
+                attracting_cycle: None,
+                interior_probe_failed: false,
             };
         }
     }
@@ -1127,6 +1669,9 @@ fn perturb64(
         iter: max_iter,
         mag2,
         rebase_count,
+        periodic_interior: false,
+        attracting_cycle: None,
+        interior_probe_failed: false,
     }
 }
 
@@ -2033,5 +2578,77 @@ mod tests {
         assert!(plan.skip <= 64);
         assert!(plan.coeff_re.iter().all(|value| value.is_finite()));
         assert!(plan.coeff_im.iter().all(|value| value.is_finite()));
+    }
+
+    fn periodic_target_parameter(screen_x: f64, screen_y: f64) -> Complex64 {
+        let center = Complex64 {
+            re: "-1.76854392069529079967435552147905380619071646671631558221721367158317146672961987405313343e0"
+                .parse()
+                .unwrap(),
+            im: "-7.30078926394540958134620082008361635055501804364889844988162485821612638368665062006680955e-4"
+                .parse()
+                .unwrap(),
+        };
+        let scale: f64 = "5.16675442717597361866334085449662625942340146464132181028971962586112670232698885953242576e3"
+            .parse()
+            .unwrap();
+        let pixel_span = 3.5 / scale / 1912.0;
+        Complex64 {
+            re: center.re + (screen_x - 956.0) * pixel_span,
+            im: center.im + (screen_y - 474.0) * pixel_span,
+        }
+    }
+
+    fn critical_orbit_value(c: Complex64, period: u32) -> Complex64 {
+        let mut z = Complex64 { re: 0.0, im: 0.0 };
+        for _ in 0..period {
+            z = complex_add64(complex_square64(z), c);
+        }
+        z
+    }
+
+    #[test]
+    fn proves_period_three_and_six_target_interior_points() {
+        for (screen_x, screen_y, period) in [(1216.5, 448.5, 3), (704.5, 448.5, 6)] {
+            let c = periodic_target_parameter(screen_x, screen_y);
+            let initial = critical_orbit_value(c, period);
+            let root = newton_periodic_point64(c, initial, period).unwrap();
+            assert_eq!(reduce_period64(c, root, period), period);
+            assert!(prove_attracting_cycle64(c, 1e-14, root, period));
+            assert!(certify_attracting_interior64(c, 1e-14, 5000, None).is_some());
+        }
+    }
+
+    #[test]
+    fn does_not_certify_target_center_that_escapes_near_iteration_226() {
+        let c = periodic_target_parameter(956.0, 474.0);
+        assert!(certify_attracting_interior64(c, 1e-14, 5000, None).is_none());
+    }
+
+    #[test]
+    fn rejects_a_cycle_when_parameter_uncertainty_crosses_its_component() {
+        let c = periodic_target_parameter(704.5, 448.5);
+        let initial = critical_orbit_value(c, 6);
+        let root = newton_periodic_point64(c, initial, 6).unwrap();
+        assert!(prove_attracting_cycle64(c, 1e-14, root, 6));
+        assert!(!prove_attracting_cycle64(c, 1e-3, root, 6));
+    }
+
+    #[test]
+    fn clamped_deep_pixel_span_encloses_the_full_f64_delta() {
+        let pixel_span = 1e-303;
+        let screen_dx = 100.0;
+        let delta = screen_dx * pixel_span;
+        let (_, radius) = render_parameter_ball64(
+            screen_dx,
+            0.0,
+            delta,
+            0.0,
+            pixel_span,
+            &[0.0, 0.0],
+            &[0.0, 0.0],
+        )
+        .unwrap();
+        assert!(radius >= delta.abs());
     }
 }
