@@ -1,10 +1,17 @@
 import type {
+  ReferenceSnapshot,
   RenderTileMessage,
+  RuntimeView,
   TileDoneMessage,
   TileWorkerInMessage,
   TileWorkerOutMessage
 } from "../types";
-import type { RawReferenceResult, ReferenceComputer, ReferenceWorkOptions } from "../reference/referenceClient";
+
+export interface RawReferenceResult {
+  maxIterBoundedRadius: number;
+  orbitRe: Float64Array;
+  orbitIm: Float64Array;
+}
 
 interface RenderQueueItem {
   kind: "render";
@@ -18,31 +25,36 @@ interface RenderQueueItem {
 
 interface ReferenceQueueItem {
   kind: "reference";
-  message: {
-    type: "computeReference";
-    requestId: number;
-    centerRe: string;
-    centerIm: string;
-    scale: string;
-    maxIter: number;
-    minPrecisionBits: number;
-  };
-  revision: number | undefined;
+  message: ComputeReferenceMessage;
+  revision: number;
   priority: number;
   sequence: number;
-  queuedAt: number;
   resolve: (result: RawReferenceResult) => void;
   reject: (error: Error) => void;
 }
 
-type QueueItem = RenderQueueItem | ReferenceQueueItem;
+interface ComputeReferenceMessage {
+  type: "computeReference";
+  requestId: number;
+  centerRe: string;
+  centerIm: string;
+  scale: string;
+  maxIter: number;
+  minPrecisionBits: number;
+}
 
-export class TileWorkerPool implements ReferenceComputer {
+type QueueItem = RenderQueueItem | ReferenceQueueItem;
+type WorkerMessage =
+  | TileWorkerOutMessage
+  | { type: "referenceDone"; requestId: number; reference: RawReferenceResult }
+  | { type: "referenceError"; requestId: number; message: string };
+
+export class TileWorkerPool {
   private readonly workers: Worker[] = [];
   private readonly idle: Worker[] = [];
   private readonly queue: QueueItem[] = [];
   private readonly inFlight = new Map<Worker, QueueItem>();
-  private readonly residentReferences = new Map<Worker, Set<string>>();
+  private readonly residentRevision = new Map<Worker, number>();
   private sequence = 0;
   private requestId = 0;
 
@@ -58,60 +70,62 @@ export class TileWorkerPool implements ReferenceComputer {
     return this.inFlight.size;
   }
 
-  render(message: RenderTileMessage, priority = defaultPriority(message)): Promise<TileDoneMessage> {
+  render(message: RenderTileMessage, priority = 0): Promise<TileDoneMessage> {
     this.ensureRenderCapacity();
+    const queuedAt = performance.now();
     const promise = new Promise<TileDoneMessage>((resolve, reject) => {
-      const queuedAt = performance.now();
       this.queue.push({ kind: "render", message, priority, sequence: ++this.sequence, queuedAt, resolve, reject });
-      this.queue.sort((a, b) => a.priority - b.priority || a.sequence - b.sequence);
-      recordDeepBench({ type: "tileQueued", tileId: message.tile.id, revision: message.tile.revision, renderMode: message.renderMode, priority, queuedAt });
+      this.sortQueue();
+      recordDeepBench({ type: "tileQueued", tileId: message.tile.id, revision: message.tile.revision, priority, queuedAt });
     });
     this.pump();
     return promise;
   }
 
-  compute(
-    centerRe: string,
-    centerIm: string,
-    scale: string,
-    maxIter: number,
-    minPrecisionBits = 128,
-    options: ReferenceWorkOptions = {}
-  ): Promise<RawReferenceResult> {
+  async computeViewReference(view: RuntimeView): Promise<ReferenceSnapshot> {
     const requestId = ++this.requestId;
-    const promise = new Promise<RawReferenceResult>((resolve, reject) => {
+    const raw = await new Promise<RawReferenceResult>((resolve, reject) => {
       this.queue.push({
         kind: "reference",
-        message: { type: "computeReference", requestId, centerRe, centerIm, scale, maxIter, minPrecisionBits },
-        revision: options.revision,
-        priority: options.kind === "viewReference" ? -5 : -2.25,
+        message: {
+          type: "computeReference",
+          requestId,
+          centerRe: view.re,
+          centerIm: view.im,
+          scale: view.scale,
+          maxIter: view.maxIter,
+          minPrecisionBits: 128
+        },
+        revision: view.revision,
+        priority: -1,
         sequence: ++this.sequence,
-        queuedAt: performance.now(),
         resolve,
         reject
       });
-      this.queue.sort((a, b) => a.priority - b.priority || a.sequence - b.sequence);
+      this.sortQueue();
+      this.pump();
     });
-    this.pump();
-    return promise;
-  }
-
-  cancelObsoleteWork(currentRevision: number): void {
-    this.clearQueueForOldRevisions(currentRevision);
+    return {
+      revision: view.revision,
+      screenX: view.width * 0.5,
+      screenY: view.height * 0.5,
+      maxIterBoundedRadius: raw.maxIterBoundedRadius,
+      orbitRe: raw.orbitRe,
+      orbitIm: raw.orbitIm
+    };
   }
 
   clearQueueForOldRevisions(currentRevision: number): void {
-    for (let i = this.queue.length - 1; i >= 0; i -= 1) {
-      const item = this.queue[i];
+    for (let index = this.queue.length - 1; index >= 0; index -= 1) {
+      const item = this.queue[index];
       const itemRevision = item.kind === "render" ? item.message.tile.revision : item.revision;
-      if (itemRevision !== undefined && itemRevision !== currentRevision) {
-        const [item] = this.queue.splice(i, 1);
-        item?.reject(new Error("stale work revision"));
-      }
+      if (itemRevision === currentRevision) continue;
+      this.queue.splice(index, 1);
+      item.reject(new Error("stale work revision"));
     }
     for (const [worker, item] of [...this.inFlight.entries()]) {
       const itemRevision = item.kind === "render" ? item.message.tile.revision : item.revision;
-      if (itemRevision === undefined || itemRevision === currentRevision) continue;
+      if (itemRevision === currentRevision) continue;
       this.inFlight.delete(worker);
       item.reject(new Error("stale work revision"));
       this.replaceWorker(worker);
@@ -119,12 +133,8 @@ export class TileWorkerPool implements ReferenceComputer {
     this.pump();
   }
 
-  dispose(): void {
-    for (const worker of this.workers) worker.terminate();
-    this.queue.splice(0);
-    this.inFlight.clear();
-    this.idle.splice(0);
-    this.residentReferences.clear();
+  private sortQueue(): void {
+    this.queue.sort((a, b) => a.priority - b.priority || a.sequence - b.sequence);
   }
 
   private pump(): void {
@@ -133,29 +143,37 @@ export class TileWorkerPool implements ReferenceComputer {
       const item = this.queue.shift();
       if (!worker || !item) break;
       this.inFlight.set(worker, item);
-      if (item.kind === "render") {
-        recordDeepBench({
-          type: "tileStarted",
-          tileId: item.message.tile.id,
-          revision: item.message.tile.revision,
-          renderMode: item.message.renderMode,
-          queuedAt: item.queuedAt,
-          startedAt: performance.now()
-        });
-        const message = this.prepareMessage(worker, item.message);
-        worker.postMessage(message satisfies TileWorkerInMessage, renderTransferables(message));
-      } else {
+      if (item.kind === "reference") {
         worker.postMessage(item.message);
+        continue;
       }
+      recordDeepBench({
+        type: "tileStarted",
+        tileId: item.message.tile.id,
+        revision: item.message.tile.revision,
+        queuedAt: item.queuedAt,
+        startedAt: performance.now()
+      });
+      worker.postMessage(this.prepareMessage(worker, item.message) satisfies TileWorkerInMessage);
     }
+  }
+
+  private prepareMessage(worker: Worker, message: RenderTileMessage): RenderTileMessage {
+    if (this.residentRevision.get(worker) !== message.reference.revision) {
+      this.residentRevision.set(worker, message.reference.revision);
+      return message;
+    }
+    return {
+      ...message,
+      reference: { ...message.reference, orbitRe: EMPTY_REFERENCE_ORBIT, orbitIm: EMPTY_REFERENCE_ORBIT }
+    };
   }
 
   private createWorker(): Worker {
     const worker = new Worker(new URL("../workers/tileWorker.ts", import.meta.url), { type: "module" });
-    worker.onmessage = (event: MessageEvent) => this.handleMessage(worker, event.data);
+    worker.onmessage = (event: MessageEvent<WorkerMessage>) => this.handleMessage(worker, event.data);
     worker.onerror = (event) => this.handleError(worker, new Error(event.message));
     this.workers.push(worker);
-    this.residentReferences.set(worker, new Set());
     return worker;
   }
 
@@ -165,7 +183,7 @@ export class TileWorkerPool implements ReferenceComputer {
     if (idleIndex >= 0) this.idle.splice(idleIndex, 1);
     const workerIndex = this.workers.indexOf(worker);
     if (workerIndex >= 0) this.workers.splice(workerIndex, 1);
-    this.residentReferences.delete(worker);
+    this.residentRevision.delete(worker);
     this.idle.push(this.createWorker());
   }
 
@@ -173,29 +191,7 @@ export class TileWorkerPool implements ReferenceComputer {
     while (this.workers.length < this.size) this.idle.push(this.createWorker());
   }
 
-  private prepareMessage(worker: Worker, message: RenderTileMessage): RenderTileMessage {
-    const resident = this.residentReferences.get(worker);
-    const reference = message.reference;
-    if (!resident || !reference) return message;
-    const key = referenceTransportKey(reference);
-    if (!resident.has(key)) {
-      resident.add(key);
-      return message;
-    }
-    return {
-      ...message,
-      reference: {
-        ...reference,
-        orbitRe: EMPTY_REFERENCE_ORBIT,
-        orbitIm: EMPTY_REFERENCE_ORBIT
-      }
-    };
-  }
-
-  private handleMessage(
-    worker: Worker,
-    message: TileWorkerOutMessage | { type: "referenceDone"; requestId: number; reference: RawReferenceResult } | { type: "referenceError"; requestId: number; message: string }
-  ): void {
+  private handleMessage(worker: Worker, message: WorkerMessage): void {
     const item = this.inFlight.get(worker);
     if (!item) return;
     this.inFlight.delete(worker);
@@ -205,11 +201,11 @@ export class TileWorkerPool implements ReferenceComputer {
     } else if (item.kind === "reference" && message.type === "referenceDone") {
       item.resolve({
         ...message.reference,
-        orbitRe: message.reference.orbitRe instanceof Float64Array ? message.reference.orbitRe : Float64Array.from(message.reference.orbitRe),
-        orbitIm: message.reference.orbitIm instanceof Float64Array ? message.reference.orbitIm : Float64Array.from(message.reference.orbitIm)
+        orbitRe: asFloat64(message.reference.orbitRe),
+        orbitIm: asFloat64(message.reference.orbitIm)
       });
     } else {
-      item.reject(new Error(message.type === "referenceError" ? message.message : "Worker returned mismatched response"));
+      item.reject(new Error(message.type === "referenceError" ? message.message : "worker returned a mismatched response"));
     }
     this.pump();
   }
@@ -220,7 +216,7 @@ export class TileWorkerPool implements ReferenceComputer {
       this.inFlight.delete(worker);
       item.reject(error);
     }
-    this.idle.push(worker);
+    this.replaceWorker(worker);
     this.pump();
   }
 }
@@ -232,21 +228,8 @@ export function resolveWorkerCount(hardwareConcurrency = globalThis.navigator?.h
 
 const EMPTY_REFERENCE_ORBIT = new Float64Array();
 
-function referenceTransportKey(reference: NonNullable<RenderTileMessage["reference"]>): string {
-  return `${reference.revision}|${reference.id}|${reference.screenX}|${reference.screenY}|${reference.escapedAt}|${reference.maxIter}|${reference.maxIterBoundedRadius}`;
-}
-
-function renderTransferables(message: RenderTileMessage): ArrayBuffer[] {
-  const buffers = [
-    message.exactBaseRgba,
-    message.exactUnresolvedMask,
-  ].filter((buffer): buffer is ArrayBuffer => buffer instanceof ArrayBuffer && buffer.byteLength > 0);
-  return [...new Set(buffers)];
-}
-
-function defaultPriority(message: RenderTileMessage): number {
-  if (message.renderMode === "preview") return 0;
-  return 10;
+function asFloat64(value: Float64Array | ArrayLike<number>): Float64Array {
+  return value instanceof Float64Array ? value : Float64Array.from(value);
 }
 
 function recordDeepBench(event: Record<string, unknown>): void {

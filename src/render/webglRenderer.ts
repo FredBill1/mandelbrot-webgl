@@ -51,14 +51,6 @@ export class WebglTileRenderer {
     this.configure();
   }
 
-  get textureCount(): number {
-    return this.cache.size;
-  }
-
-  get textureBytes(): number {
-    return this.cache.bytes;
-  }
-
   resize(width: number, height: number): void {
     if (this.canvas.width !== width || this.canvas.height !== height) {
       this.canvas.width = width;
@@ -112,7 +104,6 @@ export class WebglTileRenderer {
       type: "tileUploadStarted",
       tileId: result.tileId,
       revision: result.revision,
-      renderMode: result.stats.renderMode,
       width: result.width,
       height: result.height,
       uploadStartedAt
@@ -154,7 +145,6 @@ export class WebglTileRenderer {
       type: "tileUploadDone",
       tileId: result.tileId,
       revision: result.revision,
-      renderMode: result.stats.renderMode,
       uploadStartedAt,
       uploadDoneAt: performance.now()
     });

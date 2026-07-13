@@ -1,7 +1,6 @@
-import { ReferenceManager } from "./reference/referenceManager";
 import { WebglTileRenderer, type RetainedScreenTransform } from "./render/webglRenderer";
 import { TileWorkerPool } from "./scheduler/workerPool";
-import { createVisibleTileShells, tileKeyToId } from "./tiles/tileKey";
+import { createVisibleTiles } from "./tiles/tilePlanner";
 import {
   DEEP_TEST_VIEW,
   DEFAULT_VIEW,
@@ -23,16 +22,12 @@ import {
   type IterFormula,
   type IterSettings
 } from "./math/view";
-import { initWasm, pointToViewCenterNow, transformViewNow } from "./wasmApi";
+import { initWasm, transformViewNow } from "./wasmApi";
 import {
-  SERIES_DEGREE,
   TILE_SIZE,
-  type Rect,
   type ReferenceSnapshot,
   type RuntimeView,
   type TileDescriptor,
-  type TileDoneMessage,
-  type UnresolvedCluster,
   type ViewState
 } from "./types";
 
@@ -41,31 +36,13 @@ interface Stats {
   pending: number;
   activeWorkers: number;
   completedTiles: number;
-  references: number;
-  lastTileMs: number;
-  lastSeriesSkip: number;
-  glitches: number;
   status: string;
 }
 
 interface TileWorkState {
   tile: TileDescriptor;
-  reference: ReferenceSnapshot | undefined;
-  splitLevel: number;
   inFlight: boolean;
   completed: boolean;
-  previewUploaded: boolean;
-  forceExact: boolean;
-  exactFallback: boolean;
-  exactBaseRgba: ArrayBuffer | undefined;
-  exactUnresolvedMask: ArrayBuffer | undefined;
-}
-
-type TileShell = Omit<TileDescriptor, "centerRe" | "centerIm">;
-
-interface ExactPatchInput {
-  baseRgba: ArrayBuffer;
-  unresolvedMask: ArrayBuffer;
 }
 
 interface PointerSample {
@@ -85,9 +62,6 @@ interface ActivateViewOptions {
   scheduleWork?: boolean;
 }
 
-const EXACT_PATCH_MAX_PIXELS = 4096;
-const EXACT_PATCH_PADDING = 2;
-const MIN_EXACT_PATCH_SIZE = 8;
 const TILE_SCHEDULE_BATCH_MS = 6;
 const TILE_SCHEDULE_MIN_BATCH = 2;
 const ITER_CONTROL_DEBOUNCE_MS = 120;
@@ -122,7 +96,6 @@ export async function startApp(root: HTMLElement): Promise<void> {
             <div class="hudRow"><span>Iter</span><strong id="readIter"></strong></div>
             <div class="hudRow"><span>Workers</span><strong id="readWorkers"></strong></div>
             <div class="hudRow"><span>Tiles</span><strong id="readTiles"></strong></div>
-            <div class="hudRow"><span>Refs</span><strong id="readRefs"></strong></div>
             <div class="hudRow"><span>FPS</span><strong id="readFps"></strong></div>
             <div class="hudRow"><span>Status</span><strong id="readStatus"></strong></div>
           </section>
@@ -191,22 +164,14 @@ export async function startApp(root: HTMLElement): Promise<void> {
     pending: 0,
     activeWorkers: 0,
     completedTiles: 0,
-    references: 0,
-    lastTileMs: 0,
-    lastSeriesSkip: 0,
-    glitches: 0,
     status: "initializing"
   };
 
   const renderer = new WebglTileRenderer(canvas);
   const pool = new TileWorkerPool();
-  const references = new ReferenceManager(pool);
   const pendingTileIds = new Set<string>();
   const tileStates = new Map<string, TileWorkState>();
-  let initialTileCount = 0;
-  let patchTilesCreated = 0;
-  let patchTileLimit = 512;
-  let pendingTileShells = 0;
+  let pendingTilesToSchedule = 0;
   let activeViewReference: ReferenceSnapshot | undefined;
 
   await mainWasmReady;
@@ -321,7 +286,6 @@ export async function startApp(root: HTMLElement): Promise<void> {
     runtime = currentRuntimeView();
     window.clearTimeout(scheduledDeferredRenderWork);
     scheduledDeferredRenderWork = 0;
-    references.cancelObsoleteWork(revision);
     pool.clearQueueForOldRevisions(revision);
     resetRenderWorkState();
     renderer.setActiveRevision(revision);
@@ -359,13 +323,9 @@ export async function startApp(root: HTMLElement): Promise<void> {
   function resetRenderWorkState(): void {
     stats.pending = 0;
     stats.completedTiles = 0;
-    stats.glitches = 0;
     pendingTileIds.clear();
     tileStates.clear();
-    initialTileCount = 0;
-    patchTilesCreated = 0;
-    patchTileLimit = 512;
-    pendingTileShells = 0;
+    pendingTilesToSchedule = 0;
     activeViewReference = undefined;
   }
 
@@ -373,165 +333,70 @@ export async function startApp(root: HTMLElement): Promise<void> {
     const localRuntime = currentRuntimeView();
     stats.status = `rendering ${reason}`;
     resetRenderWorkState();
-
-    startViewReference(localRuntime, token);
-    const shells = prioritizeTileShells(createVisibleTileShells(localRuntime, TILE_SIZE), localRuntime);
-    if (token !== renderToken) return;
-
-    initialTileCount = shells.length;
-    patchTileLimit = Math.max(512, initialTileCount * 6);
-    pendingTileShells = shells.length;
+    const tiles = prioritizeTiles(createVisibleTiles(localRuntime, TILE_SIZE), localRuntime);
+    pendingTilesToSchedule = tiles.length;
     stats.pending = pendingWorkCount();
-    stats.references = references.size;
-    stats.status = `rendering ${shells.length} tiles`;
-
-    scheduleTileShellBatch(localRuntime, shells, 0, token);
-  }
-
-  function scheduleTileShellBatch(localRuntime: RuntimeView, shells: TileShell[], startIndex: number, token: number): void {
-    if (token !== renderToken || localRuntime.revision !== revision) return;
-    const activeRuntime = currentRuntimeView();
-    const deadline = performance.now() + TILE_SCHEDULE_BATCH_MS;
-    let index = startIndex;
-    let processed = 0;
-    while (index < shells.length && (processed < TILE_SCHEDULE_MIN_BATCH || performance.now() < deadline)) {
-      const tile = materializeTileShell(activeRuntime, shells[index]);
-      if (token !== renderToken || localRuntime.revision !== revision) return;
-      createTileState(tile, undefined, 0);
-      pendingTileShells = Math.max(0, shells.length - index - 1);
-      void submitPreview(activeRuntime, mustTileState(tile.id));
-      index += 1;
-      processed += 1;
-    }
-    stats.pending = pendingWorkCount();
-    stats.references = references.size;
-    updateWorkStatus("rendering");
-    if (index < shells.length) {
-      window.setTimeout(() => scheduleTileShellBatch(localRuntime, shells, index, token), 0);
-    }
-  }
-
-  function materializeTileShell(localRuntime: RuntimeView, shell: TileShell): TileDescriptor {
-    const center = pointToViewCenterNow(view, localRuntime.width, localRuntime.height, shell.centerScreenX, shell.centerScreenY);
-    return { ...shell, centerRe: center.re, centerIm: center.im };
-  }
-
-  function prioritizeTileShells(shells: TileShell[], localRuntime: RuntimeView): TileShell[] {
-    const centerX = localRuntime.width * 0.5;
-    const centerY = localRuntime.height * 0.5;
-    return [...shells].sort((a, b) => {
-      const da = Math.hypot(a.centerScreenX - centerX, a.centerScreenY - centerY);
-      const db = Math.hypot(b.centerScreenX - centerX, b.centerScreenY - centerY);
-      return da - db;
-    });
-  }
-
-  function startViewReference(localRuntime: RuntimeView, token: number): void {
-    void references.ensureViewReference(localRuntime, 0).then((reference) => {
+    stats.status = `computing reference for ${tiles.length} tiles`;
+    void pool.computeViewReference(localRuntime).then((reference) => {
       if (token !== renderToken || localRuntime.revision !== revision) return;
       activeViewReference = reference;
-      stats.references = references.size;
-      for (const state of tileStates.values()) {
-        if (state.tile.revision !== revision || state.completed) continue;
-        state.reference = reference;
-        state.previewUploaded = true;
-      }
-      for (const state of tileStates.values()) {
-        void submitTile(localRuntime, state);
-      }
-      updateWorkStatus("rendering");
+      scheduleTileBatch(localRuntime, tiles, 0, token);
     }).catch((error) => {
       if (token === renderToken) stats.status = error instanceof Error ? error.message : String(error);
     });
   }
 
-  function createTileState(tile: TileDescriptor, reference: ReferenceSnapshot | undefined, splitLevel: number): TileWorkState {
-    const state: TileWorkState = {
-      tile,
-      reference: reference ?? activeViewReference,
-      splitLevel,
-      inFlight: false,
-      completed: false,
-      previewUploaded: false,
-      forceExact: false,
-      exactFallback: false,
-      exactBaseRgba: undefined,
-      exactUnresolvedMask: undefined
-    };
-    tileStates.set(tile.id, state);
-    pendingTileIds.add(tile.id);
-    return state;
+  function prioritizeTiles(tiles: TileDescriptor[], localRuntime: RuntimeView): TileDescriptor[] {
+    const centerX = localRuntime.width * 0.5;
+    const centerY = localRuntime.height * 0.5;
+    return [...tiles].sort((a, b) => {
+      const da = Math.hypot(a.rect.x + a.rect.width * 0.5 - centerX, a.rect.y + a.rect.height * 0.5 - centerY);
+      const db = Math.hypot(b.rect.x + b.rect.width * 0.5 - centerX, b.rect.y + b.rect.height * 0.5 - centerY);
+      return da - db;
+    });
   }
 
-  function mustTileState(tileId: string): TileWorkState {
-    const state = tileStates.get(tileId);
-    if (!state) throw new Error(`Missing tile state ${tileId}`);
-    return state;
+  function scheduleTileBatch(localRuntime: RuntimeView, tiles: TileDescriptor[], startIndex: number, token: number): void {
+    if (token !== renderToken || localRuntime.revision !== revision || !activeViewReference) return;
+    const deadline = performance.now() + TILE_SCHEDULE_BATCH_MS;
+    let index = startIndex;
+    let processed = 0;
+    while (index < tiles.length && (processed < TILE_SCHEDULE_MIN_BATCH || performance.now() < deadline)) {
+      const tile = tiles[index];
+      const state: TileWorkState = { tile, inFlight: false, completed: false };
+      tileStates.set(tile.id, state);
+      pendingTileIds.add(tile.id);
+      pendingTilesToSchedule = Math.max(0, tiles.length - index - 1);
+      void submitTile(localRuntime, state, activeViewReference);
+      index += 1;
+      processed += 1;
+    }
+    stats.pending = pendingWorkCount();
+    updateWorkStatus("rendering");
+    if (index < tiles.length) window.setTimeout(() => scheduleTileBatch(localRuntime, tiles, index, token), 0);
   }
 
-  async function submitPreview(localRuntime: RuntimeView, state: TileWorkState): Promise<void> {
-    if (state.previewUploaded || state.completed || state.tile.revision !== revision || !state.reference) return;
-    state.previewUploaded = true;
-    void submitTile(localRuntime, state);
-  }
-
-  async function submitTile(localRuntime: RuntimeView, state: TileWorkState): Promise<void> {
+  async function submitTile(localRuntime: RuntimeView, state: TileWorkState, reference: ReferenceSnapshot): Promise<void> {
     if (localRuntime.maxIter !== view.maxIter || localRuntime.revision !== revision) localRuntime = currentRuntimeView();
     if (state.inFlight || state.completed || state.tile.revision !== revision) return;
-    if (!state.forceExact && !state.previewUploaded) return;
-    const candidates = state.forceExact ? [] : buildReferenceCandidates(state, localRuntime);
-    if (!state.forceExact && candidates.length === 0) {
-      updateWorkStatus("rendering");
-      return;
-    }
-
     state.inFlight = true;
-    const priority = finalRenderPriority(state);
+    const centerX = state.tile.rect.x + state.tile.rect.width * 0.5;
+    const centerY = state.tile.rect.y + state.tile.rect.height * 0.5;
+    const priority = Math.hypot(centerX - localRuntime.width * 0.5, centerY - localRuntime.height * 0.5);
     try {
       const result = await pool.render(
         {
           type: "renderTile",
           tile: state.tile,
-          canvasWidth: localRuntime.width,
-          canvasHeight: localRuntime.height,
-          viewScale: localRuntime.scale,
           pixelSpan: pixelSpanForView(localRuntime, localRuntime.width),
           maxIter: localRuntime.maxIter,
-          reference: state.forceExact ? undefined : candidates[0],
-          seriesDegree: SERIES_DEGREE,
-          paletteId: "cosine",
-          renderMode: state.forceExact ? "exact" : "final",
-          sampleStep: 1,
-          exactBaseRgba: state.exactBaseRgba,
-          exactUnresolvedMask: state.exactUnresolvedMask,
+          reference
         },
         priority
       );
       state.inFlight = false;
       if (result.revision !== revision || state.completed || state.tile.revision !== revision) return;
-      stats.lastTileMs = result.stats.elapsedMs;
-      stats.lastSeriesSkip = result.stats.seriesSkip;
-      stats.glitches += result.stats.glitchCount;
       stats.activeWorkers = pool.active;
-      stats.references = references.size;
-
-      if (state.forceExact) {
-        renderer.uploadTile(result);
-        state.completed = true;
-        stats.completedTiles += 1;
-        pendingTileIds.delete(state.tile.id);
-        stats.pending = pendingWorkCount();
-        updateWorkStatus("rendering");
-        return;
-      }
-
-      if (result.stats.unresolvedCount > 0) {
-        renderer.uploadTile(result);
-        state.previewUploaded = true;
-        await scheduleExactFallback(localRuntime, state, result);
-        return;
-      }
-
       renderer.uploadTile(result);
       state.completed = true;
       stats.completedTiles += 1;
@@ -545,191 +410,8 @@ export async function startApp(root: HTMLElement): Promise<void> {
     }
   }
 
-  function buildReferenceCandidates(state: TileWorkState, _localRuntime: RuntimeView): ReferenceSnapshot[] {
-    return state.reference ? [state.reference] : [];
-  }
-
-  async function scheduleExactFallback(localRuntime: RuntimeView, state: TileWorkState, result: TileDoneMessage): Promise<void> {
-    const tile = state.tile;
-    if (tile.revision !== revision) return;
-    const clusters = result.stats.unresolvedClusters;
-    const patchRects = exactPatchRects(tile.rect, clusters);
-    const useWholeTile =
-      patchRects.length === 0 ||
-      tile.rect.width * tile.rect.height <= EXACT_PATCH_MAX_PIXELS ||
-      patchTilesCreated + patchRects.length > patchTileLimit;
-    const rects = useWholeTile ? [tile.rect] : patchRects;
-    const patches = (
-      await Promise.all(
-        rects.map(async (rect, index) => {
-          const input = buildExactPatchInput(result, rect);
-          if (!input) return undefined;
-          const patch = createExactPatchTile(localRuntime, tile, rect, index);
-          return { patch, input };
-        })
-      )
-    ).filter((entry): entry is { patch: TileDescriptor; input: ExactPatchInput } => Boolean(entry));
-    if (tile.revision !== revision || patches.length === 0) return;
-
-    pendingTileIds.delete(tile.id);
-    tileStates.delete(tile.id);
-    patchTilesCreated += patches.length;
-    for (const { patch } of patches) pendingTileIds.add(patch.id);
-    stats.pending = pendingWorkCount();
-    stats.status = "exact fallback";
-
-    for (const { patch, input } of patches) {
-      const child = createTileState(patch, undefined, state.splitLevel + 1);
-      child.forceExact = true;
-      child.exactFallback = true;
-      child.previewUploaded = true;
-      child.exactBaseRgba = input.baseRgba;
-      child.exactUnresolvedMask = input.unresolvedMask;
-      void submitTile(localRuntime, child);
-    }
-  }
-
-  function buildExactPatchInput(result: TileDoneMessage, rect: Rect): ExactPatchInput | undefined {
-    const width = Math.max(1, Math.ceil(rect.width));
-    const height = Math.max(1, Math.ceil(rect.height));
-    const sourceRgba = new Uint8Array(result.rgba);
-    const sourceMask = result.unresolvedMask ? new Uint8Array(result.unresolvedMask) : undefined;
-    const baseRgba = new Uint8Array(width * height * 4);
-    const unresolvedMask = new Uint8Array(width * height);
-    const offsetX = Math.round(rect.x - result.rect.x);
-    const offsetY = Math.round(rect.y - result.rect.y);
-    let exactPixels = 0;
-
-    for (let y = 0; y < height; y += 1) {
-      const sourceY = offsetY + y;
-      for (let x = 0; x < width; x += 1) {
-        const sourceX = offsetX + x;
-        const targetIndex = y * width + x;
-        const targetOffset = targetIndex * 4;
-        if (sourceX < 0 || sourceY < 0 || sourceX >= result.width || sourceY >= result.height) {
-          unresolvedMask[targetIndex] = 1;
-          baseRgba[targetOffset + 3] = 255;
-          exactPixels += 1;
-          continue;
-        }
-
-        const sourceIndex = sourceY * result.width + sourceX;
-        const sourceOffset = sourceIndex * 4;
-        baseRgba[targetOffset] = sourceRgba[sourceOffset];
-        baseRgba[targetOffset + 1] = sourceRgba[sourceOffset + 1];
-        baseRgba[targetOffset + 2] = sourceRgba[sourceOffset + 2];
-        baseRgba[targetOffset + 3] = sourceRgba[sourceOffset + 3];
-        if (!sourceMask || sourceMask[sourceIndex] !== 0) {
-          unresolvedMask[targetIndex] = 1;
-          exactPixels += 1;
-        }
-      }
-    }
-
-    if (exactPixels === 0) return undefined;
-    return { baseRgba: baseRgba.buffer, unresolvedMask: unresolvedMask.buffer };
-  }
-
-  function createExactPatchTile(localRuntime: RuntimeView, parent: TileDescriptor, rect: TileDescriptor["rect"], index: number): TileDescriptor {
-    return createPatchTile(localRuntime, parent, rect, `exact:${index}`);
-  }
-
-  function createPatchTile(localRuntime: RuntimeView, parent: TileDescriptor, rect: TileDescriptor["rect"], suffix: string): TileDescriptor {
-    const centerScreenX = rect.x + rect.width * 0.5;
-    const centerScreenY = rect.y + rect.height * 0.5;
-    const center = pointToViewCenterNow(view, localRuntime.width, localRuntime.height, centerScreenX, centerScreenY);
-    const key = {
-      level: parent.key.level + 1,
-      x: Math.floor(rect.x),
-      y: Math.floor(rect.y),
-      span: Math.max(1, Math.ceil(Math.max(rect.width, rect.height)))
-    };
-    return {
-      id: `${tileKeyToId(key, parent.revision)}:${suffix}`,
-      key,
-      rect,
-      centerScreenX,
-      centerScreenY,
-      centerRe: center.re,
-      centerIm: center.im,
-      revision: parent.revision
-    };
-  }
-
-  function exactPatchRects(tileRect: TileDescriptor["rect"], clusters: UnresolvedCluster[]): TileDescriptor["rect"][] {
-    const candidates = clusters
-      .map((cluster) => expandedClusterRect(tileRect, cluster))
-      .filter((rect): rect is TileDescriptor["rect"] => Boolean(rect));
-    if (candidates.length === 0) return [];
-    return mergeRects(candidates).filter((rect) => rect.width > 0 && rect.height > 0);
-  }
-
-  function expandedClusterRect(tileRect: TileDescriptor["rect"], cluster: UnresolvedCluster): TileDescriptor["rect"] | undefined {
-    const bounds = cluster.bounds;
-    if (!bounds || bounds.width <= 0 || bounds.height <= 0) return undefined;
-    let left = Math.floor(bounds.x - EXACT_PATCH_PADDING);
-    let top = Math.floor(bounds.y - EXACT_PATCH_PADDING);
-    let right = Math.ceil(bounds.x + bounds.width + EXACT_PATCH_PADDING);
-    let bottom = Math.ceil(bounds.y + bounds.height + EXACT_PATCH_PADDING);
-    const centerX = cluster.screenX;
-    const centerY = cluster.screenY;
-    if (right - left < MIN_EXACT_PATCH_SIZE) {
-      left = Math.floor(centerX - MIN_EXACT_PATCH_SIZE * 0.5);
-      right = left + MIN_EXACT_PATCH_SIZE;
-    }
-    if (bottom - top < MIN_EXACT_PATCH_SIZE) {
-      top = Math.floor(centerY - MIN_EXACT_PATCH_SIZE * 0.5);
-      bottom = top + MIN_EXACT_PATCH_SIZE;
-    }
-    left = Math.max(tileRect.x, left);
-    top = Math.max(tileRect.y, top);
-    right = Math.min(tileRect.x + tileRect.width, right);
-    bottom = Math.min(tileRect.y + tileRect.height, bottom);
-    if (right <= left || bottom <= top) return undefined;
-    return { x: left, y: top, width: right - left, height: bottom - top };
-  }
-
-  function mergeRects(rects: TileDescriptor["rect"][]): TileDescriptor["rect"][] {
-    const merged: TileDescriptor["rect"][] = [];
-    for (const rect of rects) {
-      let current = rect;
-      for (let index = 0; index < merged.length; index += 1) {
-        if (!rectsOverlapOrTouch(current, merged[index])) continue;
-        const union = unionRect(current, merged[index]);
-        const unionArea = rectArea(union);
-        const separateArea = rectArea(current) + rectArea(merged[index]);
-        if (unionArea > EXACT_PATCH_MAX_PIXELS || unionArea > separateArea * 1.25) continue;
-        current = union;
-        merged.splice(index, 1);
-        index = -1;
-      }
-      merged.push(current);
-    }
-    return merged;
-  }
-
-  function rectsOverlapOrTouch(a: TileDescriptor["rect"], b: TileDescriptor["rect"]): boolean {
-    return a.x <= b.x + b.width && a.x + a.width >= b.x && a.y <= b.y + b.height && a.y + a.height >= b.y;
-  }
-
-  function rectArea(rect: TileDescriptor["rect"]): number {
-    return rect.width * rect.height;
-  }
-
-  function unionRect(a: TileDescriptor["rect"], b: TileDescriptor["rect"]): TileDescriptor["rect"] {
-    const left = Math.min(a.x, b.x);
-    const top = Math.min(a.y, b.y);
-    const right = Math.max(a.x + a.width, b.x + b.width);
-    const bottom = Math.max(a.y + a.height, b.y + b.height);
-    return { x: left, y: top, width: right - left, height: bottom - top };
-  }
-
-  function finalRenderPriority(_state: TileWorkState): number {
-    return -1;
-  }
-
   function hasOutstandingWork(): boolean {
-    if (pendingTileShells > 0 || pendingTileIds.size > 0 || pool.pending > 0 || pool.active > 0) return true;
+    if (pendingTilesToSchedule > 0 || pendingTileIds.size > 0 || pool.pending > 0 || pool.active > 0) return true;
     for (const state of tileStates.values()) {
       if (state.inFlight) return true;
     }
@@ -739,7 +421,6 @@ export async function startApp(root: HTMLElement): Promise<void> {
   function updateWorkStatus(activeStatus: string): void {
     stats.pending = pendingWorkCount();
     stats.activeWorkers = pool.active;
-    stats.references = references.size;
     if (hasOutstandingWork()) {
       stats.status = activeStatus;
       return;
@@ -749,7 +430,7 @@ export async function startApp(root: HTMLElement): Promise<void> {
   }
 
   function pendingWorkCount(): number {
-    return pendingTileIds.size + pendingTileShells;
+    return pendingTileIds.size + pendingTilesToSchedule;
   }
 
   function resize(): void {
@@ -963,7 +644,6 @@ export async function startApp(root: HTMLElement): Promise<void> {
     setText("readIter", String(view.maxIter));
     setText("readWorkers", `${pool.active}/${pool.size}`);
     setText("readTiles", `${stats.completedTiles}/${stats.completedTiles + stats.pending}`);
-    setText("readRefs", String(stats.references));
     setText("readFps", stats.fps.toFixed(0));
     setText("readStatus", stats.status);
   }

@@ -7,10 +7,6 @@ export class LruCache<K, V> {
     private readonly onEvict?: (key: K, value: V) => void
   ) {}
 
-  get size(): number {
-    return this.entries.size;
-  }
-
   get bytes(): number {
     return this.usedBytes;
   }

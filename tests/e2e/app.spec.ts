@@ -134,6 +134,7 @@ test("lets users switch between formula and fixed iteration controls", async ({ 
   await waitForNonBlankCanvas(page);
 
   await page.locator("#iterBaseInput").fill("640");
+  await page.locator("#iterBaseInput").press("Enter");
   await expect(page.locator("#readIter")).toHaveText("640");
   await expect.poll(() => new URL(page.url()).searchParams.get("iterBase")).toBe("640");
   expect(new URL(page.url()).searchParams.get("iter")).toBeNull();
@@ -144,12 +145,14 @@ test("lets users switch between formula and fixed iteration controls", async ({ 
   await expect.poll(() => new URL(page.url()).searchParams.get("iterBase")).toBeNull();
 
   await page.locator("#iterSlopeInput").fill("96");
+  await page.locator("#iterSlopeInput").press("Enter");
   await expect.poll(() => new URL(page.url()).searchParams.get("iterSlope")).toBe("96");
   await page.locator("#iterSlopeReset").click();
   await expect(page.locator("#iterSlopeInput")).toHaveValue("64");
   await expect.poll(() => new URL(page.url()).searchParams.get("iterSlope")).toBeNull();
 
   await page.locator("#iterCapInput").fill("12000");
+  await page.locator("#iterCapInput").press("Enter");
   await expect.poll(() => new URL(page.url()).searchParams.get("iterCap")).toBe("12000");
   await page.locator("#iterCapReset").click();
   await expect(page.locator("#iterCapInput")).toHaveValue("20000");
@@ -159,6 +162,7 @@ test("lets users switch between formula and fixed iteration controls", async ({ 
   await expect.poll(() => new URL(page.url()).searchParams.get("iter")).toBe("512");
 
   await page.locator("#iterFixedInput").fill("900");
+  await page.locator("#iterFixedInput").press("Enter");
   await expect(page.locator("#readIter")).toHaveText("900");
   await expect.poll(() => new URL(page.url()).searchParams.get("iter")).toBe("900");
 
@@ -318,7 +322,7 @@ test("avoids microtile explosion on the 1170x784 near-real regression view", asy
   }
 });
 
-test("previews and stabilizes the 1912x948 deep interior regression view", async ({ page }) => {
+test("renders and stabilizes the 1912x948 deep interior regression view", async ({ page }) => {
   test.setTimeout(90_000);
   await page.setViewportSize({ width: 1912, height: 948 });
   await page.goto(DEEP_INTERIOR_REGRESSION_URL);
@@ -397,6 +401,8 @@ test("defers render work while pan and wheel zoom inputs are still changing", as
   await waitForNonBlankCanvas(page, 30_000);
 
   const initialProbe = await readInteractionWorkerProbe(page);
+  expect(initialProbe.referenceWorkers).toBe(0);
+  expect(initialProbe.referenceRequests).toBe(1);
   const pan = await dispatchContinuousPan(page);
   expect(pan.renderMessagesBeforePointerUp).toBe(0);
   await expect.poll(async () => (await readInteractionWorkerProbe(page)).renderMessages.length, { timeout: 5_000 })
@@ -406,6 +412,7 @@ test("defers render work while pan and wheel zoom inputs are still changing", as
   const afterPanProbe = await readInteractionWorkerProbe(page);
   expect(afterPanProbe.tileWorkers).toBe(initialProbe.tileWorkers);
   expect(afterPanProbe.referenceWorkers).toBe(initialProbe.referenceWorkers);
+  expect(afterPanProbe.referenceRequests).toBe(2);
 
   const zoom = await dispatchContinuousWheelZoom(page);
   expect(zoom.renderMessagesDuringWheel).toBe(0);
@@ -416,6 +423,7 @@ test("defers render work while pan and wheel zoom inputs are still changing", as
   const afterZoomProbe = await readInteractionWorkerProbe(page);
   expect(afterZoomProbe.tileWorkers).toBe(initialProbe.tileWorkers);
   expect(afterZoomProbe.referenceWorkers).toBe(initialProbe.referenceWorkers);
+  expect(afterZoomProbe.referenceRequests).toBe(3);
 });
 
 test("does not leave false periodic disks black at 1e27", async ({ page }) => {
@@ -437,7 +445,7 @@ test("does not leave false periodic disks black at 1e27", async ({ page }) => {
   }
 });
 
-test("keeps reference count bounded on the 120-tile reference explosion view", async ({ page }) => {
+test("renders the former reference-explosion view in one tile pass", async ({ page }) => {
   test.setTimeout(90_000);
   await page.setViewportSize({ width: 1912, height: 948 });
   await page.goto(REFERENCE_EXPLOSION_REGRESSION_URL);
@@ -445,10 +453,9 @@ test("keeps reference count bounded on the 120-tile reference explosion view", a
 
   const tileCounts = await readTileCounts(page);
   expect(tileCounts.completed).toBe(tileCounts.total);
-  expect(await readReferenceCount(page)).toBeLessThan(300);
 });
 
-test("keeps early-escape reference pressure bounded on the shallow 120-tile view", async ({ page }) => {
+test("renders the early-escape shallow view promptly", async ({ page }) => {
   test.setTimeout(60_000);
   await page.setViewportSize({ width: 1912, height: 948 });
   const started = Date.now();
@@ -458,7 +465,6 @@ test("keeps early-escape reference pressure bounded on the shallow 120-tile view
 
   const tileCounts = await readTileCounts(page);
   expect(tileCounts.completed).toBe(tileCounts.total);
-  expect(await readReferenceCount(page)).toBeLessThan(300);
   expect(stableMs).toBeLessThan(20_000);
 });
 
@@ -518,7 +524,6 @@ test("reduces rainbow speckle on the reported boundary view", async ({ page }) =
 
   const tileCounts = await readTileCounts(page);
   expect(tileCounts.completed).toBe(tileCounts.total);
-  expect(await readReferenceCount(page)).toBeLessThanOrEqual(180);
 
   const speckleRatio = await readCanvasSpeckleRatio(page, { left: 420, top: 40, right: 1680, bottom: 880 });
   expect(speckleRatio).toBeLessThanOrEqual(0.05);
@@ -549,7 +554,6 @@ test("bandlimits the reported deep boundary view and emits visual artifacts", as
 
   const tileCounts = await readTileCounts(page);
   expect(tileCounts.completed).toBe(tileCounts.total);
-  expect((await readInteractionWorkerProbe(page)).renderMessages.filter((message) => message.mode === "exact")).toHaveLength(0);
 
   const roi = { left: 520, top: 120, right: 1420, bottom: 760 };
   const speckleRatio = await readCanvasSpeckleRatio(page, roi, { includeLumaOutliers: true });
@@ -572,14 +576,11 @@ test("keeps reported minibrot geometry stable across tile boundaries and small v
     const metrics = await waitForStableMetrics(page, started, 2_500);
     expect(metrics.status).toBe("stable");
     expect(metrics.stableMs).toBeLessThan(2_500);
-    expect(metrics.peakReferences).toBe(1);
 
     const tileCounts = await readTileCounts(page);
     expect(tileCounts.completed).toBe(tileCounts.total);
     const probe = await readInteractionWorkerProbe(page);
     expect(probe.referenceRequests).toBe(1);
-    expect(probe.renderMessages.filter((message) => message.mode === "exact")).toHaveLength(0);
-    expect(probe.renderMessages.filter((message) => message.mode === "final")).toHaveLength(tileCounts.total);
 
     const seam = await readTileSeamDiscontinuity(page, 128);
     expect(seam.excessRatio).toBeLessThan(0.04);
@@ -600,7 +601,6 @@ test("keeps palette filtering localized and stable on the reported views", async
 
     const tileCounts = await readTileCounts(page);
     expect(tileCounts.completed).toBe(tileCounts.total);
-    expect((await readInteractionWorkerProbe(page)).renderMessages.filter((message) => message.mode === "exact")).toHaveLength(0);
 
     const speckleRatio = await readCanvasSpeckleRatio(page, roi, { includeLumaOutliers: true });
     const seam = await readTileSeamDiscontinuity(page, 128);
@@ -646,7 +646,6 @@ test("stabilizes the reported interior-heavy views under 3 seconds", async ({ pa
     const tileCounts = await readTileCounts(page);
     expect(tileCounts.completed).toBe(tileCounts.total);
     const probe = await readInteractionWorkerProbe(page);
-    expect(probe.renderMessages.filter((message) => message.mode === "exact")).toHaveLength(0);
     for (const [x, y] of [
       [0.25, 0.25],
       [0.5, 0.5],
@@ -673,7 +672,6 @@ test("stabilizes the reported e100 deep view under 2.5 seconds", async ({ page }
   expect(tileCounts.completed).toBe(tileCounts.total);
   const probe = await readInteractionWorkerProbe(page);
   expect(probe.referenceRequests).toBe(1);
-  expect(probe.renderMessages.filter((message) => message.mode === "exact")).toHaveLength(0);
   for (const [x, y] of [
     [0.25, 0.25],
     [0.5, 0.5],
@@ -715,7 +713,6 @@ test("stabilizes the alternate reported e100 deep view under 2.5 seconds", async
   const tileCounts = await readTileCounts(page);
   expect(tileCounts.completed).toBe(tileCounts.total);
   const probe = await readInteractionWorkerProbe(page);
-  expect(probe.renderMessages.filter((message) => message.mode === "exact")).toHaveLength(0);
   for (const [x, y] of [
     [0.25, 0.25],
     [0.5, 0.5],
@@ -726,7 +723,7 @@ test("stabilizes the alternate reported e100 deep view under 2.5 seconds", async
   }
 });
 
-test("stabilizes the reported reference-pressure view under 2.5 seconds with one reference", async ({ page }) => {
+test("stabilizes the reported former reference-pressure view under 2.5 seconds", async ({ page }) => {
   test.setTimeout(30_000);
   await installInteractionWorkerProbe(page);
   await page.setViewportSize({ width: 1912, height: 948 });
@@ -736,14 +733,11 @@ test("stabilizes the reported reference-pressure view under 2.5 seconds with one
   const metrics = await waitForStableMetrics(page, started, 2_500);
   expect(metrics.status).toBe("stable");
   expect(metrics.stableMs).toBeLessThan(2_500);
-  expect(metrics.peakReferences).toBe(1);
 
   const tileCounts = await readTileCounts(page);
   expect(tileCounts.completed).toBe(tileCounts.total);
   const probe = await readInteractionWorkerProbe(page);
   expect(probe.referenceRequests).toBe(1);
-  expect(probe.renderMessages.filter((message) => message.mode === "exact")).toHaveLength(0);
-  expect(probe.renderMessages.filter((message) => message.mode === "final")).toHaveLength(tileCounts.total);
 });
 
 async function readUiLayout(page: import("@playwright/test").Page) {
@@ -835,8 +829,7 @@ interface InteractionWorkerProbe {
   referenceWorkers: number;
   unknownWorkers: number;
   referenceRequests: number;
-  renderMessages: Array<{ revision: number; mode: string; at: number }>;
-  tileResults: Array<{ revision: number; seriesReplayPixels: number }>;
+  renderMessages: Array<{ revision: number; at: number }>;
 }
 
 interface RetainedZoomProbe {
@@ -950,8 +943,7 @@ async function installInteractionWorkerProbe(page: import("@playwright/test").Pa
       referenceWorkers: 0,
       unknownWorkers: 0,
       referenceRequests: 0,
-      renderMessages: [],
-      tileResults: []
+      renderMessages: []
     };
     (globalThis as unknown as { __interactionWorkerProbe: InteractionWorkerProbe }).__interactionWorkerProbe = probe;
 
@@ -971,24 +963,14 @@ async function installInteractionWorkerProbe(page: import("@playwright/test").Pa
           typeof message === "object" &&
           (message as { type?: unknown }).type === "renderTile"
         ) {
-          const renderMessage = message as { tile?: { revision?: unknown }; renderMode?: unknown };
+          const renderMessage = message as { tile?: { revision?: unknown } };
           probe.renderMessages.push({
             revision: typeof renderMessage.tile?.revision === "number" ? renderMessage.tile.revision : -1,
-            mode: typeof renderMessage.renderMode === "string" ? renderMessage.renderMode : "",
             at: performance.now()
           });
         }
         postMessage(message, transferOrOptions);
       }) as Worker["postMessage"];
-
-      worker.addEventListener("message", (event: MessageEvent) => {
-        const data = event.data as { type?: unknown; revision?: unknown; stats?: { seriesReplayPixels?: unknown } };
-        if (data?.type !== "tileDone") return;
-        probe.tileResults.push({
-          revision: typeof data.revision === "number" ? data.revision : -1,
-          seriesReplayPixels: typeof data.stats?.seriesReplayPixels === "number" ? data.stats.seriesReplayPixels : 0
-        });
-      });
 
       return worker;
     } as unknown as typeof Worker;
@@ -1006,8 +988,7 @@ async function readInteractionWorkerProbe(page: import("@playwright/test").Page)
       referenceWorkers: probe.referenceWorkers,
       unknownWorkers: probe.unknownWorkers,
       referenceRequests: probe.referenceRequests,
-      renderMessages: [...probe.renderMessages],
-      tileResults: [...probe.tileResults]
+      renderMessages: [...probe.renderMessages]
     };
   });
 }
@@ -1098,25 +1079,14 @@ async function waitForStableMetrics(
   page: import("@playwright/test").Page,
   started: number,
   timeoutMs: number
-): Promise<{ status: string; stableMs: number; peakReferences: number }> {
+): Promise<{ status: string; stableMs: number }> {
   let status = "";
-  let peakReferences = 0;
   while (Date.now() - started < timeoutMs) {
-    const sample = await page.evaluate(() => ({
-      status: document.querySelector("#readStatus")?.textContent ?? "",
-      references: Number(document.querySelector("#readRefs")?.textContent ?? 0)
-    }));
-    status = sample.status;
-    peakReferences = Math.max(peakReferences, sample.references);
+    status = await page.locator("#readStatus").textContent() ?? "";
     if (status === "stable") break;
     await page.waitForTimeout(25);
   }
-  return { status, stableMs: Date.now() - started, peakReferences };
-}
-
-async function readReferenceCount(page: import("@playwright/test").Page): Promise<number> {
-  const text = await page.locator("#readRefs").textContent();
-  return Number(text ?? Number.POSITIVE_INFINITY);
+  return { status, stableMs: Date.now() - started };
 }
 
 async function readHorizontalDarkSeamScore(

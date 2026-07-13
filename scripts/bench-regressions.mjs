@@ -12,7 +12,6 @@ const SCENARIOS = [
       stable: true,
       maxStableMs: 90_000,
       maxTotalTiles: 999,
-      maxRefs: 1199,
       maxOnePixelTiles: 0
     },
     baselineComparable: false
@@ -25,7 +24,7 @@ const SCENARIOS = [
     requirements: {
       stable: true,
       maxStableMs: 60_000,
-      minHudIter: 6000
+      exactHudIter: 1576
     },
     baselineComparable: false
   },
@@ -228,16 +227,11 @@ function projectMetrics(scenario, raw) {
     stable: Boolean(raw.stable),
     tileDone: regression.tileDone ?? raw.counts?.tileDone ?? 0,
     finalCount: regression.finalCount ?? raw.counts?.final ?? 0,
-    exactCount: regression.exactCount ?? raw.counts?.exact ?? 0,
-    previewCount: regression.previewCount ?? raw.counts?.preview ?? 0,
     referenceDone: regression.referenceDone ?? raw.counts?.referenceDone ?? 0,
     totalTiles: regression.totalTiles ?? parseTileProgress(raw.hud?.tiles).total,
     maxActiveTiles: regression.maxActiveTiles ?? parseTileProgress(raw.hud?.tiles).total,
-    refs: regression.refs ?? (Number(raw.hud?.refs) || 0),
     p50WorkerMs: regression.p50WorkerMs ?? raw.percentiles?.finalWorkerMs?.p50 ?? 0,
     p95WorkerMs: regression.p95WorkerMs ?? raw.percentiles?.finalWorkerMs?.p95 ?? 0,
-    exactFallbackPixels: regression.exactFallbackPixels ?? raw.waves?.exactFallbackPixels ?? 0,
-    unresolvedFinals: regression.unresolvedFinals ?? raw.waves?.unresolvedFinals ?? 0,
     onePixelTiles: regression.onePixelTiles ?? raw.waves?.onePixelTiles ?? 0,
     hudIter: Number(raw.hud?.iter) || 0,
     hudTiles: raw.hud?.tiles ?? "",
@@ -259,12 +253,8 @@ function checkRequirements(requirements, metrics) {
   if (requirements.maxTotalTiles !== undefined && metrics.totalTiles > requirements.maxTotalTiles) {
     failures.push(`totalTiles ${metrics.totalTiles} > ${requirements.maxTotalTiles}`);
   }
-  if (requirements.maxRefs !== undefined && metrics.refs > requirements.maxRefs) failures.push(`refs ${metrics.refs} > ${requirements.maxRefs}`);
   if (requirements.maxOnePixelTiles !== undefined && metrics.onePixelTiles > requirements.maxOnePixelTiles) {
     failures.push(`onePixelTiles ${metrics.onePixelTiles} > ${requirements.maxOnePixelTiles}`);
-  }
-  if (requirements.minHudIter !== undefined && metrics.hudIter < requirements.minHudIter) {
-    failures.push(`hudIter ${metrics.hudIter} < ${requirements.minHudIter}`);
   }
   if (requirements.exactHudIter !== undefined && metrics.hudIter !== requirements.exactHudIter) {
     failures.push(`hudIter ${metrics.hudIter} !== ${requirements.exactHudIter}`);
@@ -311,10 +301,8 @@ function baselineMetrics(result) {
     p50WorkerMs: result.p50WorkerMs,
     tileDone: result.tileDone,
     finalCount: result.finalCount,
-    previewCount: result.previewCount,
     referenceDone: result.referenceDone,
     totalTiles: result.totalTiles,
-    refs: result.refs,
     firstVisualChangeMs: result.firstVisualChangeMs,
     newRevisionQueuedMs: result.newRevisionQueuedMs,
     firstNewTileDoneMs: result.firstNewTileDoneMs

@@ -35,10 +35,6 @@ export function decimalLog10(value: string): number {
   return Math.log10(mantissa) + exponent;
 }
 
-export function decimalLog2(value: string): number {
-  return decimalLog10(value) * Math.LOG2E * Math.LN10;
-}
-
 export function defaultMaxIter(scale: string, formula: IterFormula = DEFAULT_ITER_FORMULA): number {
   const normalized = normalizeIterFormula(formula);
   const zoomLog10 = Math.max(0, decimalLog10(scale));
@@ -95,10 +91,6 @@ export function formatCompactDecimal(value: string, digits = 8): string {
   const mantissa = Number(match[1]);
   const exponent = match[2] ?? "0";
   return `${mantissa.toPrecision(Math.min(digits, 10))}e${Number(exponent)}`;
-}
-
-export function cloneView(view: ViewState): ViewState {
-  return { re: view.re, im: view.im, scale: view.scale, maxIter: view.maxIter };
 }
 
 function clampNumber(value: number | undefined, min: number, max: number, fallback: number): number {

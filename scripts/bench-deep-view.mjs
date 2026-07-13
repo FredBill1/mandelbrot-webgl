@@ -34,10 +34,8 @@ try {
   let hud = await readHud(page);
   let maxHudTotalTiles = 0;
   let maxHudCompletedTiles = 0;
-  let peakHudReferences = 0;
   while (Date.now() - started < options.timeoutMs) {
     hud = await readHud(page);
-    peakHudReferences = Math.max(peakHudReferences, Number(hud.refs) || 0);
     const hudTiles = parseTileProgress(hud.tiles);
     maxHudCompletedTiles = Math.max(maxHudCompletedTiles, hudTiles.completed);
     maxHudTotalTiles = Math.max(maxHudTotalTiles, hudTiles.total);
@@ -61,7 +59,6 @@ try {
   const bench = await page.evaluate(() => globalThis.__deepBench);
   bench.stableAt = elapsedMs;
   const hudTiles = parseTileProgress(hud.tiles);
-  const refs = Number(hud.refs) || 0;
   const summary = {
     elapsedMs,
     stable: hud.status === "stable",
@@ -76,19 +73,13 @@ try {
       finalWallMs: average(bench.sums.finalWallMs, bench.counts.final),
       finalQueueMs: average(bench.sums.finalQueueMs, bench.counts.finalStarted),
       finalUploadMs: average(bench.sums.finalUploadMs, bench.counts.finalUploaded),
-      previewWorkerMs: average(bench.sums.previewWorkerMs, bench.counts.preview),
-      previewWallMs: average(bench.sums.previewWallMs, bench.counts.preview),
-      previewQueueMs: average(bench.sums.previewQueueMs, bench.counts.previewStarted),
-      previewUploadMs: average(bench.sums.previewUploadMs, bench.counts.previewUploaded),
       referenceWallMs: average(bench.sums.referenceWallMs, bench.counts.referenceDone)
     },
     percentiles: {
       finalWorkerMs: percentiles(bench.samples.finalWorkerMs),
       finalWallMs: percentiles(bench.samples.finalWallMs),
       finalQueueMs: percentiles(bench.samples.finalQueueMs),
-      finalUploadMs: percentiles(bench.samples.finalUploadMs),
-      previewWorkerMs: percentiles(bench.samples.previewWorkerMs),
-      previewQueueMs: percentiles(bench.samples.previewQueueMs)
+      finalUploadMs: percentiles(bench.samples.finalUploadMs)
     },
     waves: bench.waves,
     interactive,
@@ -97,19 +88,13 @@ try {
       stableMs: hud.status === "stable" ? elapsedMs : null,
       tileDone: bench.counts.tileDone,
       finalCount: bench.counts.final,
-      exactCount: bench.counts.exact,
-      previewCount: bench.counts.preview,
       referenceDone: bench.counts.referenceDone,
       referenceRequests: bench.counts.referenceDone + bench.counts.referenceError,
-      peakHudReferences,
       finalPasses: bench.counts.final,
       totalTiles: hudTiles.total || maxHudTotalTiles,
       maxActiveTiles: maxHudTotalTiles,
-      refs,
       p50WorkerMs: percentiles(bench.samples.finalWorkerMs).p50,
       p95WorkerMs: percentiles(bench.samples.finalWorkerMs).p95,
-      exactFallbackPixels: bench.waves.exactFallbackPixels,
-      unresolvedFinals: bench.waves.unresolvedFinals,
       onePixelTiles: bench.waves.onePixelTiles,
       minTileArea: bench.waves.minTileArea === Infinity ? 0 : bench.waves.minTileArea,
       maxCompletedTiles: maxHudCompletedTiles
@@ -327,42 +312,30 @@ function canListen(port) {
 function installWorkerProbe() {
   const OriginalWorker = globalThis.Worker;
   const bench = {
-    workers: { tile: 0, reference: 0, unknown: 0 },
+    workers: { tile: 0, unknown: 0 },
     counts: {
       tileDone: 0,
       final: 0,
-      preview: 0,
       finalStarted: 0,
-      previewStarted: 0,
       finalUploaded: 0,
-      previewUploaded: 0,
       referenceDone: 0,
-      referenceError: 0,
-      exact: 0
+      referenceError: 0
     },
     sums: {
       finalWorkerMs: 0,
       finalWallMs: 0,
       finalQueueMs: 0,
       finalUploadMs: 0,
-      previewWorkerMs: 0,
-      previewWallMs: 0,
-      previewQueueMs: 0,
-      previewUploadMs: 0,
       referenceWallMs: 0
     },
     samples: {
       finalWorkerMs: [],
       finalWallMs: [],
       finalQueueMs: [],
-      finalUploadMs: [],
-      previewWorkerMs: [],
-      previewQueueMs: []
+      finalUploadMs: []
     },
     waves: {
-      unresolvedFinals: 0,
       completedFinals: 0,
-      maxRefsUsed: 0,
       maxSeriesSkip: 0,
       paletteFootprintCount: 0,
       paletteFootprintFallbackCount: 0,
@@ -370,11 +343,8 @@ function installWorkerProbe() {
       paletteProxyCount: 0,
       maxPaletteFootprint: 0,
       maxPaletteProxyLod: 0,
-      totalGlitches: 0,
       totalRebases: 0,
       totalPeriodicInterior: 0,
-      totalSeriesReplayPixels: 0,
-      exactFallbackPixels: 0,
       onePixelTiles: 0,
       minTileArea: Infinity
     },
@@ -395,7 +365,6 @@ function installWorkerProbe() {
       tile.events ??= [];
       tile.events.push(normalized);
       tile.revision = event.revision ?? tile.revision;
-      tile.renderMode = event.renderMode ?? tile.renderMode;
       if (event.type === "tileQueued") {
         tile.queuedAt = event.queuedAt ?? now;
         tile.priority = event.priority;
@@ -404,15 +373,9 @@ function installWorkerProbe() {
         const queueMs = tile.queuedAt === undefined ? undefined : tile.startedAt - tile.queuedAt;
         if (queueMs !== undefined) {
           tile.queueMs = queueMs;
-          if (event.renderMode === "final") {
-            bench.counts.finalStarted += 1;
-            bench.sums.finalQueueMs += queueMs;
-            bench.samples.finalQueueMs.push(queueMs);
-          } else {
-            bench.counts.previewStarted += 1;
-            bench.sums.previewQueueMs += queueMs;
-            bench.samples.previewQueueMs.push(queueMs);
-          }
+          bench.counts.finalStarted += 1;
+          bench.sums.finalQueueMs += queueMs;
+          bench.samples.finalQueueMs.push(queueMs);
         }
       } else if (event.type === "tileUploadStarted") {
         tile.uploadStartedAt = event.uploadStartedAt ?? now;
@@ -421,13 +384,8 @@ function installWorkerProbe() {
         const uploadMs = tile.uploadStartedAt === undefined ? undefined : tile.uploadDoneAt - tile.uploadStartedAt;
         if (uploadMs !== undefined) {
           tile.uploadMs = uploadMs;
-          if (event.renderMode === "final") {
-            bench.counts.finalUploaded += 1;
-            bench.sums.finalUploadMs += uploadMs;
-          } else {
-            bench.counts.previewUploaded += 1;
-            bench.sums.previewUploadMs += uploadMs;
-          }
+          bench.counts.finalUploaded += 1;
+          bench.sums.finalUploadMs += uploadMs;
         }
       }
     }
@@ -437,7 +395,6 @@ function installWorkerProbe() {
     const worker = new OriginalWorker(url, workerOptions);
     const urlText = String(url);
     if (urlText.includes("tileWorker")) bench.workers.tile += 1;
-    else if (urlText.includes("referenceWorker")) bench.workers.reference += 1;
     else bench.workers.unknown += 1;
 
     let current;
@@ -447,11 +404,8 @@ function installWorkerProbe() {
         current = {
           type: "tile",
           started: performance.now(),
-          renderMode: message.renderMode,
           tileId: message.tile.id,
-          rect: { ...message.tile.rect },
-          refs: message.reference ? 1 : 0,
-          sampleStep: message.sampleStep
+          rect: { ...message.tile.rect }
         };
       } else if (message?.type === "computeReference") {
         current = {
@@ -473,114 +427,72 @@ function installWorkerProbe() {
         const tileArea = Math.max(0, data.width) * Math.max(0, data.height);
         bench.waves.minTileArea = Math.min(bench.waves.minTileArea, tileArea);
         if (data.width <= 1 || data.height <= 1) bench.waves.onePixelTiles += 1;
-        if (data.stats.renderMode !== "preview") {
-          bench.counts.final += 1;
-          if (data.stats.renderMode === "exact") bench.counts.exact += 1;
-          bench.sums.finalWorkerMs += data.stats.elapsedMs;
-          bench.sums.finalWallMs += wallMs;
-          bench.samples.finalWorkerMs.push(data.stats.elapsedMs);
-          bench.samples.finalWallMs.push(wallMs);
-          if (data.stats.unresolvedCount > 0) bench.waves.unresolvedFinals += 1;
-          else bench.waves.completedFinals += 1;
-          bench.waves.maxRefsUsed = Math.max(bench.waves.maxRefsUsed, data.stats.referenceIdsUsed.length);
-          bench.waves.maxSeriesSkip = Math.max(bench.waves.maxSeriesSkip, data.stats.seriesSkip);
-          bench.waves.paletteFootprintCount += data.stats.paletteFootprintCount ?? 0;
-          bench.waves.paletteFootprintFallbackCount += data.stats.paletteFootprintFallbackCount ?? 0;
-          bench.waves.paletteFilteredCount += data.stats.paletteFilteredCount ?? 0;
-          bench.waves.paletteProxyCount += data.stats.paletteProxyCount ?? 0;
-          bench.waves.maxPaletteFootprint = Math.max(
-            bench.waves.maxPaletteFootprint,
-            data.stats.maxPaletteFootprint ?? 0
-          );
-          bench.waves.maxPaletteProxyLod = Math.max(
-            bench.waves.maxPaletteProxyLod,
-            data.stats.maxPaletteProxyLod ?? 0
-          );
-          bench.waves.totalGlitches += data.stats.glitchCount;
-          bench.waves.totalRebases += data.stats.rebaseCount;
-          bench.waves.totalPeriodicInterior += data.stats.periodicInteriorCount;
-          bench.waves.totalSeriesReplayPixels += data.stats.seriesReplayPixels ?? 0;
-          bench.waves.exactFallbackPixels += data.stats.exactFallbackPixels ?? 0;
-          pushSlowFinal({
-            workerMs: Math.round(data.stats.elapsedMs),
-            wallMs: Math.round(wallMs),
-            rect: data.rect,
-            refs: current?.refs,
-            unresolved: data.stats.unresolvedCount,
-            escaped: data.stats.escapedPixels,
-            seriesSkip: data.stats.seriesSkip,
-            blaSkip: data.stats.blaSkipCount,
-            blaSteps: data.stats.blaStepCount,
-            glitches: data.stats.glitchCount,
-            rebases: data.stats.rebaseCount,
-            periodicInterior: data.stats.periodicInteriorCount,
-            seriesReplayPixels: data.stats.seriesReplayPixels ?? 0,
-            paletteFootprints: data.stats.paletteFootprintCount,
-            paletteFootprintFallbacks: data.stats.paletteFootprintFallbackCount,
-            paletteFiltered: data.stats.paletteFilteredCount,
-            paletteProxies: data.stats.paletteProxyCount,
-            maxPaletteFootprint: data.stats.maxPaletteFootprint,
-            maxPaletteProxyLod: data.stats.maxPaletteProxyLod,
-            refsUsed: data.stats.referenceIdsUsed.length,
-            clusters: data.stats.unresolvedClusters.length
-          });
-        } else {
-          bench.counts.preview += 1;
-          bench.sums.previewWorkerMs += data.stats.elapsedMs;
-          bench.sums.previewWallMs += wallMs;
-          bench.samples.previewWorkerMs.push(data.stats.elapsedMs);
-        }
+        bench.counts.final += 1;
+        bench.sums.finalWorkerMs += data.stats.elapsedMs;
+        bench.sums.finalWallMs += wallMs;
+        bench.samples.finalWorkerMs.push(data.stats.elapsedMs);
+        bench.samples.finalWallMs.push(wallMs);
+        bench.waves.completedFinals += 1;
+        bench.waves.maxSeriesSkip = Math.max(bench.waves.maxSeriesSkip, data.stats.seriesSkip);
+        bench.waves.paletteFootprintCount += data.stats.paletteFootprintCount ?? 0;
+        bench.waves.paletteFootprintFallbackCount += data.stats.paletteFootprintFallbackCount ?? 0;
+        bench.waves.paletteFilteredCount += data.stats.paletteFilteredCount ?? 0;
+        bench.waves.paletteProxyCount += data.stats.paletteProxyCount ?? 0;
+        bench.waves.maxPaletteFootprint = Math.max(bench.waves.maxPaletteFootprint, data.stats.maxPaletteFootprint ?? 0);
+        bench.waves.maxPaletteProxyLod = Math.max(bench.waves.maxPaletteProxyLod, data.stats.maxPaletteProxyLod ?? 0);
+        bench.waves.totalRebases += data.stats.rebaseCount;
+        bench.waves.totalPeriodicInterior += data.stats.periodicInteriorCount;
+        pushSlowFinal({
+          workerMs: Math.round(data.stats.elapsedMs),
+          wallMs: Math.round(wallMs),
+          rect: data.rect,
+          escaped: data.stats.escapedPixels,
+          seriesSkip: data.stats.seriesSkip,
+          rebases: data.stats.rebaseCount,
+          periodicInterior: data.stats.periodicInteriorCount,
+          paletteFootprints: data.stats.paletteFootprintCount,
+          paletteFootprintFallbacks: data.stats.paletteFootprintFallbackCount,
+          paletteFiltered: data.stats.paletteFilteredCount,
+          paletteProxies: data.stats.paletteProxyCount,
+          maxPaletteFootprint: data.stats.maxPaletteFootprint,
+          maxPaletteProxyLod: data.stats.maxPaletteProxyLod
+        });
         if (current?.tileId) {
           const tile = tileProfile(current.tileId);
           tile.renders ??= [];
           tile.renders.push({
             doneAt: performance.now(),
-            renderMode: data.stats.renderMode,
             wallMs,
             workerMs: data.stats.elapsedMs,
             rect: data.rect,
-            refs: current.refs,
-            sampleStep: current.sampleStep,
             stats: {
-              unresolved: data.stats.unresolvedCount,
               escaped: data.stats.escapedPixels,
               seriesSkip: data.stats.seriesSkip,
-              glitches: data.stats.glitchCount,
               rebases: data.stats.rebaseCount,
               periodicInterior: data.stats.periodicInteriorCount,
-              seriesReplayPixels: data.stats.seriesReplayPixels ?? 0,
               paletteFootprints: data.stats.paletteFootprintCount,
               paletteFootprintFallbacks: data.stats.paletteFootprintFallbackCount,
               paletteFiltered: data.stats.paletteFilteredCount,
               paletteProxies: data.stats.paletteProxyCount,
               maxPaletteFootprint: data.stats.maxPaletteFootprint,
-              maxPaletteProxyLod: data.stats.maxPaletteProxyLod,
-              refsUsed: data.stats.referenceIdsUsed.length,
-              clusters: data.stats.unresolvedClusters.length
+              maxPaletteProxyLod: data.stats.maxPaletteProxyLod
             }
           });
           tile.doneAt = performance.now();
           tile.wallMs = wallMs;
           tile.workerMs = data.stats.elapsedMs;
           tile.rect = data.rect;
-          tile.refs = current.refs;
-          tile.sampleStep = current.sampleStep;
           tile.stats = {
-            unresolved: data.stats.unresolvedCount,
             escaped: data.stats.escapedPixels,
             seriesSkip: data.stats.seriesSkip,
-            glitches: data.stats.glitchCount,
             rebases: data.stats.rebaseCount,
             periodicInterior: data.stats.periodicInteriorCount,
-            seriesReplayPixels: data.stats.seriesReplayPixels ?? 0,
             paletteFootprints: data.stats.paletteFootprintCount,
             paletteFootprintFallbacks: data.stats.paletteFootprintFallbackCount,
             paletteFiltered: data.stats.paletteFilteredCount,
             paletteProxies: data.stats.paletteProxyCount,
             maxPaletteFootprint: data.stats.maxPaletteFootprint,
-            maxPaletteProxyLod: data.stats.maxPaletteProxyLod,
-            refsUsed: data.stats.referenceIdsUsed.length,
-            clusters: data.stats.unresolvedClusters.length
+            maxPaletteProxyLod: data.stats.maxPaletteProxyLod
           };
         }
         current = undefined;
@@ -615,7 +527,6 @@ async function readHud(page) {
   return page.evaluate(() => ({
     status: document.querySelector("#readStatus")?.textContent ?? "",
     tiles: document.querySelector("#readTiles")?.textContent ?? "",
-    refs: document.querySelector("#readRefs")?.textContent ?? "",
     workers: document.querySelector("#readWorkers")?.textContent ?? "",
     iter: document.querySelector("#readIter")?.textContent ?? "",
     scale: document.querySelector("#readScale")?.textContent ?? "",

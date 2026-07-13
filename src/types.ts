@@ -1,8 +1,6 @@
 export const BASE_VIEW_WIDTH = 3.5;
 export const TILE_SIZE = 128;
 export const TEXTURE_CACHE_BYTES = 256 * 1024 * 1024;
-export const REFERENCE_CACHE_SOFT_BYTES = 128 * 1024 * 1024;
-export const SERIES_DEGREE = 16;
 
 export interface ViewState {
   re: string;
@@ -25,34 +23,16 @@ export interface Rect {
   height: number;
 }
 
-export interface TileKey {
-  level: number;
-  x: number;
-  y: number;
-  span: number;
-}
-
 export interface TileDescriptor {
   id: string;
-  key: TileKey;
   rect: Rect;
-  centerScreenX: number;
-  centerScreenY: number;
-  centerRe: string;
-  centerIm: string;
   revision: number;
 }
 
 export interface ReferenceSnapshot {
-  id: string;
-  centerRe: string;
-  centerIm: string;
   screenX: number;
   screenY: number;
-  precisionBits: number;
-  escapedAt: number;
   maxIterBoundedRadius: number;
-  maxIter: number;
   revision: number;
   orbitRe: Float64Array;
   orbitIm: Float64Array;
@@ -61,70 +41,24 @@ export interface ReferenceSnapshot {
 export interface RenderTileMessage {
   type: "renderTile";
   tile: TileDescriptor;
-  canvasWidth: number;
-  canvasHeight: number;
-  viewScale?: string;
   pixelSpan: number;
   maxIter: number;
-  reference?: ReferenceSnapshot;
-  seriesDegree: number;
-  paletteId: string;
-  renderMode: "preview" | "final" | "exact";
-  sampleStep: number;
-  exactBaseRgba?: ArrayBuffer;
-  exactUnresolvedMask?: ArrayBuffer;
-}
-
-export type FailureKind = "earlyReferenceEscape" | "nonFiniteArithmetic" | "seriesUnsafe";
-
-export type FailureKindCounts = Record<FailureKind, number>;
-
-export interface UnresolvedCluster {
-  screenX: number;
-  screenY: number;
-  pixelCount: number;
-  survivedIter: number;
-  radiusPx: number;
-  binX: number;
-  binY: number;
-  bounds: Rect;
-  bestSurvivedIter?: number;
-  sourceReferenceId?: string;
-  failureKindCounts?: FailureKindCounts;
+  reference: ReferenceSnapshot;
 }
 
 export interface TileStats {
   elapsedMs: number;
-  glitchCount: number;
-  unresolvedCount: number;
   escapedPixels: number;
   periodicInteriorCount: number;
-  maxEscapedIter: number;
-  p95EscapedIter: number;
-  nearCapEscapedCount: number;
   capHitUnknownCount: number;
-  capHitBoundaryCount: number;
   rebaseCount: number;
-  rebaseLimitCount: number;
-  blaSkipCount: number;
-  blaStepCount: number;
-  referenceCacheMissCount: number;
   seriesSkip: number;
-  seriesReplayPixels: number;
   paletteFootprintCount: number;
   paletteFootprintFallbackCount: number;
   paletteFilteredCount: number;
   paletteProxyCount: number;
   maxPaletteFootprint: number;
   maxPaletteProxyLod: number;
-  referenceId: string;
-  referenceIdsUsed: string[];
-  unresolvedScreenX: number | undefined;
-  unresolvedScreenY: number | undefined;
-  unresolvedClusters: UnresolvedCluster[];
-  preview: boolean;
-  renderMode: "preview" | "final" | "exact";
-  exactFallbackPixels: number;
 }
 
 export interface TileDoneMessage {
@@ -135,9 +69,7 @@ export interface TileDoneMessage {
   width: number;
   height: number;
   rgba: ArrayBuffer;
-  unresolvedMask?: ArrayBuffer;
   stats: TileStats;
-  needsReference: boolean;
 }
 
 export type TileWorkerInMessage = RenderTileMessage;
