@@ -36,6 +36,16 @@ export async function computeReferenceWasm(input: {
   };
 }
 
+export async function warmupWasm(): Promise<void> {
+  await initRenderWasm();
+}
+
+export async function prepareReferenceWasm(reference: ReferenceSnapshot): Promise<void> {
+  await initRenderWasm();
+  syncRevision(reference.revision);
+  putReference(reference);
+}
+
 export async function renderPerturbationTileWasm(message: RenderTileMessage): Promise<TileDoneMessage> {
   await initRenderWasm();
   syncRevision(message.tile.revision);

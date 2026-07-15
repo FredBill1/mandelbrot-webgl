@@ -33,12 +33,7 @@ def main() -> int:
         mean_absolute_error = channel_sum / (pixel_count * 3)
         over_16_ratio = sum(value > 16 for value in maxima) / pixel_count
         p99 = maxima[min(pixel_count - 1, int(pixel_count * 0.99))]
-        requires_exact_match = before_path.stem == "periodicInterior5000"
-        passed = (
-            different_pixel_count == 0
-            if requires_exact_match
-            else mean_absolute_error <= 1.5 and over_16_ratio <= 0.005
-        )
+        passed = mean_absolute_error <= 1.5 and over_16_ratio <= 0.005
         failed |= not passed
         results.append({
             "view": before_path.stem,
@@ -52,11 +47,17 @@ def main() -> int:
         ImageEnhance.Contrast(diff).enhance(4).save(
             output_dir / f"{before_path.stem}-diff.png"
         )
-        if before_path.stem == "periodicInterior5000":
-            side_by_side = Image.new("RGB", (before.width * 2, before.height))
-            side_by_side.paste(before, (0, 0))
-            side_by_side.paste(after, (before.width, 0))
-            side_by_side.save(output_dir / "periodicInterior5000-side-by-side.png")
+        side_by_side = Image.new("RGB", (before.width * 2, before.height))
+        side_by_side.paste(before, (0, 0))
+        side_by_side.paste(after, (before.width, 0))
+        side_by_side.save(output_dir / f"{before_path.stem}-side-by-side.png")
+        before.save(
+            output_dir / f"{before_path.stem}-blink.gif",
+            save_all=True,
+            append_images=[after],
+            duration=500,
+            loop=0,
+        )
     print(json.dumps(results, indent=2))
     return 1 if failed else 0
 

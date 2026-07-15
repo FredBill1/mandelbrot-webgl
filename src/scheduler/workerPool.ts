@@ -33,6 +33,11 @@ interface ReferenceQueueItem {
   reject: (error: Error) => void;
 }
 
+interface PrepareReferenceItem {
+  kind: "prepareReference";
+  revision: number;
+}
+
 interface ComputeReferenceMessage {
   type: "computeReference";
   requestId: number;
@@ -46,6 +51,8 @@ interface ComputeReferenceMessage {
 type QueueItem = RenderQueueItem | ReferenceQueueItem;
 type WorkerMessage =
   | TileWorkerOutMessage
+  | { type: "warmupDone" }
+  | { type: "referencePrepared"; revision: number }
   | { type: "referenceDone"; requestId: number; reference: RawReferenceResult }
   | { type: "referenceError"; requestId: number; message: string };
 
@@ -53,13 +60,13 @@ export class TileWorkerPool {
   private readonly workers: Worker[] = [];
   private readonly idle: Worker[] = [];
   private readonly queue: QueueItem[] = [];
-  private readonly inFlight = new Map<Worker, QueueItem>();
+  private readonly inFlight = new Map<Worker, QueueItem | PrepareReferenceItem>();
   private readonly residentRevision = new Map<Worker, number>();
   private sequence = 0;
   private requestId = 0;
 
   constructor(readonly size = resolveWorkerCount()) {
-    this.idle.push(this.createWorker());
+    while (this.workers.length < this.size) this.idle.push(this.createWorker());
   }
 
   get pending(): number {
@@ -74,8 +81,7 @@ export class TileWorkerPool {
     this.ensureRenderCapacity();
     const queuedAt = performance.now();
     const promise = new Promise<TileDoneMessage>((resolve, reject) => {
-      this.queue.push({ kind: "render", message, priority, sequence: ++this.sequence, queuedAt, resolve, reject });
-      this.sortQueue();
+      this.enqueue({ kind: "render", message, priority, sequence: ++this.sequence, queuedAt, resolve, reject });
       recordDeepBench({ type: "tileQueued", tileId: message.tile.id, revision: message.tile.revision, priority, queuedAt });
     });
     this.pump();
@@ -85,7 +91,7 @@ export class TileWorkerPool {
   async computeViewReference(view: RuntimeView): Promise<ReferenceSnapshot> {
     const requestId = ++this.requestId;
     const raw = await new Promise<RawReferenceResult>((resolve, reject) => {
-      this.queue.push({
+      this.enqueue({
         kind: "reference",
         message: {
           type: "computeReference",
@@ -102,10 +108,9 @@ export class TileWorkerPool {
         resolve,
         reject
       });
-      this.sortQueue();
       this.pump();
     });
-    return {
+    const reference = {
       revision: view.revision,
       screenX: view.width * 0.5,
       screenY: view.height * 0.5,
@@ -113,6 +118,8 @@ export class TileWorkerPool {
       orbitRe: raw.orbitRe,
       orbitIm: raw.orbitIm
     };
+    this.prepareReferenceWorkers(reference);
+    return reference;
   }
 
   clearQueueForOldRevisions(currentRevision: number): void {
@@ -127,14 +134,25 @@ export class TileWorkerPool {
       const itemRevision = item.kind === "render" ? item.message.tile.revision : item.revision;
       if (itemRevision === currentRevision) continue;
       this.inFlight.delete(worker);
-      item.reject(new Error("stale work revision"));
+      if (item.kind !== "prepareReference") item.reject(new Error("stale work revision"));
       this.replaceWorker(worker);
     }
     this.pump();
   }
 
-  private sortQueue(): void {
-    this.queue.sort((a, b) => a.priority - b.priority || a.sequence - b.sequence);
+  private enqueue(item: QueueItem): void {
+    let low = 0;
+    let high = this.queue.length;
+    while (low < high) {
+      const middle = (low + high) >>> 1;
+      const current = this.queue[middle];
+      if (current.priority < item.priority || (current.priority === item.priority && current.sequence < item.sequence)) {
+        low = middle + 1;
+      } else {
+        high = middle;
+      }
+    }
+    this.queue.splice(low, 0, item);
   }
 
   private pump(): void {
@@ -174,7 +192,17 @@ export class TileWorkerPool {
     worker.onmessage = (event: MessageEvent<WorkerMessage>) => this.handleMessage(worker, event.data);
     worker.onerror = (event) => this.handleError(worker, new Error(event.message));
     this.workers.push(worker);
+    worker.postMessage({ type: "warmup" });
     return worker;
+  }
+
+  private prepareReferenceWorkers(reference: ReferenceSnapshot): void {
+    for (const worker of [...this.idle]) {
+      const idleIndex = this.idle.indexOf(worker);
+      if (idleIndex >= 0) this.idle.splice(idleIndex, 1);
+      this.inFlight.set(worker, { kind: "prepareReference", revision: reference.revision });
+      worker.postMessage({ type: "prepareReference", reference } satisfies TileWorkerInMessage);
+    }
   }
 
   private replaceWorker(worker: Worker): void {
@@ -192,11 +220,14 @@ export class TileWorkerPool {
   }
 
   private handleMessage(worker: Worker, message: WorkerMessage): void {
+    if (message.type === "warmupDone") return;
     const item = this.inFlight.get(worker);
     if (!item) return;
     this.inFlight.delete(worker);
     this.idle.push(worker);
-    if (item.kind === "render" && message.type === "tileDone") {
+    if (item.kind === "prepareReference" && message.type === "referencePrepared") {
+      this.residentRevision.set(worker, message.revision);
+    } else if (item.kind === "render" && message.type === "tileDone") {
       item.resolve(message);
     } else if (item.kind === "reference" && message.type === "referenceDone") {
       item.resolve({
@@ -205,7 +236,9 @@ export class TileWorkerPool {
         orbitIm: asFloat64(message.reference.orbitIm)
       });
     } else {
-      item.reject(new Error(message.type === "referenceError" ? message.message : "worker returned a mismatched response"));
+      if (item.kind !== "prepareReference") {
+        item.reject(new Error(message.type === "referenceError" ? message.message : "worker returned a mismatched response"));
+      }
     }
     this.pump();
   }
@@ -214,7 +247,7 @@ export class TileWorkerPool {
     const item = this.inFlight.get(worker);
     if (item) {
       this.inFlight.delete(worker);
-      item.reject(error);
+      if (item.kind !== "prepareReference") item.reject(error);
     }
     this.replaceWorker(worker);
     this.pump();

@@ -73,7 +73,11 @@ try {
       finalWallMs: average(bench.sums.finalWallMs, bench.counts.final),
       finalQueueMs: average(bench.sums.finalQueueMs, bench.counts.finalStarted),
       finalUploadMs: average(bench.sums.finalUploadMs, bench.counts.finalUploaded),
-      referenceWallMs: average(bench.sums.referenceWallMs, bench.counts.referenceDone)
+      referenceWallMs: average(bench.sums.referenceWallMs, bench.counts.referenceDone),
+      seriesBuildMs: average(bench.waves.totalSeriesBuildMs, bench.counts.final),
+      blockCertMs: average(bench.waves.totalBlockCertMs, bench.counts.final),
+      pixelLoopMs: average(bench.waves.totalPixelLoopMs, bench.counts.final),
+      postProcessMs: average(bench.waves.totalPostProcessMs, bench.counts.final)
     },
     percentiles: {
       finalWorkerMs: percentiles(bench.samples.finalWorkerMs),
@@ -345,6 +349,14 @@ function installWorkerProbe() {
       maxPaletteProxyLod: 0,
       totalRebases: 0,
       totalPeriodicInterior: 0,
+      escapedPixels: 0,
+      capHitUnknownCount: 0,
+      scalarIterations: 0,
+      certifiedInteriorCount: 0,
+      totalSeriesBuildMs: 0,
+      totalBlockCertMs: 0,
+      totalPixelLoopMs: 0,
+      totalPostProcessMs: 0,
       onePixelTiles: 0,
       minTileArea: Infinity
     },
@@ -442,6 +454,14 @@ function installWorkerProbe() {
         bench.waves.maxPaletteProxyLod = Math.max(bench.waves.maxPaletteProxyLod, data.stats.maxPaletteProxyLod ?? 0);
         bench.waves.totalRebases += data.stats.rebaseCount;
         bench.waves.totalPeriodicInterior += data.stats.periodicInteriorCount;
+        bench.waves.escapedPixels += data.stats.escapedPixels ?? 0;
+        bench.waves.capHitUnknownCount += data.stats.capHitUnknownCount ?? 0;
+        bench.waves.scalarIterations += data.stats.scalarIterations ?? 0;
+        bench.waves.certifiedInteriorCount += data.stats.certifiedInteriorCount ?? 0;
+        bench.waves.totalSeriesBuildMs += data.stats.seriesBuildMs ?? 0;
+        bench.waves.totalBlockCertMs += data.stats.blockCertMs ?? 0;
+        bench.waves.totalPixelLoopMs += data.stats.pixelLoopMs ?? 0;
+        bench.waves.totalPostProcessMs += data.stats.postProcessMs ?? 0;
         pushSlowFinal({
           workerMs: Math.round(data.stats.elapsedMs),
           wallMs: Math.round(wallMs),
@@ -450,6 +470,11 @@ function installWorkerProbe() {
           seriesSkip: data.stats.seriesSkip,
           rebases: data.stats.rebaseCount,
           periodicInterior: data.stats.periodicInteriorCount,
+          certifiedInterior: data.stats.certifiedInteriorCount,
+          seriesBuildMs: data.stats.seriesBuildMs,
+          blockCertMs: data.stats.blockCertMs,
+          pixelLoopMs: data.stats.pixelLoopMs,
+          postProcessMs: data.stats.postProcessMs,
           paletteFootprints: data.stats.paletteFootprintCount,
           paletteFootprintFallbacks: data.stats.paletteFootprintFallbackCount,
           paletteFiltered: data.stats.paletteFilteredCount,

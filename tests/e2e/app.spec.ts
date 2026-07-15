@@ -599,7 +599,7 @@ test("bandlimits the reported deep boundary view and emits visual artifacts", as
   expect(speckleRatio).toBeLessThanOrEqual(0.08);
 });
 
-test("keeps reported minibrot geometry stable across tile boundaries and small view changes", async ({ page }) => {
+test("keeps reported minibrot geometry stable under 2 seconds across tile boundaries and small view changes", async ({ page }) => {
   test.setTimeout(30_000);
   await installInteractionWorkerProbe(page);
   await page.setViewportSize({ width: 1912, height: 948 });
@@ -607,9 +607,9 @@ test("keeps reported minibrot geometry stable across tile boundaries and small v
   for (const url of TILE_STABILITY_REGRESSION_VIEWS) {
     const started = Date.now();
     await page.goto(url);
-    const metrics = await waitForStableMetrics(page, started, 5_000);
+    const metrics = await waitForStableMetrics(page, started, 2_000);
     expect(metrics.status).toBe("stable");
-    expect(metrics.stableMs).toBeLessThan(5_000);
+    expect(metrics.stableMs).toBeLessThan(2_000);
 
     const tileCounts = await readTileCounts(page);
     expect(tileCounts.completed).toBe(tileCounts.total);
@@ -696,7 +696,7 @@ test("renders the seven Fractalshades fieldline views without seams or pepper no
   expect(pageErrors).toEqual([]);
 });
 
-test("stabilizes the reported interior-heavy views under 5 seconds", async ({ page }) => {
+test("stabilizes the reported interior-heavy views under 2 seconds", async ({ page }) => {
   test.setTimeout(30_000);
   await installInteractionWorkerProbe(page);
   await page.setViewportSize({ width: 1912, height: 948 });
@@ -704,9 +704,9 @@ test("stabilizes the reported interior-heavy views under 5 seconds", async ({ pa
   for (const url of REPORTED_INTERIOR_PERFORMANCE_VIEWS) {
     const started = Date.now();
     await page.goto(url);
-    await expect.poll(() => page.locator("#readStatus").textContent(), { timeout: 5_000, intervals: [25] }).toBe("stable");
+    await expect.poll(() => page.locator("#readStatus").textContent(), { timeout: 2_000, intervals: [25] }).toBe("stable");
     const stableMs = Date.now() - started;
-    expect(stableMs).toBeLessThan(5_000);
+    expect(stableMs).toBeLessThan(2_000);
 
     const tileCounts = await readTileCounts(page);
     expect(tileCounts.completed).toBe(tileCounts.total);
@@ -722,16 +722,16 @@ test("stabilizes the reported interior-heavy views under 5 seconds", async ({ pa
   }
 });
 
-test("stabilizes the reported e100 deep view under 5 seconds", async ({ page }) => {
+test("stabilizes the reported e100 deep view under 2 seconds", async ({ page }) => {
   test.setTimeout(30_000);
   await installInteractionWorkerProbe(page);
   await page.setViewportSize({ width: 1912, height: 948 });
 
   const started = Date.now();
   await page.goto(REPORTED_DEEP_PERFORMANCE_VIEW);
-  await expect.poll(() => page.locator("#readStatus").textContent(), { timeout: 5_000, intervals: [25] }).toBe("stable");
+  await expect.poll(() => page.locator("#readStatus").textContent(), { timeout: 2_000, intervals: [25] }).toBe("stable");
   const stableMs = Date.now() - started;
-  expect(stableMs).toBeLessThan(5_000);
+  expect(stableMs).toBeLessThan(2_000);
 
   const tileCounts = await readTileCounts(page);
   expect(tileCounts.completed).toBe(tileCounts.total);
@@ -764,16 +764,16 @@ test("stabilizes the reported e100 deep view under 5 seconds", async ({ page }) 
   });
 });
 
-test("stabilizes the iter=5000 periodic-interior view under 5 seconds", async ({ page }) => {
+test("stabilizes the iter=5000 periodic-interior view under 2 seconds", async ({ page }) => {
   test.setTimeout(30_000);
   await installInteractionWorkerProbe(page);
   await page.setViewportSize({ width: 1912, height: 948 });
 
   const started = Date.now();
   await page.goto(PERIODIC_INTERIOR_PERFORMANCE_VIEW);
-  await expect.poll(() => page.locator("#readStatus").textContent(), { timeout: 5_000, intervals: [25] }).toBe("stable");
+  await expect.poll(() => page.locator("#readStatus").textContent(), { timeout: 2_000, intervals: [25] }).toBe("stable");
   const stableMs = Date.now() - started;
-  expect(stableMs).toBeLessThan(5_000);
+  expect(stableMs).toBeLessThan(2_000);
 
   const tileCounts = await readTileCounts(page);
   expect(tileCounts).toEqual({ completed: 120, total: 120 });
@@ -789,16 +789,16 @@ test("stabilizes the iter=5000 periodic-interior view under 5 seconds", async ({
   }
 });
 
-test("stabilizes the alternate reported e100 deep view under 5 seconds", async ({ page }) => {
+test("stabilizes the alternate reported e100 deep view under 2 seconds", async ({ page }) => {
   test.setTimeout(30_000);
   await installInteractionWorkerProbe(page);
   await page.setViewportSize({ width: 1912, height: 948 });
 
   const started = Date.now();
   await page.goto(ALT_REPORTED_DEEP_PERFORMANCE_VIEW);
-  await expect.poll(() => page.locator("#readStatus").textContent(), { timeout: 5_000, intervals: [25] }).toBe("stable");
+  await expect.poll(() => page.locator("#readStatus").textContent(), { timeout: 2_000, intervals: [25] }).toBe("stable");
   const stableMs = Date.now() - started;
-  expect(stableMs).toBeLessThan(5_000);
+  expect(stableMs).toBeLessThan(2_000);
 
   const tileCounts = await readTileCounts(page);
   expect(tileCounts.completed).toBe(tileCounts.total);
@@ -813,16 +813,16 @@ test("stabilizes the alternate reported e100 deep view under 5 seconds", async (
   }
 });
 
-test("stabilizes the reported former reference-pressure view under 5 seconds", async ({ page }) => {
+test("stabilizes the reported former reference-pressure view under 2 seconds", async ({ page }) => {
   test.setTimeout(30_000);
   await installInteractionWorkerProbe(page);
   await page.setViewportSize({ width: 1912, height: 948 });
 
   const started = Date.now();
   await page.goto(REFERENCE_PRESSURE_PERFORMANCE_VIEW);
-  const metrics = await waitForStableMetrics(page, started, 5_000);
+  const metrics = await waitForStableMetrics(page, started, 2_000);
   expect(metrics.status).toBe("stable");
-  expect(metrics.stableMs).toBeLessThan(5_000);
+  expect(metrics.stableMs).toBeLessThan(2_000);
 
   const tileCounts = await readTileCounts(page);
   expect(tileCounts.completed).toBe(tileCounts.total);

@@ -424,7 +424,9 @@ struct CachedRenderReference {
     screen_y: f64,
     orbit_re: Rc<Vec<f64>>,
     orbit_im: Rc<Vec<f64>>,
+    orbit_limit: usize,
     interior_radius: f64,
+    series_coefficients: Rc<SeriesCoefficientCache64>,
 }
 
 struct RenderContext {
@@ -440,6 +442,27 @@ struct SeriesPlan64 {
     coeff_re: Vec<f64>,
     coeff_im: Vec<f64>,
     tail: Vec<SeriesSnapshot64>,
+}
+
+struct SeriesCoefficientCache64 {
+    degree: usize,
+    steps: usize,
+    coeff_re: Vec<f64>,
+    coeff_im: Vec<f64>,
+}
+
+impl SeriesCoefficientCache64 {
+    fn coefficients(&self, step: usize, degree: usize) -> Option<(&[f64], &[f64])> {
+        if step > self.steps || degree > self.degree {
+            return None;
+        }
+        let stride = self.degree + 1;
+        let start = step * stride;
+        Some((
+            &self.coeff_re[start..start + degree + 1],
+            &self.coeff_im[start..start + degree + 1],
+        ))
+    }
 }
 
 #[derive(Clone)]
@@ -516,6 +539,7 @@ thread_local! {
 }
 
 const RENDER_SERIES_MAX_SKIP: usize = 8192;
+const RENDER_SERIES_CACHE_DEGREE: usize = 12;
 const RENDER_MAX_SERIES_TILE_RADIUS: f64 = 1e-3;
 const RENDER_SERIES_ERROR_SCALE: f64 = 2.9e-2;
 const RENDER_SERIES_SKIP_SATURATION: f64 = 0.7;
@@ -573,6 +597,7 @@ const RENDER_FIELDLINE_WEIGHTS: [f64; RENDER_FIELDLINE_ITERATIONS] = [
     0.08921631836352062,
 ];
 const RENDER_FIELDLINE_BAILOUT: f64 = 1000.0;
+const RENDER_FIELDLINE_BAILOUT_SQUARED: f64 = RENDER_FIELDLINE_BAILOUT * RENDER_FIELDLINE_BAILOUT;
 const RENDER_FIELDLINE_MAX_REFINEMENT: usize = 8;
 const RENDER_DERIVATIVE_RESCALE_HIGH: f64 = 1e120;
 const RENDER_DERIVATIVE_RESCALE_FACTOR: f64 = 1e-120;
@@ -608,12 +633,26 @@ pub fn set_render_reference(
 ) {
     let orbit_re = orbit_re.to_vec();
     let orbit_im = orbit_im.to_vec();
+    let orbit_limit = orbit_re
+        .iter()
+        .zip(&orbit_im)
+        .take_while(|(re, im)| re.is_finite() && im.is_finite())
+        .count()
+        .saturating_sub(1);
+    let series_coefficients = Rc::new(build_series_coefficient_cache64(
+        &orbit_re,
+        &orbit_im,
+        RENDER_SERIES_CACHE_DEGREE,
+        RENDER_SERIES_MAX_SKIP,
+    ));
     let reference = CachedRenderReference {
         screen_x,
         screen_y,
         orbit_re: Rc::new(orbit_re),
         orbit_im: Rc::new(orbit_im),
+        orbit_limit,
         interior_radius: max_iter_bounded_radius,
+        series_coefficients,
     };
     RENDER_REFERENCE.with(|resident| *resident.borrow_mut() = Some(reference));
 }
@@ -647,7 +686,9 @@ pub fn render_tile(
         height: sample_height as f64,
     };
     let mut context = build_render_context(sample_rect, pixel_span)?;
-    ensure_render_series(&mut context, 16, pixel_span);
+    let series_started = js_sys::Date::now();
+    ensure_render_series(&mut context, RENDER_SERIES_CACHE_DEGREE, pixel_span);
+    let series_build_ms = js_sys::Date::now() - series_started;
     let series_skip = context
         .series
         .as_ref()
@@ -657,7 +698,8 @@ pub fn render_tile(
     let mut sample_rgba = vec![0u8; sample_count * 4];
     let mut certified_interior_mask = vec![0u8; sample_count];
     let mut escaped_pixels = 0u32;
-    certify_render_blocks64(
+    let block_cert_started = js_sys::Date::now();
+    let certified_interior_count = certify_render_blocks64(
         &mut certified_interior_mask,
         &mut sample_rgba,
         sample_width,
@@ -668,9 +710,11 @@ pub fn render_tile(
         &context,
         palette.colors.as_slice(),
     );
+    let block_cert_ms = js_sys::Date::now() - block_cert_started;
     let mut periodic_interior_count = 0u32;
     let mut cap_hit_unknown_count = 0u32;
     let mut rebase_count = 0u32;
+    let mut scalar_iterations = 0u64;
     let mut escaped_mask = vec![0u8; sample_count];
     let mut escape_iters = vec![max_iter; sample_count];
     let mut phase_values = vec![f32::NAN; sample_count];
@@ -685,6 +729,7 @@ pub fn render_tile(
     let mut adjacent_interior = false;
     let mut adjacent_cycle = None;
     let mut interior_probe_cooldown = 0u32;
+    let pixel_loop_started = js_sys::Date::now();
     for py in 0..sample_height {
         let screen_y = screen_ys[py];
         let scan_start = if py & 1 == 0 {
@@ -720,6 +765,9 @@ pub fn render_tile(
                 adjacent_cycle,
                 &context,
             );
+            if !result.periodic_interior {
+                scalar_iterations += result.iter.saturating_sub(series_skip) as u64;
+            }
             let offset = pixel_index * 4;
             if result.iter < max_iter {
                 escaped_mask[pixel_index] = 1;
@@ -757,7 +805,9 @@ pub fn render_tile(
             );
         }
     }
+    let pixel_loop_ms = js_sys::Date::now() - pixel_loop_started;
 
+    let post_process_started = js_sys::Date::now();
     let palette_footprint_fallback_count = estimate_render_palette_footprints_from_smooth(
         &mut palette_footprints,
         &phase_values,
@@ -841,6 +891,7 @@ pub fn render_tile(
         rgba[target..target + width * 4].copy_from_slice(&sample_rgba[source..source + width * 4]);
     }
     let elapsed_ms = js_sys::Date::now() - started;
+    let post_process_ms = js_sys::Date::now() - post_process_started;
     build_render_tile_value(
         tile_id,
         revision,
@@ -853,7 +904,13 @@ pub fn render_tile(
         periodic_interior_count,
         cap_hit_unknown_count,
         rebase_count,
+        scalar_iterations,
         series_skip,
+        certified_interior_count,
+        series_build_ms,
+        block_cert_ms,
+        pixel_loop_ms,
+        post_process_ms,
         palette_filter_stats,
     )
 }
@@ -874,7 +931,7 @@ fn certify_render_blocks64(
         return 0;
     }
     let mut certified = 0u32;
-    certify_render_block64(
+    let _ = certify_render_block64(
         mask,
         rgba,
         width,
@@ -888,6 +945,7 @@ fn certify_render_blocks64(
         width,
         height,
         &mut certified,
+        None,
     );
     certified
 }
@@ -907,12 +965,24 @@ fn certify_render_block64(
     block_width: usize,
     block_height: usize,
     certified: &mut u32,
-) {
+    interior_hint: Option<AttractingCycle64>,
+) -> Option<AttractingCycle64> {
     if block_width == 0 || block_height == 0 {
-        return;
+        return interior_hint;
     }
 
-    if certifies_render_block64(context, rect, pixel_span, x0, y0, block_width, block_height) {
+    let (block_is_certified, block_hint) = certifies_render_block64(
+        context,
+        rect,
+        pixel_span,
+        max_iter,
+        x0,
+        y0,
+        block_width,
+        block_height,
+        interior_hint,
+    );
+    if block_is_certified {
         fill_certified_render_block64(
             mask,
             rgba,
@@ -925,19 +995,20 @@ fn certify_render_block64(
             palette,
         );
         *certified += (block_width * block_height) as u32;
-        return;
+        return block_hint.or(interior_hint);
     }
 
     if block_width <= RENDER_REFERENCE_INTERIOR_MIN_BLOCK_SIZE
         && block_height <= RENDER_REFERENCE_INTERIOR_MIN_BLOCK_SIZE
     {
-        return;
+        return block_hint.or(interior_hint);
     }
 
+    let child_hint = block_hint.or(interior_hint);
     if block_width >= block_height && block_width > RENDER_REFERENCE_INTERIOR_MIN_BLOCK_SIZE {
         let left_width = block_width / 2;
         let right_width = block_width - left_width;
-        certify_render_block64(
+        let left_hint = certify_render_block64(
             mask,
             rgba,
             stride,
@@ -951,6 +1022,7 @@ fn certify_render_block64(
             left_width,
             block_height,
             certified,
+            child_hint,
         );
         certify_render_block64(
             mask,
@@ -966,11 +1038,12 @@ fn certify_render_block64(
             right_width,
             block_height,
             certified,
-        );
+            left_hint.or(child_hint),
+        )
     } else if block_height > RENDER_REFERENCE_INTERIOR_MIN_BLOCK_SIZE {
         let top_height = block_height / 2;
         let bottom_height = block_height - top_height;
-        certify_render_block64(
+        let top_hint = certify_render_block64(
             mask,
             rgba,
             stride,
@@ -984,6 +1057,7 @@ fn certify_render_block64(
             block_width,
             top_height,
             certified,
+            child_hint,
         );
         certify_render_block64(
             mask,
@@ -999,7 +1073,10 @@ fn certify_render_block64(
             block_width,
             bottom_height,
             certified,
-        );
+            top_hint.or(child_hint),
+        )
+    } else {
+        child_hint
     }
 }
 
@@ -1008,22 +1085,74 @@ fn certifies_render_block64(
     context: &RenderContext,
     rect: Rect64,
     pixel_span: f64,
+    max_iter: u32,
     x0: usize,
     y0: usize,
     block_width: usize,
     block_height: usize,
-) -> bool {
+    interior_hint: Option<AttractingCycle64>,
+) -> (bool, Option<AttractingCycle64>) {
     let screen_x = rect.x + x0 as f64 + block_width as f64 * 0.5;
     let screen_y = rect.y + y0 as f64 + block_height as f64 * 0.5;
     let block_radius = (block_width as f64).hypot(block_height as f64) * 0.5 * pixel_span;
     if !screen_x.is_finite() || !screen_y.is_finite() || !block_radius.is_finite() {
-        return false;
+        return (false, interior_hint);
     }
     let reference = &context.reference;
     let center_delta =
         (screen_x - reference.screen_x).hypot(screen_y - reference.screen_y) * pixel_span;
     let covered_radius = reference.interior_radius * RENDER_REFERENCE_INTERIOR_RADIUS_SAFETY;
-    covered_radius > 0.0 && center_delta + block_radius <= covered_radius
+    if covered_radius > 0.0 && center_delta + block_radius <= covered_radius {
+        return (true, interior_hint);
+    }
+
+    if block_width <= RENDER_REFERENCE_INTERIOR_MIN_BLOCK_SIZE
+        && block_height <= RENDER_REFERENCE_INTERIOR_MIN_BLOCK_SIZE
+    {
+        return (false, interior_hint);
+    }
+    let screen_dx = screen_x - reference.screen_x;
+    let screen_dy = screen_y - reference.screen_y;
+    let c_delta_re = screen_dx * pixel_span;
+    let c_delta_im = screen_dy * pixel_span;
+    let Some((parameter, center_error)) = render_parameter_ball64(
+        screen_dx,
+        screen_dy,
+        c_delta_re,
+        c_delta_im,
+        pixel_span,
+        &reference.orbit_re,
+        &reference.orbit_im,
+    ) else {
+        return (false, interior_hint);
+    };
+    let parameter_radius = outward_sum_nonnegative64(&[center_error, block_radius]);
+    if let Some(cycle) =
+        certify_attracting_interior64(parameter, parameter_radius, max_iter, interior_hint)
+    {
+        return (true, Some(cycle));
+    }
+
+    // A parent can be too wide for one proof while its center is well inside a
+    // hyperbolic component.  Preserve only the cycle as a hint; every child
+    // still constructs and verifies its own full parameter ball.
+    let center_cycle =
+        certify_attracting_interior64(parameter, center_error, max_iter, interior_hint);
+    (false, center_cycle.or(interior_hint))
+}
+
+#[cfg(test)]
+fn certify_parameter_block64(
+    parameter: Complex64,
+    center_error: f64,
+    block_radius: f64,
+    max_iter: u32,
+) -> bool {
+    if !center_error.is_finite() || !block_radius.is_finite() || block_radius < 0.0 {
+        return false;
+    }
+    let parameter_radius = outward_sum_nonnegative64(&[center_error, block_radius]);
+    certify_attracting_interior64(parameter, parameter_radius, max_iter, None).is_some()
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1145,7 +1274,13 @@ fn build_render_tile_value(
     periodic_interior_count: u32,
     cap_hit_unknown_count: u32,
     rebase_count: u32,
+    scalar_iterations: u64,
     series_skip: u32,
+    certified_interior_count: u32,
+    series_build_ms: f64,
+    block_cert_ms: f64,
+    pixel_loop_ms: f64,
+    post_process_ms: f64,
     palette_filter_stats: PaletteFilterStats64,
 ) -> Result<JsValue, JsValue> {
     let object = Object::new();
@@ -1180,7 +1315,21 @@ fn build_render_tile_value(
         "rebaseCount",
         &JsValue::from_f64(rebase_count as f64),
     )?;
+    set_js_property(
+        &stats,
+        "scalarIterations",
+        &JsValue::from_f64(scalar_iterations as f64),
+    )?;
     set_js_property(&stats, "seriesSkip", &JsValue::from_f64(series_skip as f64))?;
+    set_js_property(
+        &stats,
+        "certifiedInteriorCount",
+        &JsValue::from_f64(certified_interior_count as f64),
+    )?;
+    set_js_property(&stats, "seriesBuildMs", &JsValue::from_f64(series_build_ms))?;
+    set_js_property(&stats, "blockCertMs", &JsValue::from_f64(block_cert_ms))?;
+    set_js_property(&stats, "pixelLoopMs", &JsValue::from_f64(pixel_loop_ms))?;
+    set_js_property(&stats, "postProcessMs", &JsValue::from_f64(post_process_ms))?;
     set_js_property(
         &stats,
         "paletteFootprintCount",
@@ -1267,6 +1416,7 @@ fn render_pixel64(
         c_im,
         &context.reference.orbit_re,
         &context.reference.orbit_im,
+        context.reference.orbit_limit,
         max_iter,
         pixel_span,
         context.series.as_ref().expect("series plan is initialized"),
@@ -1392,41 +1542,14 @@ fn certify_hint_attracting_interior64(
     if hint.period == 0 || hint.period > probe_limit {
         return None;
     }
-    let mut z = Complex64 { re: 0.0, im: 0.0 };
-    let mut minimum_mag2 = f64::INFINITY;
-    let mut is_candidate = false;
-    for period in 1..=hint.period {
-        z = complex_add64(complex_square64(z), c);
-        if !complex_is_finite64(z) || z.re.abs().max(z.im.abs()) > 2.0 {
-            return None;
-        }
-        let mag2 = z.re * z.re + z.im * z.im;
-        if !mag2.is_finite() {
-            return None;
-        }
-        let new_minimum = mag2 < minimum_mag2;
-        if new_minimum {
-            minimum_mag2 = mag2;
-        }
-        if period == hint.period {
-            is_candidate = new_minimum;
-        }
-    }
-    if !is_candidate {
-        return None;
-    }
-
-    let root = newton_periodic_point64(c, hint.root, hint.period)
-        .or_else(|| newton_periodic_point64(c, z, hint.period))?;
-    let reduced_period = reduce_period64(c, root, hint.period);
-    let root = if reduced_period == hint.period {
-        root
-    } else {
-        newton_periodic_point64(c, root, reduced_period)?
-    };
-    prove_attracting_cycle64(c, c_error, root, reduced_period).then_some(AttractingCycle64 {
+    // The hint already came from a rigorous attracting-cycle proof. Newton
+    // continuation followed by a fresh ball proof is sufficient at the new
+    // parameter: replaying the critical orbit and reducing the known period
+    // only repeated O(period) work for every adjacent pixel.
+    let root = newton_periodic_point64(c, hint.root, hint.period)?;
+    prove_attracting_cycle64(c, c_error, root, hint.period).then_some(AttractingCycle64 {
         root,
-        period: reduced_period,
+        period: hint.period,
     })
 }
 
@@ -1719,9 +1842,10 @@ fn next_down64(value: f64) -> f64 {
 
 fn ensure_render_series(context: &mut RenderContext, series_degree: usize, pixel_span: f64) {
     if context.series.is_none() {
-        context.series = Some(build_series_plan64(
+        context.series = Some(build_series_plan_from_cache64(
             &context.reference.orbit_re,
             &context.reference.orbit_im,
+            &context.reference.series_coefficients,
             series_degree,
             RENDER_SERIES_MAX_SKIP,
             context.radius,
@@ -1736,6 +1860,7 @@ fn perturb64(
     c_im: f64,
     orbit_re: &[f64],
     orbit_im: &[f64],
+    orbit_limit: usize,
     max_iter: u32,
     pixel_span: f64,
     series: &SeriesPlan64,
@@ -1760,46 +1885,17 @@ fn perturb64(
             ScaledDerivative64::from_complex(evaluate_series_derivative64(series, c_re, c_im));
         iter = series.skip as u32;
         ref_index = series.skip;
-        for snapshot in &series.tail {
-            let delta = evaluate_series_coefficients64(
-                &snapshot.coeff_re,
-                &snapshot.coeff_im,
-                series.degree,
-                c_re,
-                c_im,
-            );
-            let z = Complex64 {
-                re: orbit_re.get(snapshot.iter).copied().unwrap_or(f64::NAN) + delta.re,
-                im: orbit_im.get(snapshot.iter).copied().unwrap_or(f64::NAN) + delta.im,
-            };
-            let derivative =
-                ScaledDerivative64::from_complex(evaluate_series_coefficients_derivative64(
-                    &snapshot.coeff_re,
-                    &snapshot.coeff_im,
-                    series.degree,
-                    c_re,
-                    c_im,
-                ));
-            if complex_is_finite64(z) {
-                history.push(OrbitSample64 {
-                    iter: snapshot.iter as u32,
-                    z,
-                    derivative,
-                });
-            }
-        }
     }
 
-    let limit = max_iter.min((orbit_re.len().saturating_sub(1)) as u32) as usize;
+    let limit = (max_iter as usize)
+        .min(orbit_limit)
+        .min(orbit_re.len().saturating_sub(1))
+        .min(orbit_im.len().saturating_sub(1));
     debug_assert!(ref_index <= limit);
 
     while iter <= max_iter && ref_index <= limit {
         let ref_re = orbit_re[ref_index];
         let ref_im = orbit_im[ref_index];
-        if !ref_re.is_finite() || !ref_im.is_finite() {
-            return failed_pixel_result64(iter, rebase_count);
-        }
-
         let z_re = ref_re + dz_re;
         let z_im = ref_im + dz_im;
         if !z_re.is_finite() || !z_im.is_finite() {
@@ -1813,6 +1909,8 @@ fn perturb64(
         });
         let z_norm = z_re.abs().max(z_im.abs());
         if z_norm > 2.0 {
+            let history =
+                complete_series_history64(history, series, c_re, c_im, orbit_re, orbit_im);
             return finish_escaped_pixel64(
                 iter,
                 z,
@@ -1847,7 +1945,7 @@ fn perturb64(
             rebase_count += 1;
         }
 
-        derivative.step(z);
+        derivative.step_finite(z);
         let dz2_re = dz_re * dz_re - dz_im * dz_im;
         let dz2_im = 2.0 * dz_re * dz_im;
         let two_ref_dz_re = 2.0 * (step_ref_re * dz_re - step_ref_im * dz_im);
@@ -1856,10 +1954,6 @@ fn perturb64(
         dz_im = two_ref_dz_im + dz2_im + c_im;
         iter += 1;
         ref_index += 1;
-
-        if !dz_re.is_finite() || !dz_im.is_finite() {
-            return failed_pixel_result64(iter, rebase_count);
-        }
     }
     PixelResult64 {
         iter: max_iter,
@@ -1870,6 +1964,55 @@ fn perturb64(
         phase: f64::NAN,
         distance_pixels: f64::NAN,
     }
+}
+
+fn complete_series_history64(
+    history: OrbitHistory64,
+    series: &SeriesPlan64,
+    c_re: f64,
+    c_im: f64,
+    orbit_re: &[f64],
+    orbit_im: &[f64],
+) -> OrbitHistory64 {
+    if history.len >= RENDER_FIELDLINE_HISTORY || series.tail.is_empty() {
+        return history;
+    }
+    let mut combined = OrbitHistory64::new();
+    for snapshot in &series.tail {
+        let delta = evaluate_series_coefficients64(
+            &snapshot.coeff_re,
+            &snapshot.coeff_im,
+            series.degree,
+            c_re,
+            c_im,
+        );
+        let z = Complex64 {
+            re: orbit_re.get(snapshot.iter).copied().unwrap_or(f64::NAN) + delta.re,
+            im: orbit_im.get(snapshot.iter).copied().unwrap_or(f64::NAN) + delta.im,
+        };
+        if !complex_is_finite64(z) {
+            continue;
+        }
+        combined.push(OrbitSample64 {
+            iter: snapshot.iter as u32,
+            z,
+            derivative: ScaledDerivative64::from_complex(
+                evaluate_series_coefficients_derivative64(
+                    &snapshot.coeff_re,
+                    &snapshot.coeff_im,
+                    series.degree,
+                    c_re,
+                    c_im,
+                ),
+            ),
+        });
+    }
+    for index in 0..history.len {
+        if let Some(sample) = history.get(index) {
+            combined.push_unique(sample);
+        }
+    }
+    combined
 }
 
 fn failed_pixel_result64(iter: u32, rebase_count: u32) -> PixelResult64 {
@@ -1896,10 +2039,10 @@ fn finish_escaped_pixel64(
 ) -> PixelResult64 {
     let mut post_iter = escape_iter;
     for _ in 0..RENDER_FIELDLINE_MAX_REFINEMENT {
-        if z.re.hypot(z.im) >= RENDER_FIELDLINE_BAILOUT {
+        if z.re * z.re + z.im * z.im >= RENDER_FIELDLINE_BAILOUT_SQUARED {
             break;
         }
-        derivative.step(z);
+        derivative.step_finite(z);
         z = complex_add64(complex_square64(z), parameter);
         post_iter += 1;
         if !complex_is_finite64(z) {
@@ -1912,13 +2055,15 @@ fn finish_escaped_pixel64(
         });
     }
 
-    let radius = z.re.hypot(z.im);
-    let (smooth, nu_frac) = render_continuous_iteration64(post_iter, radius);
+    let radius_squared = z.re * z.re + z.im * z.im;
+    let log_radius = 0.5 * radius_squared.ln();
+    let (smooth, nu_frac) = render_continuous_iteration_from_log64(post_iter, log_radius);
     let base_phase = smooth.max(1e-9).ln();
     let fieldline =
         render_fieldline64(&history, (-nu_frac).clamp(0.0, 1.0), pixel_span).unwrap_or(0.0);
     let phase = base_phase + RENDER_FIELDLINE_INTENSITY * fieldline;
-    let distance_pixels = render_distance_pixels64(z, derivative, pixel_span).unwrap_or(f64::NAN);
+    let distance_pixels =
+        render_distance_pixels_from_log64(log_radius, derivative, pixel_span).unwrap_or(f64::NAN);
     PixelResult64 {
         iter: escape_iter,
         rebase_count,
@@ -1930,9 +2075,13 @@ fn finish_escaped_pixel64(
     }
 }
 
+#[cfg(test)]
 fn render_continuous_iteration64(iter: u32, radius: f64) -> (f64, f64) {
-    let log_radius = radius.ln();
-    let raw_fraction = if radius.is_finite() && radius > 1.0 && log_radius.is_finite() {
+    render_continuous_iteration_from_log64(iter, radius.ln())
+}
+
+fn render_continuous_iteration_from_log64(iter: u32, log_radius: f64) -> (f64, f64) {
+    let raw_fraction = if log_radius.is_finite() && log_radius > 0.0 {
         -((log_radius / RENDER_FIELDLINE_BAILOUT.ln())
             .max(f64::MIN_POSITIVE)
             .ln()
@@ -1967,22 +2116,35 @@ impl ScaledDerivative64 {
         result
     }
 
+    #[cfg(test)]
     fn step(&mut self, z: Complex64) {
         if !self.valid || !complex_is_finite64(z) {
             self.valid = false;
             return;
         }
-        let additive = if self.log_scale == 0.0 {
-            1.0
-        } else if self.log_scale < 745.0 {
-            (-self.log_scale).exp()
-        } else {
-            0.0
-        };
+        self.step_finite(z);
+    }
+
+    fn step_finite(&mut self, z: Complex64) {
+        if !self.valid {
+            return;
+        }
+        // Once the derivative has been rescaled, the transformed +1 term is
+        // at most 1e-120 and cannot affect a normalized finite f64 derivative.
+        let additive = if self.log_scale == 0.0 { 1.0 } else { 0.0 };
         self.value = Complex64 {
             re: 2.0 * (z.re * self.value.re - z.im * self.value.im) + additive,
             im: 2.0 * (z.re * self.value.im + z.im * self.value.re),
         };
+        let re_norm = self.value.re.abs();
+        let im_norm = self.value.im.abs();
+        if re_norm <= RENDER_DERIVATIVE_RESCALE_HIGH && im_norm <= RENDER_DERIVATIVE_RESCALE_HIGH {
+            return;
+        }
+        if !re_norm.is_finite() || !im_norm.is_finite() {
+            self.valid = false;
+            return;
+        }
         self.renormalize();
     }
 
@@ -2003,8 +2165,9 @@ impl ScaledDerivative64 {
         if !self.valid {
             return None;
         }
-        let magnitude = self.value.re.hypot(self.value.im);
-        (magnitude.is_finite() && magnitude > 0.0).then_some(magnitude.ln() + self.log_scale)
+        let magnitude_squared = self.value.re * self.value.re + self.value.im * self.value.im;
+        (magnitude_squared.is_finite() && magnitude_squared > 0.0)
+            .then_some(0.5 * magnitude_squared.ln() + self.log_scale)
     }
 }
 
@@ -2027,20 +2190,27 @@ impl OrbitHistory64 {
     }
 
     fn push(&mut self, sample: OrbitSample64) {
+        self.samples[self.next] = sample;
+        self.next += 1;
+        if self.next == RENDER_FIELDLINE_HISTORY {
+            self.next = 0;
+        }
+        self.len = (self.len + 1).min(RENDER_FIELDLINE_HISTORY);
+    }
+
+    fn push_unique(&mut self, sample: OrbitSample64) {
         if self.len > 0 {
-            let last = if self.len < RENDER_FIELDLINE_HISTORY {
-                self.len - 1
+            let last = if self.next == 0 {
+                RENDER_FIELDLINE_HISTORY - 1
             } else {
-                (self.next + RENDER_FIELDLINE_HISTORY - 1) % RENDER_FIELDLINE_HISTORY
+                self.next - 1
             };
             if self.samples[last].iter == sample.iter {
                 self.samples[last] = sample;
                 return;
             }
         }
-        self.samples[self.next] = sample;
-        self.next = (self.next + 1) % RENDER_FIELDLINE_HISTORY;
-        self.len = (self.len + 1).min(RENDER_FIELDLINE_HISTORY);
+        self.push(sample);
     }
 
     fn get(&self, index: usize) -> Option<OrbitSample64> {
@@ -2052,7 +2222,14 @@ impl OrbitHistory64 {
         } else {
             0
         };
-        Some(self.samples[(start + index) % RENDER_FIELDLINE_HISTORY])
+        let slot = start + index;
+        Some(
+            self.samples[if slot >= RENDER_FIELDLINE_HISTORY {
+                slot - RENDER_FIELDLINE_HISTORY
+            } else {
+                slot
+            }],
+        )
     }
 }
 
@@ -2090,41 +2267,45 @@ fn render_bandlimited_orbit_sine64(
     pixel_span: f64,
     log_pixel_span: f64,
 ) -> Option<f64> {
-    let z_abs = sample.z.re.hypot(sample.z.im);
-    let derivative_abs = sample.derivative.value.re.hypot(sample.derivative.value.im);
+    let z_abs_squared = sample.z.re * sample.z.re + sample.z.im * sample.z.im;
+    let derivative_abs_squared = sample.derivative.value.re * sample.derivative.value.re
+        + sample.derivative.value.im * sample.derivative.value.im;
     if !sample.derivative.valid
-        || !z_abs.is_finite()
-        || z_abs <= 0.0
-        || !derivative_abs.is_finite()
-        || derivative_abs <= 0.0
+        || !z_abs_squared.is_finite()
+        || z_abs_squared <= 0.0
+        || !derivative_abs_squared.is_finite()
+        || derivative_abs_squared <= 0.0
     {
         return None;
     }
-    let direct_gradient = derivative_abs * pixel_span / z_abs;
-    let gradient = if sample.derivative.log_scale == 0.0 && direct_gradient.is_finite() {
-        direct_gradient.min(1e6)
+    let cross = sample.derivative.value.im * sample.z.re - sample.derivative.value.re * sample.z.im;
+    let dot = sample.derivative.value.re * sample.z.re + sample.derivative.value.im * sample.z.im;
+    let direct_gradient_squared = derivative_abs_squared * pixel_span * pixel_span / z_abs_squared;
+    let (gx, gy) = if sample.derivative.log_scale == 0.0 && direct_gradient_squared.is_finite() {
+        let mut component_scale = pixel_span / z_abs_squared;
+        if direct_gradient_squared > 1e12 {
+            component_scale *= 1e6 / direct_gradient_squared.sqrt();
+        }
+        (component_scale * cross, component_scale * dot)
     } else {
         let log_gradient =
-            derivative_abs.ln() + sample.derivative.log_scale + log_pixel_span - z_abs.ln();
+            0.5 * derivative_abs_squared.ln() + sample.derivative.log_scale + log_pixel_span
+                - 0.5 * z_abs_squared.ln();
         if !log_gradient.is_finite() {
             return None;
         }
-        log_gradient.min(13.815_510_557_964_274).exp()
+        let gradient = log_gradient.min(13.815_510_557_964_274).exp();
+        let direction_denominator = (derivative_abs_squared * z_abs_squared).sqrt();
+        if !direction_denominator.is_finite() || direction_denominator <= f64::MIN_POSITIVE {
+            return None;
+        }
+        (
+            gradient * cross / direction_denominator,
+            gradient * dot / direction_denominator,
+        )
     };
-    let direction_denominator = derivative_abs * z_abs;
-    if !direction_denominator.is_finite() || direction_denominator <= f64::MIN_POSITIVE {
-        return None;
-    }
-    let direction_sin = (sample.derivative.value.im * sample.z.re
-        - sample.derivative.value.re * sample.z.im)
-        / direction_denominator;
-    let direction_cos = (sample.derivative.value.re * sample.z.re
-        + sample.derivative.value.im * sample.z.im)
-        / direction_denominator;
-    let gx = gradient * direction_sin;
-    let gy = gradient * direction_cos;
     let attenuation = render_pixel_sinc64(gx) * render_pixel_sinc64(gy);
-    Some((sample.z.im / z_abs) * attenuation)
+    Some((sample.z.im / z_abs_squared.sqrt()) * attenuation)
 }
 
 fn render_pixel_sinc64(phase_delta: f64) -> f64 {
@@ -2144,17 +2325,25 @@ fn render_pixel_sinc64(phase_delta: f64) -> f64 {
     (0.5 * x).sin() / (0.5 * x)
 }
 
+#[cfg(test)]
 fn render_distance_pixels64(
     z: Complex64,
     derivative: ScaledDerivative64,
     pixel_span: f64,
 ) -> Option<f64> {
-    let radius = z.re.hypot(z.im);
-    let log_radius = radius.ln();
-    let log_distance = std::f64::consts::LN_2 + radius.ln() + log_radius.ln()
+    let radius_squared = z.re * z.re + z.im * z.im;
+    render_distance_pixels_from_log64(0.5 * radius_squared.ln(), derivative, pixel_span)
+}
+
+fn render_distance_pixels_from_log64(
+    log_radius: f64,
+    derivative: ScaledDerivative64,
+    pixel_span: f64,
+) -> Option<f64> {
+    let log_distance = std::f64::consts::LN_2 + log_radius + log_radius.ln()
         - derivative.log_abs()?
         - pixel_span.abs().ln();
-    if !log_distance.is_finite() || radius <= 1.0 || log_radius <= 0.0 {
+    if !log_distance.is_finite() || log_radius <= 0.0 {
         return None;
     }
     Some(if log_distance > 27.631_021_115_928_547 {
@@ -2166,9 +2355,99 @@ fn render_distance_pixels64(
     })
 }
 
+fn build_series_coefficient_cache64(
+    orbit_re: &[f64],
+    orbit_im: &[f64],
+    degree: usize,
+    max_skip: usize,
+) -> SeriesCoefficientCache64 {
+    let stride = degree + 1;
+    let available = max_skip
+        .min(orbit_re.len().saturating_sub(1))
+        .min(orbit_im.len().saturating_sub(1));
+    let mut coeff_re = vec![0.0; stride];
+    let mut coeff_im = vec![0.0; stride];
+    let mut current_re = vec![0.0; stride];
+    let mut current_im = vec![0.0; stride];
+    let mut next_re = vec![0.0; stride];
+    let mut next_im = vec![0.0; stride];
+    let mut steps = 0usize;
+
+    coeff_re.reserve(available * stride);
+    coeff_im.reserve(available * stride);
+    for n in 0..available {
+        let zr = orbit_re[n];
+        let zi = orbit_im[n];
+        if !zr.is_finite() || !zi.is_finite() {
+            break;
+        }
+        next_re.fill(0.0);
+        next_im.fill(0.0);
+        for k in 1..=degree {
+            let ar = current_re[k];
+            let ai = current_im[k];
+            next_re[k] += 2.0 * (zr * ar - zi * ai);
+            next_im[k] += 2.0 * (zr * ai + zi * ar);
+            if k == 1 {
+                next_re[k] += 1.0;
+            }
+            for j in 1..k {
+                let br = current_re[j];
+                let bi = current_im[j];
+                let cr = current_re[k - j];
+                let ci = current_im[k - j];
+                next_re[k] += br * cr - bi * ci;
+                next_im[k] += br * ci + bi * cr;
+            }
+        }
+        coeff_re.extend_from_slice(&next_re);
+        coeff_im.extend_from_slice(&next_im);
+        std::mem::swap(&mut current_re, &mut next_re);
+        std::mem::swap(&mut current_im, &mut next_im);
+        steps += 1;
+    }
+
+    SeriesCoefficientCache64 {
+        degree,
+        steps,
+        coeff_re,
+        coeff_im,
+    }
+}
+
+#[cfg(test)]
 fn build_series_plan64(
     orbit_re: &[f64],
     orbit_im: &[f64],
+    degree: usize,
+    max_skip: usize,
+    tile_radius: f64,
+    pixel_span: f64,
+    probes: &[Complex64],
+) -> SeriesPlan64 {
+    let cache = build_series_coefficient_cache64(
+        orbit_re,
+        orbit_im,
+        degree.min(RENDER_SERIES_CACHE_DEGREE),
+        max_skip,
+    );
+    build_series_plan_from_cache64(
+        orbit_re,
+        orbit_im,
+        &cache,
+        degree,
+        max_skip,
+        tile_radius,
+        pixel_span,
+        probes,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_series_plan_from_cache64(
+    orbit_re: &[f64],
+    orbit_im: &[f64],
+    cache: &SeriesCoefficientCache64,
     degree: usize,
     max_skip: usize,
     tile_radius: f64,
@@ -2180,6 +2459,7 @@ fn build_series_plan64(
         let mut best = build_series_plan_for_degree64(
             orbit_re,
             orbit_im,
+            cache,
             2,
             max_skip,
             tile_radius,
@@ -2196,6 +2476,7 @@ fn build_series_plan64(
             let candidate = build_series_plan_for_degree64(
                 orbit_re,
                 orbit_im,
+                cache,
                 candidate_degree,
                 max_skip,
                 tile_radius,
@@ -2216,6 +2497,7 @@ fn build_series_plan64(
     build_series_plan_for_degree64(
         orbit_re,
         orbit_im,
+        cache,
         normalized_degree,
         max_skip,
         tile_radius,
@@ -2240,6 +2522,7 @@ fn is_series_skip_saturated64(
 fn build_series_plan_for_degree64(
     orbit_re: &[f64],
     orbit_im: &[f64],
+    cache: &SeriesCoefficientCache64,
     normalized_degree: usize,
     max_skip: usize,
     tile_radius: f64,
@@ -2248,8 +2531,9 @@ fn build_series_plan_for_degree64(
 ) -> SeriesPlan64 {
     let mut coeff_re = vec![0.0; normalized_degree + 1];
     let mut coeff_im = vec![0.0; normalized_degree + 1];
-    let mut tail = Vec::with_capacity(RENDER_FIELDLINE_HISTORY);
+    let mut tail = Vec::new();
     if normalized_degree < 2
+        || normalized_degree > cache.degree
         || max_skip == 0
         || !tile_radius.is_finite()
         || tile_radius <= 0.0
@@ -2269,8 +2553,6 @@ fn build_series_plan_for_degree64(
         };
     }
 
-    let mut next_re = vec![0.0; normalized_degree + 1];
-    let mut next_im = vec![0.0; normalized_degree + 1];
     let mut probe_re = vec![0.0; probes.len()];
     let mut probe_im = vec![0.0; probes.len()];
     let mut next_probe_re = vec![0.0; probes.len()];
@@ -2279,41 +2561,22 @@ fn build_series_plan_for_degree64(
     let mut error_bound = 0.0f64;
     let error_limit = pixel_span.abs() * RENDER_SERIES_PIXEL_ERROR_SCALE;
 
-    for n in 0..max_skip.min(orbit_re.len() - 1) {
-        next_re.fill(0.0);
-        next_im.fill(0.0);
-        let zr = orbit_re[n];
-        let zi = orbit_im[n];
-        if !zr.is_finite() || !zi.is_finite() {
+    let available = max_skip
+        .min(cache.steps)
+        .min(orbit_re.len().saturating_sub(1))
+        .min(orbit_im.len().saturating_sub(1));
+    for n in 0..available {
+        let Some((next_re, next_im)) = cache.coefficients(n + 1, normalized_degree) else {
             break;
-        }
-
-        for k in 1..=normalized_degree {
-            let ar = coeff_re[k];
-            let ai = coeff_im[k];
-            next_re[k] += 2.0 * (zr * ar - zi * ai);
-            next_im[k] += 2.0 * (zr * ai + zi * ar);
-            if k == 1 {
-                next_re[k] += 1.0;
-            }
-            for j in 1..k {
-                let br = coeff_re[j];
-                let bi = coeff_im[j];
-                let cr = coeff_re[k - j];
-                let ci = coeff_im[k - j];
-                next_re[k] += br * cr - bi * ci;
-                next_im[k] += br * ci + bi * cr;
-            }
-        }
-
+        };
         let Some(probe_error) = probes_validate_series_step64(
             probes,
             &probe_re,
             &probe_im,
             &mut next_probe_re,
             &mut next_probe_im,
-            &next_re,
-            &next_im,
+            next_re,
+            next_im,
             orbit_re,
             orbit_im,
             n,
@@ -2321,8 +2584,7 @@ fn build_series_plan_for_degree64(
         ) else {
             break;
         };
-        let derivative_lower_bound =
-            series_derivative_lower_bound64(&next_re, &next_im, tile_radius);
+        let derivative_lower_bound = series_derivative_lower_bound64(next_re, next_im, tile_radius);
         if derivative_lower_bound <= 0.0 {
             break;
         }
@@ -2332,20 +2594,30 @@ fn build_series_plan_for_degree64(
         if !next_error_bound.is_finite() || next_error_bound > error_limit {
             break;
         }
-        coeff_re.copy_from_slice(&next_re);
-        coeff_im.copy_from_slice(&next_im);
         probe_re.copy_from_slice(&next_probe_re);
         probe_im.copy_from_slice(&next_probe_im);
         error_bound = next_error_bound;
         skip = n + 1;
-        if tail.len() == RENDER_FIELDLINE_HISTORY {
-            tail.remove(0);
+    }
+
+    if let Some((final_re, final_im)) = cache.coefficients(skip, normalized_degree) {
+        coeff_re.copy_from_slice(final_re);
+        coeff_im.copy_from_slice(final_im);
+    }
+    if skip > 0 {
+        let first_tail_step = skip.saturating_sub(RENDER_FIELDLINE_HISTORY - 1).max(1);
+        tail.reserve(skip - first_tail_step + 1);
+        for step in first_tail_step..=skip {
+            let Some((snapshot_re, snapshot_im)) = cache.coefficients(step, normalized_degree)
+            else {
+                break;
+            };
+            tail.push(SeriesSnapshot64 {
+                iter: step,
+                coeff_re: snapshot_re.to_vec(),
+                coeff_im: snapshot_im.to_vec(),
+            });
         }
-        tail.push(SeriesSnapshot64 {
-            iter: skip,
-            coeff_re: coeff_re.clone(),
-            coeff_im: coeff_im.clone(),
-        });
     }
 
     SeriesPlan64 {
@@ -3038,13 +3310,31 @@ mod tests {
 
     #[test]
     fn finite_large_delta_is_an_escape_not_a_numeric_failure() {
-        let result = perturb64(1e150, 0.0, &[0.0, 0.0], &[0.0, 0.0], 8, 1.0, &no_series());
+        let result = perturb64(
+            1e150,
+            0.0,
+            &[0.0, 0.0],
+            &[0.0, 0.0],
+            1,
+            8,
+            1.0,
+            &no_series(),
+        );
         assert!(result.iter < 8);
     }
 
     #[test]
     fn carries_on_after_a_short_reference_orbit() {
-        let result = perturb64(-1.0, 0.0, &[0.0, 1.0], &[0.0, 0.0], 32, 1.0, &no_series());
+        let result = perturb64(
+            -1.0,
+            0.0,
+            &[0.0, 1.0],
+            &[0.0, 0.0],
+            1,
+            32,
+            1.0,
+            &no_series(),
+        );
         assert_eq!(result.iter, 32);
         assert!(result.rebase_count > 0);
     }
@@ -3225,6 +3515,119 @@ mod tests {
         assert!((-1.0..=1.0).contains(&value));
     }
 
+    fn reference_bandlimited_orbit_sine64(sample: OrbitSample64, pixel_span: f64) -> Option<f64> {
+        let z_abs = sample.z.re.hypot(sample.z.im);
+        let derivative_abs = sample.derivative.value.re.hypot(sample.derivative.value.im);
+        if !sample.derivative.valid
+            || !z_abs.is_finite()
+            || z_abs <= 0.0
+            || !derivative_abs.is_finite()
+            || derivative_abs <= 0.0
+        {
+            return None;
+        }
+        let direct_gradient = derivative_abs * pixel_span / z_abs;
+        let gradient = if sample.derivative.log_scale == 0.0 && direct_gradient.is_finite() {
+            direct_gradient.min(1e6)
+        } else {
+            (derivative_abs.ln() + sample.derivative.log_scale + pixel_span.ln() - z_abs.ln())
+                .min(13.815_510_557_964_274)
+                .exp()
+        };
+        let direction_denominator = derivative_abs * z_abs;
+        let direction_sin = (sample.derivative.value.im * sample.z.re
+            - sample.derivative.value.re * sample.z.im)
+            / direction_denominator;
+        let direction_cos = (sample.derivative.value.re * sample.z.re
+            + sample.derivative.value.im * sample.z.im)
+            / direction_denominator;
+        Some(
+            (sample.z.im / z_abs)
+                * render_pixel_sinc64(gradient * direction_sin)
+                * render_pixel_sinc64(gradient * direction_cos),
+        )
+    }
+
+    #[test]
+    fn optimized_fieldline_sample_matches_reference_formula() {
+        let cases = [
+            (
+                OrbitSample64 {
+                    iter: 1,
+                    z: Complex64 { re: 12.0, im: -7.0 },
+                    derivative: ScaledDerivative64::from_complex(Complex64 { re: 31.0, im: 17.0 }),
+                },
+                1e-3,
+            ),
+            (
+                OrbitSample64 {
+                    iter: 2,
+                    z: Complex64 {
+                        re: -820.0,
+                        im: 125.0,
+                    },
+                    derivative: ScaledDerivative64 {
+                        value: Complex64 {
+                            re: 1e80,
+                            im: -3e79,
+                        },
+                        log_scale: RENDER_DERIVATIVE_LOG_RESCALE,
+                        valid: true,
+                    },
+                },
+                1e-100,
+            ),
+        ];
+        for (sample, pixel_span) in cases {
+            let expected = reference_bandlimited_orbit_sine64(sample, pixel_span).unwrap();
+            let actual =
+                render_bandlimited_orbit_sine64(sample, pixel_span, pixel_span.ln()).unwrap();
+            assert!((actual - expected).abs() <= 1e-12 * expected.abs().max(1.0));
+        }
+    }
+
+    #[test]
+    fn series_history_is_evaluated_only_when_an_escape_needs_it() {
+        let orbit_re = vec![0.0; 129];
+        let orbit_im = vec![0.0; 129];
+        let c = Complex64 {
+            re: 1e-6,
+            im: -2e-7,
+        };
+        let plan = build_series_plan64(&orbit_re, &orbit_im, 12, 128, 2e-6, 1e-10, &[c]);
+        assert!(plan.skip >= RENDER_FIELDLINE_HISTORY);
+        let mut scalar_history = OrbitHistory64::new();
+        scalar_history.push(OrbitSample64 {
+            iter: plan.skip as u32,
+            z: evaluate_series64(&plan, c.re, c.im),
+            derivative: ScaledDerivative64::from_complex(evaluate_series_derivative64(
+                &plan, c.re, c.im,
+            )),
+        });
+        let history =
+            complete_series_history64(scalar_history, &plan, c.re, c.im, &orbit_re, &orbit_im);
+        assert_eq!(history.len, RENDER_FIELDLINE_HISTORY);
+        assert_eq!(
+            history.get(RENDER_FIELDLINE_HISTORY - 1).unwrap().iter,
+            plan.skip as u32
+        );
+    }
+
+    #[test]
+    fn strict_parameter_blocks_certify_only_enclosed_components() {
+        for (screen_x, screen_y) in [(1216.5, 448.5), (704.5, 448.5)] {
+            let c = periodic_target_parameter(screen_x, screen_y);
+            assert!(certify_parameter_block64(c, 1e-15, 1e-14, 5000));
+            assert!(!certify_parameter_block64(c, 1e-15, 1e-3, 5000));
+        }
+        assert!(!certify_parameter_block64(
+            periodic_target_parameter(956.0, 474.0),
+            1e-15,
+            1e-14,
+            5000,
+        ));
+    }
+
     #[test]
     fn series_tail_and_derivative_match_direct_recurrence() {
         let orbit_re = vec![0.0; 129];
@@ -3327,8 +3730,8 @@ mod tests {
 
         let orbit_re = vec![0.0; 65];
         let orbit_im = vec![0.0; 65];
-        let first = perturb64(0.5, 0.1, &orbit_re, &orbit_im, 64, 1e-3, &no_series());
-        let second = perturb64(0.5, 0.1, &orbit_re, &orbit_im, 64, 1e-3, &no_series());
+        let first = perturb64(0.5, 0.1, &orbit_re, &orbit_im, 64, 64, 1e-3, &no_series());
+        let second = perturb64(0.5, 0.1, &orbit_re, &orbit_im, 64, 64, 1e-3, &no_series());
         assert_eq!(first.iter, second.iter);
         assert_eq!(first.rebase_count, second.rebase_count);
         assert_eq!(first.phase.to_bits(), second.phase.to_bits());

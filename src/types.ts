@@ -46,13 +46,28 @@ export interface RenderTileMessage {
   reference: ReferenceSnapshot;
 }
 
+export interface PrepareReferenceMessage {
+  type: "prepareReference";
+  reference: ReferenceSnapshot;
+}
+
+export interface WarmupMessage {
+  type: "warmup";
+}
+
 export interface TileStats {
   elapsedMs: number;
   escapedPixels: number;
   periodicInteriorCount: number;
   capHitUnknownCount: number;
   rebaseCount: number;
+  scalarIterations: number;
   seriesSkip: number;
+  certifiedInteriorCount: number;
+  seriesBuildMs: number;
+  blockCertMs: number;
+  pixelLoopMs: number;
+  postProcessMs: number;
   paletteFootprintCount: number;
   paletteFootprintFallbackCount: number;
   paletteFilteredCount: number;
@@ -72,5 +87,5 @@ export interface TileDoneMessage {
   stats: TileStats;
 }
 
-export type TileWorkerInMessage = RenderTileMessage;
+export type TileWorkerInMessage = RenderTileMessage | PrepareReferenceMessage | WarmupMessage;
 export type TileWorkerOutMessage = TileDoneMessage;

@@ -1,5 +1,10 @@
-import { computeReferenceWasm, renderPerturbationTileWasm } from "./wasmPerturbation";
-import type { RenderTileMessage, TileWorkerOutMessage } from "../types";
+import {
+  computeReferenceWasm,
+  prepareReferenceWasm,
+  renderPerturbationTileWasm,
+  warmupWasm
+} from "./wasmPerturbation";
+import type { TileWorkerInMessage, TileWorkerOutMessage } from "../types";
 
 interface ComputeReferenceMessage {
   type: "computeReference";
@@ -11,7 +16,18 @@ interface ComputeReferenceMessage {
   minPrecisionBits: number;
 }
 
-self.onmessage = (event: MessageEvent<RenderTileMessage | ComputeReferenceMessage>) => {
+self.onmessage = (event: MessageEvent<TileWorkerInMessage | ComputeReferenceMessage>) => {
+  if (event.data.type === "warmup") {
+    void warmupWasm().then(() => self.postMessage({ type: "warmupDone" }));
+    return;
+  }
+  if (event.data.type === "prepareReference") {
+    const revision = event.data.reference.revision;
+    void prepareReferenceWasm(event.data.reference).then(() => {
+      self.postMessage({ type: "referencePrepared", revision });
+    });
+    return;
+  }
   if (event.data.type === "computeReference") {
     const request = event.data;
     void computeReferenceWasm(request).then((reference) => {
