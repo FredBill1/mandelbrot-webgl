@@ -14,6 +14,7 @@
     "prebench:regressions": "npm run build",
     "bench:regressions": "node scripts/bench-regressions.mjs",
     "visual:capture": "node scripts/visual-regression.mjs capture",
+    "visual:capture:nyquist": "node scripts/visual-regression.mjs capture-nyquist",
     "visual:compare": "node scripts/visual-regression.mjs compare",
     "preview": "vite preview --host 127.0.0.1",
     "pretest": "npm run build:wasm",
