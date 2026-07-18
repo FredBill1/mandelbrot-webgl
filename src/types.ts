@@ -43,6 +43,7 @@ export interface RenderTileMessage {
   tile: TileDescriptor;
   pixelSpan: number;
   maxIter: number;
+  eagerDerivative: boolean;
   reference: ReferenceSnapshot;
 }
 
@@ -51,8 +52,27 @@ export interface PrepareReferenceMessage {
   reference: ReferenceSnapshot;
 }
 
+export interface PrepareTilesMessage {
+  type: "prepareTiles";
+  requestId: number;
+  revision: number;
+  rects: Rect[];
+  pixelSpan: number;
+  maxIter: number;
+  reference: ReferenceSnapshot;
+}
+
+export interface TilesPreparedMessage {
+  type: "tilesPrepared";
+  requestId: number;
+  revision: number;
+  derivativeEagerScores: Float64Array;
+  seriesSkips: Float64Array;
+}
+
 export interface WarmupMessage {
   type: "warmup";
+  module: WebAssembly.Module;
 }
 
 export interface TileStats {
@@ -62,6 +82,10 @@ export interface TileStats {
   capHitUnknownCount: number;
   rebaseCount: number;
   scalarIterations: number;
+  simdDualLaneSteps: number;
+  simdSingleLaneSteps: number;
+  simdActiveLaneIterations: number;
+  simdLaneUtilization: number;
   seriesSkip: number;
   certifiedInteriorCount: number;
   seriesBuildMs: number;
@@ -87,5 +111,10 @@ export interface TileDoneMessage {
   stats: TileStats;
 }
 
-export type TileWorkerInMessage = RenderTileMessage | PrepareReferenceMessage | WarmupMessage;
-export type TileWorkerOutMessage = TileDoneMessage;
+export interface WorkerErrorMessage {
+  type: "workerError";
+  message: string;
+}
+
+export type TileWorkerInMessage = RenderTileMessage | PrepareTilesMessage | PrepareReferenceMessage | WarmupMessage;
+export type TileWorkerOutMessage = TileDoneMessage | TilesPreparedMessage | WorkerErrorMessage;

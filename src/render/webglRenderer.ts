@@ -161,6 +161,7 @@ export class WebglTileRenderer {
   }
 
   render(flush = false): void {
+    const renderStartedAt = performance.now();
     const gl = this.gl;
     gl.viewport(0, 0, this.canvas.width, this.canvas.height);
     gl.clearColor(0.006, 0.009, 0.014, 1);
@@ -179,6 +180,14 @@ export class WebglTileRenderer {
       .sort((a, b) => tileArea(b) - tileArea(a));
     for (const tile of retained) this.drawTile(tile, this.retainedTransforms.get(tile.revision) ?? identityTransform());
     for (const tile of active) this.drawTile(tile, identityTransform());
+    recordDeepBench({
+      type: "frameRendered",
+      revision: this.activeRevision,
+      retainedCount: retained.length,
+      activeCount: active.length,
+      renderedAt: performance.now(),
+      renderMs: performance.now() - renderStartedAt
+    });
     if (flush && retained.length > 0) {
       const retainedFrame = {
         revision: this.activeRevision,

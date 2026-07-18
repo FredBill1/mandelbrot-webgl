@@ -8,7 +8,9 @@ export default defineConfig({
   },
   use: {
     baseURL: "http://127.0.0.1:4173",
-    trace: "retain-on-failure"
+    // Tracing instruments every Worker message and materially distorts the
+    // two-second CPU benchmark. Keep it opt-in for diagnostic reruns.
+    trace: process.env.PLAYWRIGHT_TRACE === "1" ? "retain-on-failure" : "off"
   },
   webServer: {
     command: "npm run preview -- --strictPort",

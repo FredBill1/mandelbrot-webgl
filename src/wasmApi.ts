@@ -1,10 +1,19 @@
 import init, { apply_view_transform } from "./wasm/pkg/mandelbrot_wasm";
+import wasmUrl from "./wasm/pkg/mandelbrot_wasm_bg.wasm?url";
 import type { ViewState } from "./types";
 
 let wasmReady: Promise<void> | undefined;
+let wasmModuleReady: Promise<WebAssembly.Module> | undefined;
 
-export async function initWasm(): Promise<void> {
-  wasmReady ??= init().then(() => undefined);
+export function compileWasmModule(): Promise<WebAssembly.Module> {
+  wasmModuleReady ??= WebAssembly.compileStreaming(fetch(wasmUrl));
+  return wasmModuleReady;
+}
+
+export async function initWasm(module?: WebAssembly.Module): Promise<void> {
+  wasmReady ??= (module === undefined ? compileWasmModule() : Promise.resolve(module))
+    .then((compiled) => init({ module_or_path: compiled }))
+    .then(() => undefined);
   await wasmReady;
 }
 

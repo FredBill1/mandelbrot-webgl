@@ -27,10 +27,10 @@ try {
   });
   await page.addInitScript(installWorkerProbe);
   const targetUrl = options.url === undefined ? url : new URL(options.url, url).toString();
+  const started = Date.now();
   await page.goto(targetUrl, { waitUntil: "domcontentloaded" });
   if (options.url === undefined) await page.click("#deepButton");
 
-  const started = Date.now();
   let hud = await readHud(page);
   let maxHudTotalTiles = 0;
   let maxHudCompletedTiles = 0;
@@ -40,7 +40,7 @@ try {
     maxHudCompletedTiles = Math.max(maxHudCompletedTiles, hudTiles.completed);
     maxHudTotalTiles = Math.max(maxHudTotalTiles, hudTiles.total);
     if (hud.status === "stable") break;
-    await page.waitForTimeout(500);
+    await page.waitForTimeout(25);
   }
 
   const elapsedMs = Date.now() - started;
@@ -53,7 +53,7 @@ try {
       maxHudCompletedTiles = Math.max(maxHudCompletedTiles, hudTiles.completed);
       maxHudTotalTiles = Math.max(maxHudTotalTiles, hudTiles.total);
       if (hud.status === "stable") break;
-      await page.waitForTimeout(500);
+      await page.waitForTimeout(25);
     }
   }
   const bench = await page.evaluate(() => globalThis.__deepBench);
@@ -73,6 +73,8 @@ try {
       finalWallMs: average(bench.sums.finalWallMs, bench.counts.final),
       finalQueueMs: average(bench.sums.finalQueueMs, bench.counts.finalStarted),
       finalUploadMs: average(bench.sums.finalUploadMs, bench.counts.finalUploaded),
+      tilePreparationMs: bench.scheduler.tilePreparationMs,
+      frameRenderMs: average(bench.sums.frameRenderMs, bench.samples.frameRenderMs.length),
       referenceWallMs: average(bench.sums.referenceWallMs, bench.counts.referenceDone),
       seriesBuildMs: average(bench.waves.totalSeriesBuildMs, bench.counts.final),
       blockCertMs: average(bench.waves.totalBlockCertMs, bench.counts.final),
@@ -83,8 +85,10 @@ try {
       finalWorkerMs: percentiles(bench.samples.finalWorkerMs),
       finalWallMs: percentiles(bench.samples.finalWallMs),
       finalQueueMs: percentiles(bench.samples.finalQueueMs),
-      finalUploadMs: percentiles(bench.samples.finalUploadMs)
+      finalUploadMs: percentiles(bench.samples.finalUploadMs),
+      frameRenderMs: percentiles(bench.samples.frameRenderMs)
     },
+    scheduler: bench.scheduler,
     waves: bench.waves,
     interactive,
     slowFinalTiles: bench.slowFinalTiles,
@@ -330,13 +334,21 @@ function installWorkerProbe() {
       finalWallMs: 0,
       finalQueueMs: 0,
       finalUploadMs: 0,
-      referenceWallMs: 0
+      referenceWallMs: 0,
+      frameRenderMs: 0
     },
     samples: {
       finalWorkerMs: [],
       finalWallMs: [],
       finalQueueMs: [],
-      finalUploadMs: []
+      finalUploadMs: [],
+      frameRenderMs: []
+    },
+    scheduler: {
+      tilePreparationMs: 0,
+      plannedTiles: 0,
+      tileSizes: {},
+      atlasCount: 0
     },
     waves: {
       completedFinals: 0,
@@ -352,6 +364,9 @@ function installWorkerProbe() {
       escapedPixels: 0,
       capHitUnknownCount: 0,
       scalarIterations: 0,
+      simdDualLaneSteps: 0,
+      simdSingleLaneSteps: 0,
+      simdActiveLaneIterations: 0,
       certifiedInteriorCount: 0,
       totalSeriesBuildMs: 0,
       totalBlockCertMs: 0,
@@ -372,6 +387,18 @@ function installWorkerProbe() {
     const now = performance.now();
     const normalized = { ...event, now };
     bench.profile.events.push(normalized);
+    if (event?.type === "tilesPrepared") {
+      bench.scheduler.tilePreparationMs += event.elapsedMs ?? 0;
+    } else if (event?.type === "tilePlanCreated") {
+      bench.scheduler.plannedTiles = event.tileCount ?? 0;
+      bench.scheduler.tileSizes = event.sizes ?? {};
+    } else if (event?.type === "revisionAtlasCreated") {
+      bench.scheduler.atlasCount += 1;
+    } else if (event?.type === "frameRendered") {
+      const renderMs = event.renderMs ?? 0;
+      bench.sums.frameRenderMs += renderMs;
+      bench.samples.frameRenderMs.push(renderMs);
+    }
     if (event?.tileId) {
       const tile = tileProfile(event.tileId);
       tile.events ??= [];
@@ -457,6 +484,9 @@ function installWorkerProbe() {
         bench.waves.escapedPixels += data.stats.escapedPixels ?? 0;
         bench.waves.capHitUnknownCount += data.stats.capHitUnknownCount ?? 0;
         bench.waves.scalarIterations += data.stats.scalarIterations ?? 0;
+        bench.waves.simdDualLaneSteps += data.stats.simdDualLaneSteps ?? 0;
+        bench.waves.simdSingleLaneSteps += data.stats.simdSingleLaneSteps ?? 0;
+        bench.waves.simdActiveLaneIterations += data.stats.simdActiveLaneIterations ?? 0;
         bench.waves.certifiedInteriorCount += data.stats.certifiedInteriorCount ?? 0;
         bench.waves.totalSeriesBuildMs += data.stats.seriesBuildMs ?? 0;
         bench.waves.totalBlockCertMs += data.stats.blockCertMs ?? 0;

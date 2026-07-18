@@ -1,4 +1,5 @@
 import { expect, test } from "@playwright/test";
+import { TILE_SIZE } from "../../src/types";
 
 const REGRESSION_VIEWS = [
   {
@@ -129,11 +130,54 @@ const UNSAFE_ACCELERATION_TILE_REGRESSIONS = [
   }
 ] as const;
 
-test.beforeAll(async ({ browser }) => {
-  const page = await browser.newPage({ viewport: { width: 320, height: 240 } });
+test("stops before constructing workers when WebAssembly SIMD is unavailable", async ({ page }) => {
+  await page.addInitScript(() => {
+    const NativeWorker = window.Worker;
+    let workerConstructionCount = 0;
+    class CountingWorker extends NativeWorker {
+      constructor(scriptURL: string | URL, options?: WorkerOptions) {
+        workerConstructionCount += 1;
+        super(scriptURL, options);
+      }
+    }
+    Object.defineProperty(window, "Worker", { configurable: true, value: CountingWorker });
+    Object.defineProperty(window, "__workerConstructionCount", {
+      configurable: true,
+      get: () => workerConstructionCount
+    });
+    Object.defineProperty(WebAssembly, "validate", { configurable: true, value: () => false });
+  });
+
   await page.goto("/");
-  await page.waitForTimeout(300);
-  await page.close();
+  await expect(page.locator("#readStatus")).toHaveText("unsupported: WebAssembly SIMD is required");
+  expect(await page.evaluate(() => (window as typeof window & { __workerConstructionCount: number }).__workerConstructionCount)).toBe(0);
+});
+
+test("publishes stable only after the frame containing the final tile is rendered", async ({ page }) => {
+  await page.addInitScript(() => {
+    const events: Array<Record<string, unknown>> = [];
+    (globalThis as unknown as {
+      __timingEvents: Array<Record<string, unknown>>;
+      __deepBenchRecord: (event: Record<string, unknown>) => void;
+    }).__timingEvents = events;
+    (globalThis as unknown as { __deepBenchRecord: (event: Record<string, unknown>) => void }).__deepBenchRecord =
+      (event) => events.push(event);
+  });
+  await page.setViewportSize({ width: 320, height: 240 });
+  await page.goto("/");
+  await expect(page.locator("#readStatus")).toHaveText("stable", { timeout: 15_000 });
+
+  const timing = await page.evaluate(() => {
+    const events = (globalThis as unknown as { __timingEvents: Array<Record<string, unknown>> }).__timingEvents;
+    const uploads = events.filter((event) => event.type === "tileUploadDone");
+    const lastUpload = Math.max(...uploads.map((event) => Number(event.uploadDoneAt)));
+    const frame = events.find((event) => event.type === "frameRendered" && Number(event.renderedAt) >= lastUpload);
+    const stable = events.find((event) => event.type === "hudStatusPublished" && event.status === "stable");
+    return { uploadCount: uploads.length, lastUpload, frameAt: Number(frame?.renderedAt), stableAt: Number(stable?.publishedAt) };
+  });
+  expect(timing.uploadCount).toBeGreaterThan(0);
+  expect(timing.frameAt).toBeGreaterThanOrEqual(timing.lastUpload);
+  expect(timing.stableAt).toBeGreaterThanOrEqual(timing.frameAt);
 });
 
 test("renders, pans, zooms, and restores URL state", async ({ page }) => {
@@ -613,10 +657,11 @@ test("keeps reported minibrot geometry stable under 2 seconds across tile bounda
 
     const tileCounts = await readTileCounts(page);
     expect(tileCounts.completed).toBe(tileCounts.total);
+    expect(tileCounts.total).toBe(120);
     const probe = await readInteractionWorkerProbe(page);
     expect(probe.referenceRequests).toBe(1);
 
-    const seam = await readTileSeamDiscontinuity(page, 128);
+    const seam = await readTileSeamDiscontinuity(page, TILE_SIZE);
     expect(seam.excessRatio).toBeLessThan(0.04);
   }
 });
@@ -637,7 +682,7 @@ test("keeps palette filtering localized and stable on the reported views", async
     expect(tileCounts.completed).toBe(tileCounts.total);
 
     const speckleRatio = await readCanvasSpeckleRatio(page, roi, { includeLumaOutliers: true });
-    const seam = await readTileSeamDiscontinuity(page, 128);
+    const seam = await readTileSeamDiscontinuity(page, TILE_SIZE);
     expect(speckleRatio, `${name} speckle ratio`).toBeLessThanOrEqual(0.08);
     if (name === "palette-footprint") {
       expect(seam.excessRatio, `${name} tile seam excess ratio`).toBeLessThan(0.025);
@@ -660,7 +705,7 @@ test("does not draw dark horizontal tile-edge bands on the reported view", async
   const tileCounts = await readTileCounts(page);
   expect(tileCounts.completed).toBe(tileCounts.total);
 
-  const seam = await readHorizontalDarkSeamScore(page, 128);
+  const seam = await readHorizontalDarkSeamScore(page, TILE_SIZE);
   await page.screenshot({ path: "test-results/tile-edge-bandlimit.png", fullPage: false });
   expect(seam.maxExcessDarkDropRatio).toBeLessThanOrEqual(0.03);
 });
@@ -682,7 +727,7 @@ test("renders the seven Fractalshades fieldline views without seams or pepper no
     expect(await page.locator("#readStatus").textContent(), `${name} status`).not.toContain("error");
     expect(await readTransparentPixelCount(page), `${name} transparent pixels`).toBe(0);
 
-    const seam = await readTileSeamDiscontinuity(page, 128);
+    const seam = await readTileSeamDiscontinuity(page, TILE_SIZE);
     const speckleRatio = await readCanvasSpeckleRatio(page, {
       left: 0,
       top: 0,
@@ -704,12 +749,17 @@ test("stabilizes the reported interior-heavy views under 2 seconds", async ({ pa
   for (const url of REPORTED_INTERIOR_PERFORMANCE_VIEWS) {
     const started = Date.now();
     await page.goto(url);
-    await expect.poll(() => page.locator("#readStatus").textContent(), { timeout: 2_000, intervals: [25] }).toBe("stable");
+    await expect.poll(() => page.locator("#readStatus").textContent(), {
+      message: `view did not stabilize in time: ${url}`,
+      timeout: 2_000,
+      intervals: [25]
+    }).toBe("stable");
     const stableMs = Date.now() - started;
     expect(stableMs).toBeLessThan(2_000);
 
     const tileCounts = await readTileCounts(page);
     expect(tileCounts.completed).toBe(tileCounts.total);
+    expect(tileCounts.total).toBe(120);
     const probe = await readInteractionWorkerProbe(page);
     for (const [x, y] of [
       [0.25, 0.25],
@@ -735,6 +785,7 @@ test("stabilizes the reported e100 deep view under 2 seconds", async ({ page }) 
 
   const tileCounts = await readTileCounts(page);
   expect(tileCounts.completed).toBe(tileCounts.total);
+  expect(tileCounts.total).toBe(120);
   const probe = await readInteractionWorkerProbe(page);
   expect(probe.referenceRequests).toBe(1);
   for (const [x, y] of [
@@ -748,7 +799,7 @@ test("stabilizes the reported e100 deep view under 2 seconds", async ({ page }) 
 
   const roi = { left: 520, top: 40, right: 1420, bottom: 760 };
   const speckleRatio = await readCanvasSpeckleRatio(page, roi);
-  const seam = await readTileSeamDiscontinuity(page, 128);
+  const seam = await readTileSeamDiscontinuity(page, TILE_SIZE);
   expect(speckleRatio).toBeLessThanOrEqual(0.10);
   expect(seam.excessRatio).toBeLessThan(0.04);
 
@@ -776,7 +827,8 @@ test("stabilizes the iter=5000 periodic-interior view under 2 seconds", async ({
   expect(stableMs).toBeLessThan(2_000);
 
   const tileCounts = await readTileCounts(page);
-  expect(tileCounts).toEqual({ completed: 120, total: 120 });
+  expect(tileCounts.completed).toBe(tileCounts.total);
+  expect(tileCounts.total).toBe(120);
   const probe = await readInteractionWorkerProbe(page);
   expect(probe.referenceRequests).toBe(1);
   for (const [x, y] of [
@@ -802,6 +854,7 @@ test("stabilizes the alternate reported e100 deep view under 2 seconds", async (
 
   const tileCounts = await readTileCounts(page);
   expect(tileCounts.completed).toBe(tileCounts.total);
+  expect(tileCounts.total).toBe(120);
   const probe = await readInteractionWorkerProbe(page);
   for (const [x, y] of [
     [0.25, 0.25],
@@ -826,6 +879,7 @@ test("stabilizes the reported former reference-pressure view under 2 seconds", a
 
   const tileCounts = await readTileCounts(page);
   expect(tileCounts.completed).toBe(tileCounts.total);
+  expect(tileCounts.total).toBe(120);
   const probe = await readInteractionWorkerProbe(page);
   expect(probe.referenceRequests).toBe(1);
 });

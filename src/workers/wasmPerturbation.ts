@@ -2,12 +2,13 @@ import init, {
   compute_reference,
   estimate_max_iter_bounded_radius,
   estimate_precision_bits,
+  prepare_tiles,
   render_tile,
   reset_render_cache,
   set_render_reference
 } from "../wasm/pkg/mandelbrot_wasm";
 import type { RawReferenceResult } from "../scheduler/workerPool";
-import type { ReferenceSnapshot, RenderTileMessage, TileDoneMessage } from "../types";
+import type { PrepareTilesMessage, ReferenceSnapshot, RenderTileMessage, TilesPreparedMessage, TileDoneMessage } from "../types";
 
 let ready: Promise<void> | undefined;
 let residentRevision = -1;
@@ -36,8 +37,8 @@ export async function computeReferenceWasm(input: {
   };
 }
 
-export async function warmupWasm(): Promise<void> {
-  await initRenderWasm();
+export async function warmupWasm(module?: WebAssembly.Module): Promise<void> {
+  await initRenderWasm(module);
 }
 
 export async function prepareReferenceWasm(reference: ReferenceSnapshot): Promise<void> {
@@ -58,10 +59,37 @@ export async function renderPerturbationTileWasm(message: RenderTileMessage): Pr
     message.tile.rect.y,
     message.tile.rect.width,
     message.tile.rect.height,
+    message.tile.rect.x,
+    message.tile.rect.y,
+    message.tile.rect.width,
+    message.tile.rect.height,
     message.pixelSpan,
-    message.maxIter
+    message.maxIter,
+    message.eagerDerivative
   ) as TileDoneMessage;
   return { ...raw, rgba: normalizeRgbaBuffer(raw.rgba) };
+}
+
+export async function prepareTilesWasm(message: PrepareTilesMessage): Promise<TilesPreparedMessage> {
+  await initRenderWasm();
+  syncRevision(message.revision);
+  if (message.reference.orbitRe.length > 0) putReference(message.reference);
+  if (!hasResidentReference) throw new Error("tile worker has no resident view reference");
+  const rects = new Float64Array(message.rects.length * 4);
+  for (let index = 0; index < message.rects.length; index += 1) {
+    const rect = message.rects[index];
+    rects.set([rect.x, rect.y, rect.width, rect.height], index * 4);
+  }
+  const preparation = prepare_tiles(rects, message.pixelSpan, message.maxIter);
+  const count = message.rects.length;
+  if (preparation.length !== count * 2) throw new Error("WASM tile preparation returned an invalid result");
+  return {
+    type: "tilesPrepared",
+    requestId: message.requestId,
+    revision: message.revision,
+    derivativeEagerScores: preparation.slice(0, count),
+    seriesSkips: preparation.slice(count)
+  };
 }
 
 export function resetWasmPerturbationCacheForTests(): void {
@@ -69,8 +97,8 @@ export function resetWasmPerturbationCacheForTests(): void {
   hasResidentReference = false;
 }
 
-async function initRenderWasm(): Promise<void> {
-  ready ??= init().then(() => undefined);
+async function initRenderWasm(module?: WebAssembly.Module): Promise<void> {
+  ready ??= init(module === undefined ? undefined : { module_or_path: module }).then(() => undefined);
   await ready;
 }
 

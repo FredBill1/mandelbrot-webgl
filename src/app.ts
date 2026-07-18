@@ -1,6 +1,6 @@
 import { WebglTileRenderer, type RetainedScreenTransform } from "./render/webglRenderer";
 import { TileWorkerPool } from "./scheduler/workerPool";
-import { createVisibleTiles } from "./tiles/tilePlanner";
+import { planVisibleTiles } from "./tiles/tilePlanner";
 import {
   DEEP_TEST_VIEW,
   DEFAULT_VIEW,
@@ -22,12 +22,12 @@ import {
   type IterFormula,
   type IterSettings
 } from "./math/view";
-import { initWasm, transformViewNow } from "./wasmApi";
+import { compileWasmModule, initWasm, transformViewNow } from "./wasmApi";
+import { supportsWasmSimd, WASM_SIMD_REQUIRED_MESSAGE } from "./wasmSimd";
 import {
-  TILE_SIZE,
-  type ReferenceSnapshot,
   type RuntimeView,
   type TileDescriptor,
+  type TileDoneMessage,
   type ViewState
 } from "./types";
 
@@ -41,6 +41,8 @@ interface Stats {
 
 interface TileWorkState {
   tile: TileDescriptor;
+  priority: number;
+  eagerDerivative: boolean;
   inFlight: boolean;
   completed: boolean;
 }
@@ -62,8 +64,6 @@ interface ActivateViewOptions {
   scheduleWork?: boolean;
 }
 
-const TILE_SCHEDULE_BATCH_MS = 6;
-const TILE_SCHEDULE_MIN_BATCH = 2;
 const ITER_CONTROL_DEBOUNCE_MS = 120;
 const WHEEL_RENDER_DEBOUNCE_MS = 80;
 const ALT_DEEP_TEST_VIEW: Pick<ViewState, "re" | "im" | "scale"> = {
@@ -142,13 +142,34 @@ export async function startApp(root: HTMLElement): Promise<void> {
     </main>
   `;
 
+  if (!supportsWasmSimd()) {
+    const status = requireElement(root, "#readStatus", HTMLElement);
+    status.textContent = WASM_SIMD_REQUIRED_MESSAGE;
+    return;
+  }
+
+  // Worker module loading can overlap the single production WASM compile. The
+  // SIMD validation above still runs first, so unsupported browsers construct
+  // no workers at all.
+  const pool = new TileWorkerPool();
+
   const canvas = requireElement(root, "#fractal", HTMLCanvasElement);
   const uiDock = requireElement(root, "#uiDock", HTMLElement);
   const uiRail = requireElement(root, "#uiRail", HTMLElement);
   const uiToggle = requireElement(root, "#uiToggle", HTMLButtonElement);
   let uiHidden = false;
 
-  const mainWasmReady = initWasm();
+  let wasmModule: WebAssembly.Module;
+  try {
+    wasmModule = await compileWasmModule();
+    pool.warmup(wasmModule);
+  } catch (error) {
+    pool.dispose(error instanceof Error ? error : new Error(String(error)));
+    const status = requireElement(root, "#readStatus", HTMLElement);
+    status.textContent = error instanceof Error ? error.message : String(error);
+    return;
+  }
+  const mainWasmReady = initWasm(wasmModule);
 
   const parsedView = parseViewStateFromUrl();
   let view: ViewState = parsedView.view;
@@ -166,15 +187,12 @@ export async function startApp(root: HTMLElement): Promise<void> {
     completedTiles: 0,
     status: "initializing"
   };
+  let lastPublishedStatus = "";
 
   const renderer = new WebglTileRenderer(canvas);
-  const pool = new TileWorkerPool();
   const pendingTileIds = new Set<string>();
   const tileStates = new Map<string, TileWorkState>();
-  let pendingTilesToSchedule = 0;
-  let activeViewReference: ReferenceSnapshot | undefined;
 
-  await mainWasmReady;
   let runtime = currentRuntimeView();
   resize();
   renderer.setActiveRevision(runtime.revision);
@@ -183,6 +201,10 @@ export async function startApp(root: HTMLElement): Promise<void> {
   syncIterControls();
   syncUiVisibility();
   scheduleTiles("initial", renderToken);
+
+  // The main-thread WASM instance only serves interactive view transforms.
+  // Let the workers start the initial render while that instance initializes.
+  await mainWasmReady;
 
   uiToggle.addEventListener("click", () => {
     uiHidden = !uiHidden;
@@ -325,75 +347,74 @@ export async function startApp(root: HTMLElement): Promise<void> {
     stats.completedTiles = 0;
     pendingTileIds.clear();
     tileStates.clear();
-    pendingTilesToSchedule = 0;
-    activeViewReference = undefined;
   }
 
   function scheduleTiles(reason: string, token: number): void {
     const localRuntime = currentRuntimeView();
     stats.status = `rendering ${reason}`;
     resetRenderWorkState();
-    const tiles = prioritizeTiles(createVisibleTiles(localRuntime, TILE_SIZE), localRuntime);
-    pendingTilesToSchedule = tiles.length;
-    stats.pending = pendingWorkCount();
-    stats.status = `computing reference for ${tiles.length} tiles`;
-    void pool.computeViewReference(localRuntime).then((reference) => {
+    const planned = planVisibleTiles(localRuntime);
+    stats.status = `computing reference for ${planned.length} tiles`;
+    void pool.computeViewReference(localRuntime).then(async (reference) => {
       if (token !== renderToken || localRuntime.revision !== revision) return;
-      activeViewReference = reference;
-      scheduleTileBatch(localRuntime, tiles, 0, token);
+      stats.status = `preparing ${planned.length} tiles`;
+      const pixelSpan = pixelSpanForView(localRuntime, localRuntime.width);
+      const preparation = await pool.prepareTiles(
+        reference,
+        planned.map(({ tile }) => tile.rect),
+        pixelSpan,
+        localRuntime.maxIter
+      );
+      if (token !== renderToken || localRuntime.revision !== revision) return;
+      const states = planned.map(({ tile }, priority) => {
+        const derivativeEagerScore = preparation.derivativeEagerScores[priority] ?? 0;
+        const state: TileWorkState = {
+          tile,
+          priority,
+          eagerDerivative: derivativeEagerScore >= 0.5,
+          inFlight: true,
+          completed: false
+        };
+        tileStates.set(tile.id, state);
+        pendingTileIds.add(tile.id);
+        return state;
+      });
+      stats.pending = pendingWorkCount();
+      stats.status = `rendering ${states.length} tiles`;
+      recordDeepBench({
+        type: "tilePlanCreated",
+        revision: localRuntime.revision,
+        tileCount: states.length,
+        eagerDerivativeCount: states.reduce((count, state) => count + Number(state.eagerDerivative), 0),
+        derivativeEagerCounts: Object.fromEntries([0.5, 0.6, 0.7, 0.8, 0.9].map((threshold) => [
+          threshold.toFixed(1),
+          preparation.derivativeEagerScores.reduce((count, score) => count + Number(score >= threshold), 0)
+        ])),
+        sizes: Object.fromEntries(states.map((state) => `${state.tile.rect.width}x${state.tile.rect.height}`).reduce((counts, size) => {
+          counts.set(size, (counts.get(size) ?? 0) + 1);
+          return counts;
+        }, new Map<string, number>()))
+      });
+      const promises = pool.renderBatch(states.map((state) => ({
+        priority: state.priority,
+        message: {
+          type: "renderTile" as const,
+          tile: state.tile,
+          pixelSpan,
+          maxIter: localRuntime.maxIter,
+          eagerDerivative: state.eagerDerivative,
+          reference
+        }
+      })));
+      for (let index = 0; index < states.length; index += 1) void completeTile(states[index], promises[index]);
     }).catch((error) => {
       if (token === renderToken) stats.status = error instanceof Error ? error.message : String(error);
     });
   }
 
-  function prioritizeTiles(tiles: TileDescriptor[], localRuntime: RuntimeView): TileDescriptor[] {
-    const centerX = localRuntime.width * 0.5;
-    const centerY = localRuntime.height * 0.5;
-    return [...tiles].sort((a, b) => {
-      const da = Math.hypot(a.rect.x + a.rect.width * 0.5 - centerX, a.rect.y + a.rect.height * 0.5 - centerY);
-      const db = Math.hypot(b.rect.x + b.rect.width * 0.5 - centerX, b.rect.y + b.rect.height * 0.5 - centerY);
-      return da - db;
-    });
-  }
-
-  function scheduleTileBatch(localRuntime: RuntimeView, tiles: TileDescriptor[], startIndex: number, token: number): void {
-    if (token !== renderToken || localRuntime.revision !== revision || !activeViewReference) return;
-    const deadline = performance.now() + TILE_SCHEDULE_BATCH_MS;
-    let index = startIndex;
-    let processed = 0;
-    while (index < tiles.length && (processed < TILE_SCHEDULE_MIN_BATCH || performance.now() < deadline)) {
-      const tile = tiles[index];
-      const state: TileWorkState = { tile, inFlight: false, completed: false };
-      tileStates.set(tile.id, state);
-      pendingTileIds.add(tile.id);
-      pendingTilesToSchedule = Math.max(0, tiles.length - index - 1);
-      void submitTile(localRuntime, state, activeViewReference);
-      index += 1;
-      processed += 1;
-    }
-    stats.pending = pendingWorkCount();
-    updateWorkStatus("rendering");
-    if (index < tiles.length) window.setTimeout(() => scheduleTileBatch(localRuntime, tiles, index, token), 0);
-  }
-
-  async function submitTile(localRuntime: RuntimeView, state: TileWorkState, reference: ReferenceSnapshot): Promise<void> {
-    if (localRuntime.maxIter !== view.maxIter || localRuntime.revision !== revision) localRuntime = currentRuntimeView();
-    if (state.inFlight || state.completed || state.tile.revision !== revision) return;
-    state.inFlight = true;
-    const centerX = state.tile.rect.x + state.tile.rect.width * 0.5;
-    const centerY = state.tile.rect.y + state.tile.rect.height * 0.5;
-    const priority = Math.hypot(centerX - localRuntime.width * 0.5, centerY - localRuntime.height * 0.5);
+  async function completeTile(state: TileWorkState, promise: Promise<TileDoneMessage>): Promise<void> {
     try {
-      const result = await pool.render(
-        {
-          type: "renderTile",
-          tile: state.tile,
-          pixelSpan: pixelSpanForView(localRuntime, localRuntime.width),
-          maxIter: localRuntime.maxIter,
-          reference
-        },
-        priority
-      );
+      const result = await promise;
       state.inFlight = false;
       if (result.revision !== revision || state.completed || state.tile.revision !== revision) return;
       stats.activeWorkers = pool.active;
@@ -411,7 +432,7 @@ export async function startApp(root: HTMLElement): Promise<void> {
   }
 
   function hasOutstandingWork(): boolean {
-    if (pendingTilesToSchedule > 0 || pendingTileIds.size > 0 || pool.pending > 0 || pool.active > 0) return true;
+    if (pendingTileIds.size > 0 || pool.pending > 0 || pool.active > 0) return true;
     for (const state of tileStates.values()) {
       if (state.inFlight) return true;
     }
@@ -430,7 +451,7 @@ export async function startApp(root: HTMLElement): Promise<void> {
   }
 
   function pendingWorkCount(): number {
-    return pendingTileIds.size + pendingTilesToSchedule;
+    return pendingTileIds.size;
   }
 
   function resize(): void {
@@ -646,6 +667,10 @@ export async function startApp(root: HTMLElement): Promise<void> {
     setText("readTiles", `${stats.completedTiles}/${stats.completedTiles + stats.pending}`);
     setText("readFps", stats.fps.toFixed(0));
     setText("readStatus", stats.status);
+    if (lastPublishedStatus !== stats.status) {
+      lastPublishedStatus = stats.status;
+      recordDeepBench({ type: "hudStatusPublished", status: stats.status, revision, publishedAt: performance.now() });
+    }
   }
 
   function setText(id: string, value: string): void {
@@ -658,5 +683,9 @@ function requireElement<T extends Element>(root: ParentNode, selector: string, c
   const element = root.querySelector(selector);
   if (!(element instanceof constructor)) throw new Error(`Missing ${selector}`);
   return element;
+}
+
+function recordDeepBench(event: Record<string, unknown>): void {
+  (globalThis as unknown as { __deepBenchRecord?: (event: Record<string, unknown>) => void }).__deepBenchRecord?.(event);
 }
 

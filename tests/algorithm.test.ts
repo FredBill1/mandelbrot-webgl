@@ -8,6 +8,7 @@ import init, {
 } from "../src/wasm/pkg/mandelbrot_wasm";
 import {
   computeReferenceWasm,
+  prepareTilesWasm,
   renderPerturbationTileWasm,
   resetWasmPerturbationCacheForTests
 } from "../src/workers/wasmPerturbation";
@@ -63,6 +64,66 @@ describe("single perturbation path", () => {
     expect(first.stats.escapedPixels + first.stats.capHitUnknownCount + first.stats.periodicInteriorCount).toBe(32 * 24);
     expect(first.stats.rebaseCount).toBeGreaterThan(0);
     expect(first.stats.seriesSkip).toBeGreaterThanOrEqual(0);
+    expect(first.stats.simdDualLaneSteps + first.stats.simdSingleLaneSteps).toBeGreaterThan(0);
+    expect(first.stats.simdActiveLaneIterations).toBeGreaterThan(0);
+    expect(first.stats.simdLaneUtilization).toBeGreaterThan(0);
+    expect(first.stats.simdLaneUtilization).toBeLessThanOrEqual(1);
+  });
+
+  it("keeps eager and delayed derivative rendering byte-identical", async () => {
+    const message = await makeMessage({
+      re: "-7.5e-1",
+      im: "1e-1",
+      scale: "1",
+      maxIter: 1200,
+      width: 32,
+      height: 24,
+      revision: 21
+    });
+    const delayed = await renderPerturbationTileWasm(message);
+    const eager = await renderPerturbationTileWasm({
+      ...message,
+      eagerDerivative: true,
+      reference: { ...message.reference, orbitRe: new Float64Array(), orbitIm: new Float64Array() }
+    });
+
+    expect(new Uint8Array(eager.rgba)).toEqual(new Uint8Array(delayed.rgba));
+    expect(eager.stats.escapedPixels).toBe(delayed.stats.escapedPixels);
+    expect(eager.stats.periodicInteriorCount).toBe(delayed.stats.periodicInteriorCount);
+    expect(eager.stats.capHitUnknownCount).toBe(delayed.stats.capHitUnknownCount);
+  });
+
+  it("returns deterministic SIMD tile preparation hints", async () => {
+    const message = await makeMessage({
+      re: "-7.5e-1",
+      im: "0",
+      scale: "1",
+      maxIter: 256,
+      width: 128,
+      height: 64,
+      revision: 8
+    });
+    const prepareMessage = {
+      type: "prepareTiles" as const,
+      requestId: 1,
+      revision: message.tile.revision,
+      rects: [
+        { x: 0, y: 0, width: 64, height: 64 },
+        { x: 64, y: 0, width: 64, height: 64 }
+      ],
+      pixelSpan: message.pixelSpan,
+      maxIter: message.maxIter,
+      reference: message.reference
+    };
+    const first = await prepareTilesWasm(prepareMessage);
+    const second = await prepareTilesWasm({
+      ...prepareMessage,
+      reference: { ...message.reference, orbitRe: new Float64Array(), orbitIm: new Float64Array() }
+    });
+    expect(Array.from(first.derivativeEagerScores)).toEqual(Array.from(second.derivativeEagerScores));
+    expect(Array.from(first.seriesSkips)).toEqual(Array.from(second.seriesSkips));
+    expect(Array.from(first.derivativeEagerScores).every((score) => score >= 0 && score <= 1)).toBe(true);
+    expect(Array.from(first.seriesSkips).every((skip) => Number.isFinite(skip) && skip >= 0)).toBe(true);
   });
 
   it("certifies target periodic interiors without changing their RGBA", async () => {
@@ -170,6 +231,7 @@ async function makeMessage(view: {
     },
     pixelSpan: 3.5 / (Number(view.scale) * view.width),
     maxIter: view.maxIter,
+    eagerDerivative: false,
     reference
   };
 }
