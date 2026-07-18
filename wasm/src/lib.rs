@@ -640,6 +640,7 @@ const RENDER_FIELDLINE_BACKSHIFT: usize = 14;
 const RENDER_FIELDLINE_HISTORY: usize = RENDER_FIELDLINE_BACKSHIFT + 1;
 const RENDER_FIELDLINE_ITERATIONS: usize = 10;
 const RENDER_FIELDLINE_INTENSITY: f64 = 0.25;
+const RENDER_FIELDLINE_CONTRAST_GAIN: f64 = 2.0;
 const RENDER_FIELDLINE_WEIGHTS: [f64; RENDER_FIELDLINE_ITERATIONS] = [
     0.11152039795440076,
     0.10878938741684663,
@@ -4003,6 +4004,7 @@ fn finish_escaped_pixel_with_log64(
         log_pixel_span,
     )
     .unwrap_or(0.0);
+    let fieldline = enhance_render_fieldline_contrast64(base_phase, fieldline);
     let phase = base_phase + RENDER_FIELDLINE_INTENSITY * fieldline;
     let distance_pixels = render_distance_pixels_from_log64(log_radius, derivative, log_pixel_span)
         .unwrap_or(f64::NAN);
@@ -4274,6 +4276,81 @@ fn render_fieldline_from_sines64(
                 + h3 * orbit_sines[index + 3]);
     }
     fieldline.is_finite().then_some(fieldline.clamp(-1.0, 1.0))
+}
+
+#[inline(always)]
+fn shape_render_fieldline_contrast64(fieldline: f64) -> f64 {
+    if !fieldline.is_finite() {
+        return 0.0;
+    }
+    let fieldline = fieldline.clamp(-1.0, 1.0);
+    RENDER_FIELDLINE_CONTRAST_GAIN * fieldline
+        / (1.0 + (RENDER_FIELDLINE_CONTRAST_GAIN - 1.0) * fieldline.abs())
+}
+
+#[inline(always)]
+fn enhance_render_fieldline_contrast64(base_phase: f64, fieldline: f64) -> f64 {
+    let fieldline = if fieldline.is_finite() {
+        fieldline.clamp(-1.0, 1.0)
+    } else {
+        0.0
+    };
+    let enhanced = shape_render_fieldline_contrast64(fieldline);
+    let extra_cycle =
+        (RENDER_FIELDLINE_INTENSITY * RENDER_CLASSIC_PHASE_TO_CYCLE * (enhanced - fieldline)).abs();
+    if extra_cycle <= f64::EPSILON || !base_phase.is_finite() {
+        return enhanced;
+    }
+
+    let base_cycle = render_phase_cycle_position(base_phase).rem_euclid(1.0);
+    let base_t = if base_cycle <= 0.5 {
+        base_cycle * 2.0
+    } else {
+        (1.0 - base_cycle) * 2.0
+    };
+    // Near the white-to-gold part of the classic palette, keep extra phase
+    // displacement only when it moves the Fieldline away from white. This
+    // preserves the original gold coverage without weakening dark blue views.
+    let white_protection = if base_t < RENDER_CLASSIC_X[2] {
+        smoothstep(
+            (RENDER_CLASSIC_X[1] + RENDER_CLASSIC_X[2]) * 0.5,
+            RENDER_CLASSIC_X[2],
+            base_t,
+        )
+    } else {
+        1.0 - smoothstep(
+            RENDER_CLASSIC_X[3],
+            (RENDER_CLASSIC_X[3] + RENDER_CLASSIC_X[4]) * 0.5,
+            base_t,
+        )
+    };
+    if white_protection <= 0.0 {
+        return enhanced;
+    }
+
+    let raw_cycle = (base_cycle
+        + RENDER_FIELDLINE_INTENSITY * RENDER_CLASSIC_PHASE_TO_CYCLE * fieldline)
+        .rem_euclid(1.0);
+    let enhanced_cycle = (base_cycle
+        + RENDER_FIELDLINE_INTENSITY * RENDER_CLASSIC_PHASE_TO_CYCLE * enhanced)
+        .rem_euclid(1.0);
+    let raw_white_distance = render_classic_white_cycle_distance64(raw_cycle);
+    let enhanced_white_distance = render_classic_white_cycle_distance64(enhanced_cycle);
+    let toward_white =
+        ((raw_white_distance - enhanced_white_distance) / extra_cycle).clamp(0.0, 1.0);
+    enhanced + (fieldline - enhanced) * white_protection * toward_white
+}
+
+#[inline(always)]
+fn render_classic_white_cycle_distance64(cycle: f64) -> f64 {
+    let cycle = cycle.rem_euclid(1.0);
+    [RENDER_CLASSIC_X[2] * 0.5, 1.0 - RENDER_CLASSIC_X[2] * 0.5]
+        .into_iter()
+        .map(|white| {
+            let distance = (cycle - white).abs();
+            distance.min(1.0 - distance)
+        })
+        .fold(f64::INFINITY, f64::min)
 }
 
 #[cfg(target_arch = "wasm32")]
@@ -5712,6 +5789,73 @@ mod tests {
         let value = render_fieldline64(&history, 0.3, 1e-12, 1e-12f64.ln()).unwrap();
         assert!((value - 0.784_884_924_620_446_8).abs() < 1e-11);
         assert!((-1.0..=1.0).contains(&value));
+    }
+
+    #[test]
+    fn fieldline_contrast_curve_is_bounded_odd_and_monotonic() {
+        assert_eq!(shape_render_fieldline_contrast64(f64::NAN), 0.0);
+        assert_eq!(shape_render_fieldline_contrast64(0.0), 0.0);
+        assert_eq!(shape_render_fieldline_contrast64(1.0), 1.0);
+        assert_eq!(shape_render_fieldline_contrast64(-1.0), -1.0);
+        assert_eq!(shape_render_fieldline_contrast64(2.0), 1.0);
+        assert_eq!(shape_render_fieldline_contrast64(-2.0), -1.0);
+
+        let samples = [-1.0, -0.75, -0.5, -0.25, 0.0, 0.25, 0.5, 0.75, 1.0];
+        let mut previous = f64::NEG_INFINITY;
+        for fieldline in samples {
+            let enhanced = shape_render_fieldline_contrast64(fieldline);
+            assert!((-1.0..=1.0).contains(&enhanced));
+            assert!(enhanced >= previous);
+            assert!((enhanced + shape_render_fieldline_contrast64(-fieldline)).abs() < 1e-12);
+            previous = enhanced;
+        }
+
+        assert!((shape_render_fieldline_contrast64(0.25) - 0.4).abs() < 1e-12);
+        assert!((shape_render_fieldline_contrast64(0.5) - 2.0 / 3.0).abs() < 1e-12);
+    }
+
+    #[test]
+    fn fieldline_contrast_moves_bright_palette_regions_away_from_white() {
+        let phase_for_cycle =
+            |cycle: f64| cycle / RENDER_CLASSIC_PHASE_TO_CYCLE + RENDER_CLASSIC_PHASE_SHIFT;
+        let gold_phase = phase_for_cycle(RENDER_CLASSIC_X[3] * 0.5);
+        let white_phase = phase_for_cycle(RENDER_CLASSIC_X[2] * 0.5);
+        let blue_phase = phase_for_cycle(RENDER_CLASSIC_X[1] * 0.5);
+        let raw = 0.5;
+        let shaped = shape_render_fieldline_contrast64(raw);
+
+        assert!((enhance_render_fieldline_contrast64(gold_phase, -raw) + raw).abs() < 1e-12);
+        assert!((enhance_render_fieldline_contrast64(gold_phase, raw) - shaped).abs() < 1e-12);
+        assert!((enhance_render_fieldline_contrast64(white_phase, raw) - shaped).abs() < 1e-12);
+        assert!((enhance_render_fieldline_contrast64(white_phase, -raw) + shaped).abs() < 1e-12);
+        assert!((enhance_render_fieldline_contrast64(blue_phase, raw) - shaped).abs() < 1e-12);
+
+        for phase in [gold_phase, white_phase, blue_phase] {
+            assert_eq!(enhance_render_fieldline_contrast64(phase, 0.0), 0.0);
+            assert_eq!(enhance_render_fieldline_contrast64(phase, 1.0), 1.0);
+            assert_eq!(enhance_render_fieldline_contrast64(phase, -1.0), -1.0);
+            for fieldline in [-0.9, -0.5, -0.1, 0.1, 0.5, 0.9] {
+                assert!(
+                    (-1.0..=1.0).contains(&enhance_render_fieldline_contrast64(phase, fieldline))
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn fieldline_white_protection_fades_continuously_at_palette_boundaries() {
+        let phase_for_t =
+            |t: f64| (t * 0.5) / RENDER_CLASSIC_PHASE_TO_CYCLE + RENDER_CLASSIC_PHASE_SHIFT;
+        for boundary in [
+            (RENDER_CLASSIC_X[1] + RENDER_CLASSIC_X[2]) * 0.5,
+            RENDER_CLASSIC_X[2],
+            RENDER_CLASSIC_X[3],
+            (RENDER_CLASSIC_X[3] + RENDER_CLASSIC_X[4]) * 0.5,
+        ] {
+            let before = enhance_render_fieldline_contrast64(phase_for_t(boundary - 1e-8), -0.5);
+            let after = enhance_render_fieldline_contrast64(phase_for_t(boundary + 1e-8), -0.5);
+            assert!((before - after).abs() < 1e-6);
+        }
     }
 
     fn reference_bandlimited_orbit_sine64(sample: OrbitSample64, pixel_span: f64) -> Option<f64> {

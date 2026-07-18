@@ -59,6 +59,10 @@ const GRAY_EDGE_REGRESSION_URL =
   "/?re=-1.27943732849845421883617983015056333056548550645104382141825159351044164938397038329347978e0&im=-5.63147855791696141231505724508040262456380326148232169076294081643376175182702037659590245e-2&scale=2.31557868453953676955259871388625631367299552317831244832768609325162487992078455893055703e4&iter=1500";
 const PALETTE_FOOTPRINT_REGRESSION_URL =
   "/?re=-6.66946223594351220414061702075025073882181567152192831986002310059523004175864072078497634e-1&im=-4.73676488536724904191861481769138940645914771730222045140362508393748458135121359473063677e-1&scale=7.74784629252607411431486981341523433374510907407907698525079151524254606022906253914814138e1";
+const BRIGHT_FIELDLINE_CONTRAST_URL =
+  "/?re=3.65507337176578885294026060094803596771753851886465789116904636035328412227022685302373151064451179094515431467238368411509651774e-1&im=5.92476366173214971781468865486627113155901675162131546210951676054743401782782494892476964551347706530382782424590053437009752788e-1&scale=4.23364510013388081972378287333510313825748479033841476600173578111021294744920383704781554353193160781522705542092500275770455794e64&iter=10000";
+const DARK_FIELDLINE_CONTRAST_URL =
+  "/?re=-9.959092464185054883225506132210230552190949057119571362942630457064490430604163231474625569798368531e-1&im=-2.920507103490551290150186532760395758430668842892091005073382904491078494928285425130345226290424115e-1&scale=4.303900674935801695984501351181982889546308733797690837956726229236583503365453241437207169030817557e35&iter=10000";
 const TILE_EDGE_STRIPE_REGRESSION_URL =
   "/?re=-7.47058923830677172637465716958601050178238459796401120563138311051740403989739537513387692e-1&im=-9.02333390881196912445043591041816477037301725271975723099794599405573445075541691219218423e-2&scale=5.95653801318458424494811292043527003967000942264323805684287564004180700059580065965587753e6";
 const RETAINED_ZOOM_REGRESSION_URL =
@@ -715,6 +719,28 @@ test("keeps palette filtering localized and stable on the reported views", async
   }
 });
 
+test("keeps Fieldlines legible at bright and dark palette extrema", async ({ page }) => {
+  test.setTimeout(120_000);
+  await page.setViewportSize({ width: 1912, height: 948 });
+
+  for (const [name, url, minimumP95] of [
+    ["bright", BRIGHT_FIELDLINE_CONTRAST_URL, 48],
+    ["dark", DARK_FIELDLINE_CONTRAST_URL, 26]
+  ] as const) {
+    await page.goto(url);
+    await waitForNonBlankCanvas(page, 90_000);
+    expect(await readTileCounts(page)).toEqual({ completed: 120, total: 120 });
+
+    const contrast = await readCanvasPatternContrast(page, 4);
+    expect(contrast.p95, `${name} Fieldline local contrast`).toBeGreaterThanOrEqual(minimumP95);
+    if (name === "bright") {
+      const goldCoverage = await readCanvasGoldCoverage(page);
+      expect(goldCoverage, "bright Fieldline gold coverage").toBeGreaterThanOrEqual(0.06);
+    }
+    await page.screenshot({ path: `test-results/fieldline-contrast-${name}.png`, fullPage: false });
+  }
+});
+
 test("does not draw dark horizontal tile-edge bands on the reported view", async ({ page }) => {
   test.setTimeout(90_000);
   await page.setViewportSize({ width: 1912, height: 948 });
@@ -976,6 +1002,79 @@ async function readCanvasPixel(page: import("@playwright/test").Page, x: number,
     },
     { x, y }
   );
+}
+
+async function readCanvasPatternContrast(
+  page: import("@playwright/test").Page,
+  distance: number
+): Promise<{ p95: number }> {
+  return page.evaluate((sampleDistance) => {
+    const canvas = document.querySelector<HTMLCanvasElement>("#fractal");
+    const gl = canvas?.getContext("webgl2", { alpha: false, antialias: false, preserveDrawingBuffer: true });
+    if (!canvas || !gl) return { p95: 0 };
+
+    // Keep the desktop controls out of the sample while covering both smooth
+    // background regions and dense Fieldline detail throughout the viewport.
+    const width = Math.floor(canvas.width * 0.75);
+    const height = canvas.height;
+    const pixels = new Uint8Array(width * height * 4);
+    gl.readPixels(0, 0, width, height, gl.RGBA, gl.UNSIGNED_BYTE, pixels);
+    const deltas: number[] = [];
+    const offset = (x: number, y: number) => (y * width + x) * 4;
+    const colorDistance = (first: number, second: number) => {
+      const red = pixels[first] - pixels[second];
+      const green = pixels[first + 1] - pixels[second + 1];
+      const blue = pixels[first + 2] - pixels[second + 2];
+      return Math.sqrt(red * red + green * green + blue * blue);
+    };
+
+    for (let y = 0; y < height - sampleDistance; y += 2) {
+      for (let x = 0; x < width - sampleDistance; x += 2) {
+        const current = offset(x, y);
+        deltas.push(colorDistance(current, offset(x + sampleDistance, y)));
+        deltas.push(colorDistance(current, offset(x, y + sampleDistance)));
+      }
+    }
+    deltas.sort((left, right) => left - right);
+    return { p95: deltas[Math.floor((deltas.length - 1) * 0.95)] ?? 0 };
+  }, distance);
+}
+
+async function readCanvasGoldCoverage(page: import("@playwright/test").Page): Promise<number> {
+  return page.evaluate(() => {
+    const canvas = document.querySelector<HTMLCanvasElement>("#fractal");
+    const gl = canvas?.getContext("webgl2", { alpha: false, antialias: false, preserveDrawingBuffer: true });
+    if (!canvas || !gl) return 0;
+
+    const width = Math.floor(canvas.width * 0.75);
+    const height = canvas.height;
+    const pixels = new Uint8Array(width * height * 4);
+    gl.readPixels(0, 0, width, height, gl.RGBA, gl.UNSIGNED_BYTE, pixels);
+    let goldPixels = 0;
+    const pixelCount = width * height;
+    for (let index = 0; index < pixels.length; index += 4) {
+      const red = pixels[index] / 255;
+      const green = pixels[index + 1] / 255;
+      const blue = pixels[index + 2] / 255;
+      const value = Math.max(red, green, blue);
+      const minimum = Math.min(red, green, blue);
+      const delta = value - minimum;
+      const saturation = value > 0 ? delta / value : 0;
+      if (delta <= 0 || saturation < 0.2 || value < 0.35) continue;
+
+      let hue: number;
+      if (value === red) {
+        hue = ((green - blue) / delta) % 6;
+      } else if (value === green) {
+        hue = (blue - red) / delta + 2;
+      } else {
+        hue = (red - green) / delta + 4;
+      }
+      hue = ((hue / 6) + 1) % 1;
+      if (hue >= 0.07 && hue <= 0.18) goldPixels += 1;
+    }
+    return goldPixels / Math.max(1, pixelCount);
+  });
 }
 
 async function hasRetainedFrameAfter(page: import("@playwright/test").Page, started: number): Promise<boolean> {
