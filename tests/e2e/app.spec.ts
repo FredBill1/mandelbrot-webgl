@@ -54,6 +54,7 @@ const ANTI_ALIASING_PEPPER_REGRESSION_URL =
   "/?re=-7.47689723441669939527017253976715439192679851461831874268821803604290203278587516851291729e-1&im=-7.22121932539053588116373452229159661989232396616246710140552835347280711817029504503225198e-2&scale=1.47647815655772413738325308653033716994542630984542066793843052404878099060420525511068532e4&iter=779";
 const BANDLIMIT_REPORTED_URL =
   "/?re=-1.48458330140036247637711150173056275201800398126520184731392135110206459886484778357996466e0&im=-2.59388635255443261801021498780013338816140992922161747121570167509133203590861049947497997e-11&scale=5.36190464429385541522377455367357477832895987078444543478371941540670062366744215336045641e8&iter=7000";
+const EARLY_ESCAPE_COLORING_REGRESSION_URL = "/?re=-2&im=0&scale=200";
 const GRAY_EDGE_REGRESSION_URL =
   "/?re=-1.27943732849845421883617983015056333056548550645104382141825159351044164938397038329347978e0&im=-5.63147855791696141231505724508040262456380326148232169076294081643376175182702037659590245e-2&scale=2.31557868453953676955259871388625631367299552317831244832768609325162487992078455893055703e4&iter=1500";
 const PALETTE_FOOTPRINT_REGRESSION_URL =
@@ -641,6 +642,24 @@ test("bandlimits the reported deep boundary view and emits visual artifacts", as
     clip: { x: roi.left, y: roi.top, width: roi.right - roi.left, height: roi.bottom - roi.top }
   });
   expect(speckleRatio).toBeLessThanOrEqual(0.08);
+});
+
+test("keeps continuous coloring smooth across the early escape boundary at Re=-2", async ({ page }) => {
+  test.setTimeout(30_000);
+  await page.setViewportSize({ width: 1912, height: 948 });
+  await page.goto(EARLY_ESCAPE_COLORING_REGRESSION_URL);
+  await expect(page.locator("#readStatus")).toHaveText("stable", { timeout: 15_000 });
+
+  const tileCounts = await readTileCounts(page);
+  expect(tileCounts).toEqual({ completed: 120, total: 120 });
+
+  const discontinuity = await readCenterVerticalDiscontinuity(page);
+  await page.screenshot({ path: "test-results/early-escape-coloring-full.png", fullPage: false });
+  await page.screenshot({
+    path: "test-results/early-escape-coloring-center.png",
+    clip: { x: 756, y: 120, width: 400, height: 708 }
+  });
+  expect(discontinuity.anomalousRatio).toBeLessThanOrEqual(0.02);
 });
 
 test("keeps reported minibrot geometry stable under 2 seconds across tile boundaries and small view changes", async ({ page }) => {
@@ -1372,6 +1391,54 @@ async function readTileSeamDiscontinuity(
     const controlRatio = controlAnomalous / Math.max(1, controlCompared);
     return { anomalousRatio, controlRatio, excessRatio: Math.max(0, anomalousRatio - controlRatio), anomalous, compared };
   }, tileSize);
+}
+
+async function readCenterVerticalDiscontinuity(
+  page: import("@playwright/test").Page
+): Promise<{ anomalousRatio: number; anomalous: number; compared: number; maxDelta: number }> {
+  const screenshot = await page.locator("#fractal").screenshot({ type: "png" });
+  return page.evaluate(async (source) => {
+    const image = new Image();
+    image.src = source;
+    await image.decode();
+    const scratch = document.createElement("canvas");
+    scratch.width = image.naturalWidth;
+    scratch.height = image.naturalHeight;
+    const context = scratch.getContext("2d", { willReadFrequently: true });
+    if (!context) return { anomalousRatio: Number.POSITIVE_INFINITY, anomalous: 0, compared: 0, maxDelta: 0 };
+    context.drawImage(image, 0, 0);
+    const width = scratch.width;
+    const height = scratch.height;
+    const pixels = context.getImageData(0, 0, width, height).data;
+    const centerX = Math.floor(width * 0.5);
+    const offset = (x: number, screenY: number) => (screenY * width + x) * 4;
+    const delta = (leftX: number, screenY: number) => {
+      const left = offset(leftX, screenY);
+      const right = offset(leftX + 1, screenY);
+      return (
+        Math.abs(pixels[left] - pixels[right]) +
+        Math.abs(pixels[left + 1] - pixels[right + 1]) +
+        Math.abs(pixels[left + 2] - pixels[right + 2])
+      );
+    };
+
+    let anomalous = 0;
+    let compared = 0;
+    let maxDelta = 0;
+    for (let y = 1; y < height - 1; y += 1) {
+      // The real axis is a genuine high-contrast feature; the regression is the
+      // otherwise full-height vertical discontinuity through the view center.
+      if (Math.abs(y - height * 0.5) < 6) continue;
+      const seam = delta(centerX - 1, y);
+      const before = delta(centerX - 2, y);
+      const after = delta(centerX, y);
+      maxDelta = Math.max(maxDelta, seam);
+      compared += 1;
+      if (seam > 120 && seam > Math.max(before, after) * 2.5 + 30) anomalous += 1;
+    }
+
+    return { anomalousRatio: anomalous / Math.max(1, compared), anomalous, compared, maxDelta };
+  }, `data:image/png;base64,${screenshot.toString("base64")}`);
 }
 
 async function readCanvasSpeckleRatio(

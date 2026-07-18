@@ -654,7 +654,6 @@ const RENDER_FIELDLINE_WEIGHTS: [f64; RENDER_FIELDLINE_ITERATIONS] = [
 ];
 const RENDER_FIELDLINE_BAILOUT: f64 = 1000.0;
 const RENDER_FIELDLINE_BAILOUT_SQUARED: f64 = RENDER_FIELDLINE_BAILOUT * RENDER_FIELDLINE_BAILOUT;
-const RENDER_FIELDLINE_MAX_REFINEMENT: usize = 8;
 const RENDER_DERIVATIVE_RESCALE_HIGH: f64 = 1e120;
 #[cfg(target_arch = "wasm32")]
 const RENDER_DERIVATIVE_CHECK_SAFE: f64 = RENDER_DERIVATIVE_RESCALE_HIGH / 6.277101735386681e57;
@@ -3984,22 +3983,13 @@ fn finish_escaped_pixel_with_log64(
     rebase_count: u32,
 ) -> PixelResult64 {
     let mut post_iter = escape_iter;
-    for _ in 0..RENDER_FIELDLINE_MAX_REFINEMENT {
-        if z.re * z.re + z.im * z.im >= RENDER_FIELDLINE_BAILOUT_SQUARED {
-            break;
-        }
-        derivative.step_finite(z);
-        z = complex_add64(complex_square64(z), parameter);
-        post_iter += 1;
-        if !complex_is_finite64(z) {
-            break;
-        }
-        history.push(OrbitSample64 {
-            iter: post_iter,
-            z,
-            derivative,
-        });
-    }
+    refine_escaped_orbit64(
+        &mut z,
+        &mut derivative,
+        parameter,
+        &mut history,
+        &mut post_iter,
+    );
 
     let radius_squared = z.re * z.re + z.im * z.im;
     let log_radius = 0.5 * radius_squared.ln();
@@ -4024,6 +4014,32 @@ fn finish_escaped_pixel_with_log64(
         interior_probe_failed: false,
         phase,
         distance_pixels,
+    }
+}
+
+fn refine_escaped_orbit64(
+    z: &mut Complex64,
+    derivative: &mut ScaledDerivative64,
+    parameter: Complex64,
+    history: &mut OrbitHistory64,
+    post_iter: &mut u32,
+) {
+    // Continuous_iter_pp normalizes against the configured bailout, so its
+    // fractional iteration is valid only after the orbit actually reaches M.
+    // A fixed refinement count leaves slowly escaping points near c = -2 below
+    // M and creates a color plateau at the initial |z|_inf = 2 escape boundary.
+    while z.re * z.re + z.im * z.im < RENDER_FIELDLINE_BAILOUT_SQUARED {
+        derivative.step_finite(*z);
+        *z = complex_add64(complex_square64(*z), parameter);
+        *post_iter += 1;
+        if !complex_is_finite64(*z) {
+            break;
+        }
+        history.push(OrbitSample64 {
+            iter: *post_iter,
+            z: *z,
+            derivative: *derivative,
+        });
     }
 }
 
@@ -5615,6 +5631,38 @@ mod tests {
         let (smooth, normalized_fraction) = render_continuous_iteration64(23, radius);
         assert!((smooth - (23.0 - 1.5f64.log2())).abs() < 1e-12);
         assert!(normalized_fraction > -1.0 && normalized_fraction <= 0.0);
+    }
+
+    #[test]
+    fn early_escape_refinement_reaches_the_fieldline_bailout() {
+        let parameter = Complex64 {
+            re: -2.000_005,
+            im: 0.000_25,
+        };
+        let mut z = parameter;
+        let mut derivative = ScaledDerivative64::from_complex(Complex64 { re: 1.0, im: 0.0 });
+        let mut history = OrbitHistory64::new();
+        history.push(OrbitSample64 {
+            iter: 1,
+            z,
+            derivative,
+        });
+        let mut post_iter = 1;
+
+        refine_escaped_orbit64(
+            &mut z,
+            &mut derivative,
+            parameter,
+            &mut history,
+            &mut post_iter,
+        );
+
+        assert!(
+            post_iter > 1 + 8,
+            "regression sample must exceed the old fixed cap"
+        );
+        assert!(z.re * z.re + z.im * z.im >= RENDER_FIELDLINE_BAILOUT_SQUARED);
+        assert!(complex_is_finite64(z));
     }
 
     #[test]
