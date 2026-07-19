@@ -10,7 +10,6 @@ use wasm_bindgen::prelude::*;
 const RM: RoundingMode = RoundingMode::ToEven;
 const BASE_VIEW_WIDTH: f64 = 3.5;
 const DEFAULT_REFERENCE_CHECK_INTERVAL: u32 = 16;
-const REFERENCE_RESELECTION_MIN_ORBIT: u32 = 64;
 const REFERENCE_CANDIDATE_OFFSETS: [(f64, f64); 10] = [
     (0.25, 0.0),
     (-0.25, 0.0),
@@ -5659,8 +5658,12 @@ pub fn compute_view_reference(
     );
     let mut best_screen_x = center_x;
     let mut best_screen_y = center_y;
-    let minimum_orbit = max_iter.min(REFERENCE_RESELECTION_MIN_ORBIT);
-    if best_orbit.escaped_at >= minimum_orbit {
+    // A reference that survives the full iteration budget cannot be improved
+    // for this view. If the center escapes, however, search the existing
+    // viewport candidates even when its orbit is moderately long: a nearby
+    // longer orbit avoids reference-end rebasing glitches and keeps integer
+    // pixel pans translation-invariant.
+    if best_orbit.escaped_at >= max_iter {
         return build_reference_value(best_orbit, best_screen_x, best_screen_y);
     }
 

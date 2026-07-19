@@ -71,6 +71,15 @@ const F64_ENDPOINT_REGRESSION_VIEWS = [
     url: "/?re=-2&im=0&scale=4e15&iter=10000"
   }
 ] as const;
+const REFERENCE_TRANSLATION_GLITCH_VIEWS = {
+  base:
+    "/?re=-1.999999999999999999997722496865251610205723263864688621461471850802795099356956634910901357309140825996029399661389577551356892748e0&im=7.891588524974215555715249014515373714049880746694313785215894473057548291754182756314059836386496027274025794562877935926703781457e-56&scale=1.619259515236639561080134939673026635984902003650327369739897946785131221679441664912925939020188144206544943729378621306962757564e65",
+  shifted: {
+    re: "-1.999999999999999999997722496865251610205723263864688621461471850802569002932531810516739815041891241716386923560140864558598810486e0",
+    im: "7.891588525057871232752434040355144352932226930162029942677918280378038721646494834199637233428125399245380141201174438955315880712e-56",
+    scale: "1.619259515236639561080134939673026635984902003650327369739897946785131221679441664912925939020188144206544943729378621306962757563e65"
+  }
+} as const;
 const GRAY_EDGE_REGRESSION_URL =
   "/?re=-1.27943732849845421883617983015056333056548550645104382141825159351044164938397038329347978e0&im=-5.63147855791696141231505724508040262456380326148232169076294081643376175182702037659590245e-2&scale=2.31557868453953676955259871388625631367299552317831244832768609325162487992078455893055703e4&iter=1500";
 const PALETTE_FOOTPRINT_REGRESSION_URL =
@@ -703,6 +712,50 @@ test("preserves sub-ULP structure around the Re=-2 endpoint", async ({ page }) =
       expect(discontinuity.anomalousRatio).toBeLessThanOrEqual(0.02);
     }
   }
+});
+
+test("keeps the reported deep view invariant across an exact 20x74 pixel pan", async ({ page }) => {
+  test.setTimeout(30_000);
+  await page.setViewportSize({ width: 1912, height: 948 });
+
+  const initialStarted = Date.now();
+  await page.goto(REFERENCE_TRANSLATION_GLITCH_VIEWS.base);
+  const initialMetrics = await waitForStableMetrics(page, initialStarted, PERFORMANCE_BUDGET_MS);
+  expect(initialMetrics.status).toBe("stable");
+  expect(initialMetrics.stableMs).toBeLessThan(PERFORMANCE_BUDGET_MS);
+  expect(await readTileCounts(page)).toEqual({ completed: 120, total: 120 });
+  await storeReferenceTranslationBaseline(page);
+  await page.screenshot({ path: "test-results/reference-translation-base.png", fullPage: false });
+
+  const panStarted = Date.now();
+  await page.mouse.move(956, 474);
+  await page.mouse.down();
+  await page.mouse.move(936, 400, { steps: 1 });
+  await page.mouse.up();
+  const expectedCoordinatePrefix = {
+    re: REFERENCE_TRANSLATION_GLITCH_VIEWS.shifted.re.slice(0, -20),
+    im: REFERENCE_TRANSLATION_GLITCH_VIEWS.shifted.im.slice(0, -20),
+    scale: REFERENCE_TRANSLATION_GLITCH_VIEWS.shifted.scale
+  };
+  await expect.poll(() => {
+    const url = new URL(page.url());
+    return {
+      re: url.searchParams.get("re")?.slice(0, -20),
+      im: url.searchParams.get("im")?.slice(0, -20),
+      scale: url.searchParams.get("scale")
+    };
+  }).toEqual(expectedCoordinatePrefix);
+
+  const shiftedMetrics = await waitForStableMetrics(page, panStarted, PERFORMANCE_BUDGET_MS);
+  expect(shiftedMetrics.status).toBe("stable");
+  expect(shiftedMetrics.stableMs).toBeLessThan(PERFORMANCE_BUDGET_MS);
+  expect(await readTileCounts(page)).toEqual({ completed: 120, total: 120 });
+  await page.screenshot({ path: "test-results/reference-translation-shifted.png", fullPage: false });
+
+  const difference = await readReferenceTranslationDifference(page, 20, 74);
+  expect(difference.meanAbsoluteChannelDifference).toBeLessThanOrEqual(0.02);
+  expect(difference.maxChannelDifference).toBeLessThanOrEqual(16);
+  expect(difference.largeDifferenceRatio).toBeLessThanOrEqual(0.0001);
 });
 
 test("keeps reported minibrot geometry stable within the performance budget across tile boundaries and small view changes", async ({ page }) => {
@@ -1388,6 +1441,74 @@ async function waitForStableMetrics(
     await page.waitForTimeout(25);
   }
   return { status, stableMs: Date.now() - started };
+}
+
+async function storeReferenceTranslationBaseline(page: import("@playwright/test").Page): Promise<void> {
+  await page.evaluate(() => {
+    const canvas = document.querySelector<HTMLCanvasElement>("#fractal");
+    const gl = canvas?.getContext("webgl2", { alpha: false, antialias: false, preserveDrawingBuffer: true });
+    if (!canvas || !gl) throw new Error("Missing reference translation baseline target");
+    const pixels = new Uint8Array(canvas.width * canvas.height * 4);
+    gl.readPixels(0, 0, canvas.width, canvas.height, gl.RGBA, gl.UNSIGNED_BYTE, pixels);
+    (globalThis as unknown as {
+      __referenceTranslationBaseline?: { width: number; height: number; pixels: Uint8Array };
+    }).__referenceTranslationBaseline = { width: canvas.width, height: canvas.height, pixels };
+  });
+}
+
+async function readReferenceTranslationDifference(
+  page: import("@playwright/test").Page,
+  shiftX: number,
+  shiftY: number
+): Promise<{
+  meanAbsoluteChannelDifference: number;
+  maxChannelDifference: number;
+  largeDifferenceRatio: number;
+}> {
+  return page.evaluate(({ shiftX, shiftY }) => {
+    const canvas = document.querySelector<HTMLCanvasElement>("#fractal");
+    const gl = canvas?.getContext("webgl2", { alpha: false, antialias: false, preserveDrawingBuffer: true });
+    const baseline = (globalThis as unknown as {
+      __referenceTranslationBaseline?: { width: number; height: number; pixels: Uint8Array };
+    }).__referenceTranslationBaseline;
+    if (!canvas || !gl || !baseline || canvas.width !== baseline.width || canvas.height !== baseline.height) {
+      return {
+        meanAbsoluteChannelDifference: Number.POSITIVE_INFINITY,
+        maxChannelDifference: Number.POSITIVE_INFINITY,
+        largeDifferenceRatio: Number.POSITIVE_INFINITY
+      };
+    }
+
+    const width = canvas.width;
+    const height = canvas.height;
+    const current = new Uint8Array(width * height * 4);
+    gl.readPixels(0, 0, width, height, gl.RGBA, gl.UNSIGNED_BYTE, current);
+    const offset = (x: number, screenY: number) => ((height - 1 - screenY) * width + x) * 4;
+    let totalDifference = 0;
+    let maxChannelDifference = 0;
+    let largeDifferenceCount = 0;
+    let comparedPixels = 0;
+    for (let screenY = 0; screenY < height - shiftY; screenY += 1) {
+      for (let x = 0; x < width - shiftX; x += 1) {
+        const before = offset(x + shiftX, screenY + shiftY);
+        const after = offset(x, screenY);
+        let pixelMax = 0;
+        for (let channel = 0; channel < 3; channel += 1) {
+          const difference = Math.abs(baseline.pixels[before + channel] - current[after + channel]);
+          totalDifference += difference;
+          pixelMax = Math.max(pixelMax, difference);
+          maxChannelDifference = Math.max(maxChannelDifference, difference);
+        }
+        if (pixelMax > 8) largeDifferenceCount += 1;
+        comparedPixels += 1;
+      }
+    }
+    return {
+      meanAbsoluteChannelDifference: totalDifference / Math.max(1, comparedPixels * 3),
+      maxChannelDifference,
+      largeDifferenceRatio: largeDifferenceCount / Math.max(1, comparedPixels)
+    };
+  }, { shiftX, shiftY });
 }
 
 async function readHorizontalDarkSeamScore(

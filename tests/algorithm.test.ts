@@ -3,6 +3,7 @@ import { readFileSync } from "node:fs";
 import init, {
   apply_view_transform,
   compute_reference,
+  compute_view_reference,
   estimate_max_iter_bounded_radius,
   estimate_precision_bits
 } from "../src/wasm/pkg/mandelbrot_wasm";
@@ -41,6 +42,30 @@ describe("single perturbation path", () => {
 
   it("increases reference precision with zoom depth", () => {
     expect(estimate_precision_bits("1e100", 4096)).toBeGreaterThan(estimate_precision_bits("1", 4096));
+  });
+
+  it("reselects the longest viewport reference when the deep center orbit escapes", () => {
+    const raw = compute_view_reference(
+      "-1.999999999999999999997722496865251610205723263864688621461471850802795099356956634910901357309140825996029399661389577551356892748e0",
+      "7.891588524974215555715249014515373714049880746694313785215894473057548291754182756314059836386496027274025794562877935926703781457e-56",
+      "1.619259515236639561080134939673026635984902003650327369739897946785131221679441664912925939020188144206544943729378621306962757564e65",
+      1912,
+      948,
+      4686,
+      128
+    ) as {
+      escaped_at: number;
+      orbit_re: Float64Array;
+      orbit_im: Float64Array;
+      screen_x: number;
+      screen_y: number;
+    };
+
+    expect(raw.escaped_at).toBe(546);
+    expect(raw.orbit_re).toHaveLength(547);
+    expect(raw.orbit_im).toHaveLength(547);
+    expect(raw.screen_x).toBe(956);
+    expect(raw.screen_y).toBe(711);
   });
 
   it("renders final RGBA tiles through one resident reference", async () => {
