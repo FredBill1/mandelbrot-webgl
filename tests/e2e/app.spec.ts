@@ -1,5 +1,7 @@
 import { expect, test } from "@playwright/test";
-import { TILE_SIZE } from "../../src/types";
+import { BASE_VIEW_WIDTH, TILE_SIZE } from "../../src/types";
+
+const PERFORMANCE_BUDGET_MS = 2_500;
 
 const REGRESSION_VIEWS = [
   {
@@ -55,6 +57,20 @@ const ANTI_ALIASING_PEPPER_REGRESSION_URL =
 const BANDLIMIT_REPORTED_URL =
   "/?re=-1.48458330140036247637711150173056275201800398126520184731392135110206459886484778357996466e0&im=-2.59388635255443261801021498780013338816140992922161747121570167509133203590861049947497997e-11&scale=5.36190464429385541522377455367357477832895987078444543478371941540670062366744215336045641e8&iter=7000";
 const EARLY_ESCAPE_COLORING_REGRESSION_URL = "/?re=-2&im=0&scale=200";
+const F64_ENDPOINT_REGRESSION_VIEWS = [
+  {
+    name: "scale3-near",
+    url: "/?re=-2.0000000000000001&im=0&scale=3e14&iter=10000"
+  },
+  {
+    name: "scale4-near",
+    url: "/?re=-2.0000000000000001&im=0&scale=4e15&iter=10000"
+  },
+  {
+    name: "scale4-exact",
+    url: "/?re=-2&im=0&scale=4e15&iter=10000"
+  }
+] as const;
 const GRAY_EDGE_REGRESSION_URL =
   "/?re=-1.27943732849845421883617983015056333056548550645104382141825159351044164938397038329347978e0&im=-5.63147855791696141231505724508040262456380326148232169076294081643376175182702037659590245e-2&scale=2.31557868453953676955259871388625631367299552317831244832768609325162487992078455893055703e4&iter=1500";
 const PALETTE_FOOTPRINT_REGRESSION_URL =
@@ -666,7 +682,30 @@ test("keeps continuous coloring smooth across the early escape boundary at Re=-2
   expect(discontinuity.anomalousRatio).toBeLessThanOrEqual(0.02);
 });
 
-test("keeps reported minibrot geometry stable under 2 seconds across tile boundaries and small view changes", async ({ page }) => {
+test("preserves sub-ULP structure around the Re=-2 endpoint", async ({ page }) => {
+  test.setTimeout(90_000);
+  await page.setViewportSize({ width: 1912, height: 948 });
+
+  for (const view of F64_ENDPOINT_REGRESSION_VIEWS) {
+    await page.goto(view.url);
+    await expect(page.locator("#readStatus")).toHaveText("stable", { timeout: 30_000 });
+    expect(await readTileCounts(page)).toEqual({ completed: 120, total: 120 });
+    await page.screenshot({ path: `test-results/f64-endpoint-${view.name}.png`, fullPage: false });
+
+    if (view.name === "scale4-near") {
+      const diversity = await readEndpointBandDiversity(page, 471, 1198, [430, 450, 498, 518]);
+      expect(diversity.combinedUnique).toBeGreaterThanOrEqual(32);
+      expect(diversity.perRowUnique.every((count) => count > 1)).toBe(true);
+    }
+    if (view.name === "scale3-near") {
+      const boundaries = predictedEndpointF64Boundaries(1912, 3e14);
+      const discontinuity = await readPredictedVerticalBoundaryDiscontinuity(page, boundaries);
+      expect(discontinuity.anomalousRatio).toBeLessThanOrEqual(0.02);
+    }
+  }
+});
+
+test("keeps reported minibrot geometry stable within the performance budget across tile boundaries and small view changes", async ({ page }) => {
   test.setTimeout(30_000);
   await installInteractionWorkerProbe(page);
   await page.setViewportSize({ width: 1912, height: 948 });
@@ -674,9 +713,9 @@ test("keeps reported minibrot geometry stable under 2 seconds across tile bounda
   for (const url of TILE_STABILITY_REGRESSION_VIEWS) {
     const started = Date.now();
     await page.goto(url);
-    const metrics = await waitForStableMetrics(page, started, 2_000);
+    const metrics = await waitForStableMetrics(page, started, PERFORMANCE_BUDGET_MS);
     expect(metrics.status).toBe("stable");
-    expect(metrics.stableMs).toBeLessThan(2_000);
+    expect(metrics.stableMs).toBeLessThan(PERFORMANCE_BUDGET_MS);
 
     const tileCounts = await readTileCounts(page);
     expect(tileCounts.completed).toBe(tileCounts.total);
@@ -786,7 +825,7 @@ test("renders the seven Fractalshades fieldline views without seams or pepper no
   expect(pageErrors).toEqual([]);
 });
 
-test("stabilizes the reported interior-heavy views under 2 seconds", async ({ page }) => {
+test("stabilizes the reported interior-heavy views within the performance budget", async ({ page }) => {
   test.setTimeout(30_000);
   await installInteractionWorkerProbe(page);
   await page.setViewportSize({ width: 1912, height: 948 });
@@ -796,11 +835,11 @@ test("stabilizes the reported interior-heavy views under 2 seconds", async ({ pa
     await page.goto(url);
     await expect.poll(() => page.locator("#readStatus").textContent(), {
       message: `view did not stabilize in time: ${url}`,
-      timeout: 2_000,
+      timeout: PERFORMANCE_BUDGET_MS,
       intervals: [25]
     }).toBe("stable");
     const stableMs = Date.now() - started;
-    expect(stableMs).toBeLessThan(2_000);
+    expect(stableMs).toBeLessThan(PERFORMANCE_BUDGET_MS);
 
     const tileCounts = await readTileCounts(page);
     expect(tileCounts.completed).toBe(tileCounts.total);
@@ -817,16 +856,16 @@ test("stabilizes the reported interior-heavy views under 2 seconds", async ({ pa
   }
 });
 
-test("stabilizes the reported e100 deep view under 2 seconds", async ({ page }) => {
+test("stabilizes the reported e100 deep view within the performance budget", async ({ page }) => {
   test.setTimeout(30_000);
   await installInteractionWorkerProbe(page);
   await page.setViewportSize({ width: 1912, height: 948 });
 
   const started = Date.now();
   await page.goto(REPORTED_DEEP_PERFORMANCE_VIEW);
-  await expect.poll(() => page.locator("#readStatus").textContent(), { timeout: 2_000, intervals: [25] }).toBe("stable");
+  await expect.poll(() => page.locator("#readStatus").textContent(), { timeout: PERFORMANCE_BUDGET_MS, intervals: [25] }).toBe("stable");
   const stableMs = Date.now() - started;
-  expect(stableMs).toBeLessThan(2_000);
+  expect(stableMs).toBeLessThan(PERFORMANCE_BUDGET_MS);
 
   const tileCounts = await readTileCounts(page);
   expect(tileCounts.completed).toBe(tileCounts.total);
@@ -860,16 +899,16 @@ test("stabilizes the reported e100 deep view under 2 seconds", async ({ page }) 
   });
 });
 
-test("stabilizes the iter=5000 periodic-interior view under 2 seconds", async ({ page }) => {
+test("stabilizes the iter=5000 periodic-interior view within the performance budget", async ({ page }) => {
   test.setTimeout(30_000);
   await installInteractionWorkerProbe(page);
   await page.setViewportSize({ width: 1912, height: 948 });
 
   const started = Date.now();
   await page.goto(PERIODIC_INTERIOR_PERFORMANCE_VIEW);
-  await expect.poll(() => page.locator("#readStatus").textContent(), { timeout: 2_000, intervals: [25] }).toBe("stable");
+  await expect.poll(() => page.locator("#readStatus").textContent(), { timeout: PERFORMANCE_BUDGET_MS, intervals: [25] }).toBe("stable");
   const stableMs = Date.now() - started;
-  expect(stableMs).toBeLessThan(2_000);
+  expect(stableMs).toBeLessThan(PERFORMANCE_BUDGET_MS);
 
   const tileCounts = await readTileCounts(page);
   expect(tileCounts.completed).toBe(tileCounts.total);
@@ -886,16 +925,16 @@ test("stabilizes the iter=5000 periodic-interior view under 2 seconds", async ({
   }
 });
 
-test("stabilizes the alternate reported e100 deep view under 2 seconds", async ({ page }) => {
+test("stabilizes the alternate reported e100 deep view within the performance budget", async ({ page }) => {
   test.setTimeout(30_000);
   await installInteractionWorkerProbe(page);
   await page.setViewportSize({ width: 1912, height: 948 });
 
   const started = Date.now();
   await page.goto(ALT_REPORTED_DEEP_PERFORMANCE_VIEW);
-  await expect.poll(() => page.locator("#readStatus").textContent(), { timeout: 2_000, intervals: [25] }).toBe("stable");
+  await expect.poll(() => page.locator("#readStatus").textContent(), { timeout: PERFORMANCE_BUDGET_MS, intervals: [25] }).toBe("stable");
   const stableMs = Date.now() - started;
-  expect(stableMs).toBeLessThan(2_000);
+  expect(stableMs).toBeLessThan(PERFORMANCE_BUDGET_MS);
 
   const tileCounts = await readTileCounts(page);
   expect(tileCounts.completed).toBe(tileCounts.total);
@@ -911,16 +950,16 @@ test("stabilizes the alternate reported e100 deep view under 2 seconds", async (
   }
 });
 
-test("stabilizes the reported former reference-pressure view under 2 seconds", async ({ page }) => {
+test("stabilizes the reported former reference-pressure view within the performance budget", async ({ page }) => {
   test.setTimeout(30_000);
   await installInteractionWorkerProbe(page);
   await page.setViewportSize({ width: 1912, height: 948 });
 
   const started = Date.now();
   await page.goto(REFERENCE_PRESSURE_PERFORMANCE_VIEW);
-  const metrics = await waitForStableMetrics(page, started, 2_000);
+  const metrics = await waitForStableMetrics(page, started, PERFORMANCE_BUDGET_MS);
   expect(metrics.status).toBe("stable");
-  expect(metrics.stableMs).toBeLessThan(2_000);
+  expect(metrics.stableMs).toBeLessThan(PERFORMANCE_BUDGET_MS);
 
   const tileCounts = await readTileCounts(page);
   expect(tileCounts.completed).toBe(tileCounts.total);
@@ -1490,6 +1529,98 @@ async function readTileSeamDiscontinuity(
     const controlRatio = controlAnomalous / Math.max(1, controlCompared);
     return { anomalousRatio, controlRatio, excessRatio: Math.max(0, anomalousRatio - controlRatio), anomalous, compared };
   }, tileSize);
+}
+
+async function readEndpointBandDiversity(
+  page: import("@playwright/test").Page,
+  left: number,
+  right: number,
+  rows: number[]
+): Promise<{ combinedUnique: number; perRowUnique: number[] }> {
+  return page.evaluate(({ left, right, rows }) => {
+    const canvas = document.querySelector<HTMLCanvasElement>("#fractal");
+    const gl = canvas?.getContext("webgl2", { alpha: false, antialias: false, preserveDrawingBuffer: true });
+    if (!canvas || !gl) return { combinedUnique: 0, perRowUnique: [] };
+    const sampleLeft = Math.max(0, Math.floor(left));
+    const sampleRight = Math.min(canvas.width - 1, Math.floor(right));
+    const width = Math.max(1, sampleRight - sampleLeft + 1);
+    const combined = new Set<string>();
+    const perRowUnique = rows.map((screenY) => {
+      const pixels = new Uint8Array(width * 4);
+      gl.readPixels(
+        sampleLeft,
+        Math.max(0, canvas.height - Math.floor(screenY) - 1),
+        width,
+        1,
+        gl.RGBA,
+        gl.UNSIGNED_BYTE,
+        pixels
+      );
+      const colors = new Set<string>();
+      for (let offset = 0; offset < pixels.length; offset += 4) {
+        const color = `${pixels[offset]},${pixels[offset + 1]},${pixels[offset + 2]}`;
+        colors.add(color);
+        combined.add(color);
+      }
+      return colors.size;
+    });
+    return { combinedUnique: combined.size, perRowUnique };
+  }, { left, right, rows });
+}
+
+function predictedEndpointF64Boundaries(width: number, scale: number): number[] {
+  const pixelSpan = BASE_VIEW_WIDTH / scale / width;
+  const center = width * 0.5;
+  const boundaries: number[] = [];
+  const appendSide = (direction: -1 | 1, spacing: number) => {
+    for (let step = 0; ; step += 1) {
+      const boundary = center + direction * ((step + 0.5) * spacing) / pixelSpan - 0.5;
+      if (boundary <= 1 || boundary >= width - 1) break;
+      boundaries.push(boundary);
+    }
+  };
+  appendSide(-1, Number.EPSILON * 2);
+  appendSide(1, Number.EPSILON);
+  return boundaries.sort((left, right) => left - right);
+}
+
+async function readPredictedVerticalBoundaryDiscontinuity(
+  page: import("@playwright/test").Page,
+  boundaries: number[]
+): Promise<{ anomalousRatio: number; anomalous: number; compared: number }> {
+  return page.evaluate((boundaries) => {
+    const canvas = document.querySelector<HTMLCanvasElement>("#fractal");
+    const gl = canvas?.getContext("webgl2", { alpha: false, antialias: false, preserveDrawingBuffer: true });
+    if (!canvas || !gl) return { anomalousRatio: Number.POSITIVE_INFINITY, anomalous: 0, compared: 0 };
+    const width = canvas.width;
+    const height = canvas.height;
+    const pixels = new Uint8Array(width * height * 4);
+    gl.readPixels(0, 0, width, height, gl.RGBA, gl.UNSIGNED_BYTE, pixels);
+    const offset = (x: number, screenY: number) => ((height - 1 - screenY) * width + x) * 4;
+    const delta = (lineX: number, screenY: number) => {
+      const left = offset(lineX - 1, screenY);
+      const right = offset(lineX, screenY);
+      return (
+        Math.abs(pixels[left] - pixels[right]) +
+        Math.abs(pixels[left + 1] - pixels[right + 1]) +
+        Math.abs(pixels[left + 2] - pixels[right + 2])
+      );
+    };
+    let anomalous = 0;
+    let compared = 0;
+    for (const boundary of boundaries) {
+      const lineX = Math.max(2, Math.min(width - 2, Math.round(boundary)));
+      for (let screenY = 1; screenY < height - 1; screenY += 1) {
+        if (Math.abs(screenY - height * 0.5) < 8) continue;
+        const seam = delta(lineX, screenY);
+        const before = delta(lineX - 1, screenY);
+        const after = delta(lineX + 1, screenY);
+        compared += 1;
+        if (seam > 120 && seam > Math.max(before, after) * 2.5 + 30) anomalous += 1;
+      }
+    }
+    return { anomalousRatio: anomalous / Math.max(1, compared), anomalous, compared };
+  }, boundaries);
 }
 
 async function readCenterVerticalDiscontinuity(

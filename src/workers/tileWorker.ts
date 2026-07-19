@@ -13,6 +13,8 @@ interface ComputeReferenceMessage {
   centerRe: string;
   centerIm: string;
   scale: string;
+  width: number;
+  height: number;
   maxIter: number;
   minPrecisionBits: number;
 }

@@ -93,6 +93,58 @@ describe("single perturbation path", () => {
     expect(eager.stats.capHitUnknownCount).toBe(delayed.stats.capHitUnknownCount);
   });
 
+  it("keeps sub-ULP endpoint coordinates invariant across an exact 256-pixel reference shift", async () => {
+    const common = {
+      im: "0",
+      scale: "4e15",
+      maxIter: 10_000,
+      width: 1912,
+      height: 948
+    } as const;
+    const base = await makeMessage({
+      ...common,
+      re: "-2",
+      revision: 31
+    });
+    const shifted = await makeMessage({
+      ...common,
+      re: "-2.000000000000000117154811715481169408760410616898562715065988865982549160804637722321785986423492432",
+      revision: 32
+    });
+    const baseResult = await renderPerturbationTileWasm({
+      ...base,
+      tile: {
+        id: "endpoint-base",
+        rect: { x: 960, y: 300, width: 128, height: 4 },
+        revision: base.tile.revision
+      }
+    });
+    const shiftedResult = await renderPerturbationTileWasm({
+      ...shifted,
+      tile: {
+        id: "endpoint-shifted",
+        rect: { x: 1216, y: 300, width: 128, height: 4 },
+        revision: shifted.tile.revision
+      }
+    });
+
+    expect(shiftedResult.stats.escapedPixels).toBe(baseResult.stats.escapedPixels);
+    expect(shiftedResult.stats.periodicInteriorCount).toBe(baseResult.stats.periodicInteriorCount);
+    expect(shiftedResult.stats.capHitUnknownCount).toBe(baseResult.stats.capHitUnknownCount);
+    const baseRgba = new Uint8Array(baseResult.rgba);
+    const shiftedRgba = new Uint8Array(shiftedResult.rgba);
+    let totalDifference = 0;
+    let comparedChannels = 0;
+    for (let offset = 0; offset < baseRgba.length; offset += 4) {
+      for (let channel = 0; channel < 3; channel += 1) {
+        totalDifference += Math.abs(baseRgba[offset + channel] - shiftedRgba[offset + channel]);
+        comparedChannels += 1;
+      }
+      expect(shiftedRgba[offset + 3]).toBe(baseRgba[offset + 3]);
+    }
+    expect(totalDifference / comparedChannels).toBeLessThanOrEqual(1);
+  });
+
   it("returns deterministic SIMD tile preparation hints", async () => {
     const message = await makeMessage({
       re: "-7.5e-1",
@@ -211,13 +263,15 @@ async function makeMessage(view: {
     centerRe: view.re,
     centerIm: view.im,
     scale: view.scale,
+    width: view.width,
+    height: view.height,
     maxIter: view.maxIter,
     minPrecisionBits: 128
   });
   const reference: ReferenceSnapshot = {
     revision: view.revision,
-    screenX: view.width * 0.5,
-    screenY: view.height * 0.5,
+    screenX: raw.screenX,
+    screenY: raw.screenY,
     maxIterBoundedRadius: raw.maxIterBoundedRadius,
     orbitRe: raw.orbitRe,
     orbitIm: raw.orbitIm

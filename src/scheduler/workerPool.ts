@@ -10,6 +10,8 @@ import type {
 } from "../types";
 
 export interface RawReferenceResult {
+  screenX: number;
+  screenY: number;
   maxIterBoundedRadius: number;
   orbitRe: Float64Array;
   orbitIm: Float64Array;
@@ -62,6 +64,8 @@ interface ComputeReferenceMessage {
   centerRe: string;
   centerIm: string;
   scale: string;
+  width: number;
+  height: number;
   maxIter: number;
   minPrecisionBits: number;
 }
@@ -221,6 +225,8 @@ export class TileWorkerPool {
           centerRe: view.re,
           centerIm: view.im,
           scale: view.scale,
+          width: view.width,
+          height: view.height,
           maxIter: view.maxIter,
           minPrecisionBits: 128
         },
@@ -234,8 +240,8 @@ export class TileWorkerPool {
     });
     const reference = {
       revision: view.revision,
-      screenX: view.width * 0.5,
-      screenY: view.height * 0.5,
+      screenX: raw.screenX,
+      screenY: raw.screenY,
       maxIterBoundedRadius: raw.maxIterBoundedRadius,
       orbitRe: raw.orbitRe,
       orbitIm: raw.orbitIm

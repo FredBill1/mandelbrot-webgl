@@ -10,6 +10,19 @@ use wasm_bindgen::prelude::*;
 const RM: RoundingMode = RoundingMode::ToEven;
 const BASE_VIEW_WIDTH: f64 = 3.5;
 const DEFAULT_REFERENCE_CHECK_INTERVAL: u32 = 16;
+const REFERENCE_RESELECTION_MIN_ORBIT: u32 = 64;
+const REFERENCE_CANDIDATE_OFFSETS: [(f64, f64); 10] = [
+    (0.25, 0.0),
+    (-0.25, 0.0),
+    (0.0, 0.25),
+    (0.0, -0.25),
+    (0.25, 0.25),
+    (0.25, -0.25),
+    (-0.25, 0.25),
+    (-0.25, -0.25),
+    (0.4375, 0.0),
+    (-0.4375, 0.0),
+];
 
 #[derive(Deserialize)]
 struct ViewInput {
@@ -374,7 +387,11 @@ fn replay_two_mul_block(
     }
 }
 
-fn build_reference_value(orbit: OrbitResult) -> Result<JsValue, JsValue> {
+fn build_reference_value(
+    orbit: OrbitResult,
+    screen_x: f64,
+    screen_y: f64,
+) -> Result<JsValue, JsValue> {
     let object = Object::new();
     set_js_property(
         &object,
@@ -386,6 +403,8 @@ fn build_reference_value(orbit: OrbitResult) -> Result<JsValue, JsValue> {
     let orbit_im = Float64Array::from(orbit.orbit_im.as_slice());
     set_js_property(&object, "orbit_re", orbit_re.as_ref())?;
     set_js_property(&object, "orbit_im", orbit_im.as_ref())?;
+    set_js_property(&object, "screen_x", &JsValue::from_f64(screen_x))?;
+    set_js_property(&object, "screen_y", &JsValue::from_f64(screen_y))?;
 
     Ok(object.into())
 }
@@ -517,6 +536,15 @@ struct OrbitHistory64 {
     samples: [OrbitSample64; RENDER_FIELDLINE_HISTORY],
     len: usize,
     next: usize,
+}
+
+struct EscapedPerturbState64 {
+    iter: u32,
+    ref_index: usize,
+    dz: Complex64,
+    z: Complex64,
+    derivative: ScaledDerivative64,
+    history: OrbitHistory64,
 }
 
 #[derive(Default)]
@@ -3145,20 +3173,24 @@ fn replay_perturb_history_lane64(
     orbit_re: &[f64],
     orbit_im: &[f64],
     limit: usize,
-) -> (OrbitHistory64, ScaledDerivative64) {
+) -> EscapedPerturbState64 {
     let mut history = OrbitHistory64::new();
     let mut iter = checkpoint.iter;
     let mut dz_re = pair_lane(checkpoint.dz.re, lane);
     let mut dz_im = pair_lane(checkpoint.dz.im, lane);
     let mut derivative = checkpoint.derivative.extract(lane);
     let mut ref_index = checkpoint.ref_index[lane];
+    let mut z = Complex64 {
+        re: f64::NAN,
+        im: f64::NAN,
+    };
 
     while iter <= end_iter {
         let ref_re = orbit_re[ref_index];
         let ref_im = orbit_im[ref_index];
         let z_re = ref_re + dz_re;
         let z_im = ref_im + dz_im;
-        let z = Complex64 { re: z_re, im: z_im };
+        z = Complex64 { re: z_re, im: z_im };
         history.push(OrbitSample64 {
             iter,
             z,
@@ -3184,16 +3216,33 @@ fn replay_perturb_history_lane64(
         }
 
         derivative.step_finite(z);
-        let factor_re = step_ref_re + step_ref_re + dz_re;
-        let factor_im = step_ref_im + step_ref_im + dz_im;
-        let next_re = dz_re * factor_re - dz_im * factor_im + c_re;
-        let next_im = dz_re * factor_im + dz_im * factor_re + c_im;
-        dz_re = next_re;
-        dz_im = next_im;
+        let next = perturb_step64(
+            Complex64 {
+                re: step_ref_re,
+                im: step_ref_im,
+            },
+            Complex64 {
+                re: dz_re,
+                im: dz_im,
+            },
+            Complex64 { re: c_re, im: c_im },
+        );
+        dz_re = next.re;
+        dz_im = next.im;
         iter += 1;
         ref_index += 1;
     }
-    (history, derivative)
+    EscapedPerturbState64 {
+        iter,
+        ref_index,
+        dz: Complex64 {
+            re: dz_re,
+            im: dz_im,
+        },
+        z,
+        derivative,
+        history,
+    }
 }
 
 #[cfg(target_arch = "wasm32")]
@@ -3403,17 +3452,6 @@ fn perturb_pair64_impl(
     let mut ref_index = [0usize; 2];
     let mut rebase_count = [0u32; 2];
     let mut results = [failed_pixel_result64(max_iter, 0); 2];
-    let parameter = [
-        Complex64 {
-            re: orbit_re.get(1).copied().unwrap_or(0.0) + c_re[0],
-            im: orbit_im.get(1).copied().unwrap_or(0.0) + c_im[0],
-        },
-        Complex64 {
-            re: orbit_re.get(1).copied().unwrap_or(0.0) + c_re[1],
-            im: orbit_im.get(1).copied().unwrap_or(0.0) + c_im[1],
-        },
-    ];
-
     if series.skip > 0 {
         let (series_value, series_derivative) = evaluate_series_and_derivative_pair64(series, c);
         dz = series_value;
@@ -3615,11 +3653,7 @@ fn perturb_pair64_impl(
                     continue;
                 }
                 if escape_bits & (1 << lane) != 0 {
-                    let z_scalar = Complex64 {
-                        re: pair_lane(z.re, lane),
-                        im: pair_lane(z.im, lane),
-                    };
-                    let (replayed_history, replayed_derivative) = replay_perturb_history_lane64(
+                    let mut escaped_state = replay_perturb_history_lane64(
                         replay_checkpoint.expect("escape history and derivative are replayed"),
                         iter,
                         lane,
@@ -3629,22 +3663,32 @@ fn perturb_pair64_impl(
                         orbit_im,
                         limit,
                     );
-                    let scalar_history = complete_series_history64(
-                        replayed_history,
+                    escaped_state.history = complete_series_history64(
+                        escaped_state.history,
                         series,
                         c_re[lane],
                         c_im[lane],
                         orbit_re,
                         orbit_im,
                     );
+                    refine_escaped_perturbation64(
+                        &mut escaped_state,
+                        Complex64 {
+                            re: c_re[lane],
+                            im: c_im[lane],
+                        },
+                        orbit_re,
+                        orbit_im,
+                        limit,
+                    );
                     results[lane] = finish_escaped_pixel_with_log64(
                         iter,
-                        z_scalar,
-                        replayed_derivative,
-                        parameter[lane],
+                        escaped_state.iter,
+                        escaped_state.z,
+                        escaped_state.derivative,
                         pixel_span,
                         log_pixel_span,
-                        scalar_history,
+                        escaped_state.history,
                         rebase_count[lane],
                     );
                     active[lane] = false;
@@ -3794,11 +3838,6 @@ fn perturb64(
     let mut rebase_count = 0u32;
     let mut derivative = ScaledDerivative64::zero();
     let mut history = OrbitHistory64::new();
-    let parameter = Complex64 {
-        re: orbit_re.get(1).copied().unwrap_or(0.0) + c_re,
-        im: orbit_im.get(1).copied().unwrap_or(0.0) + c_im,
-    };
-
     if series.skip > 0 {
         let dz = evaluate_series64(series, c_re, c_im);
         dz_re = dz.re;
@@ -3833,13 +3872,31 @@ fn perturb64(
         if z_norm > 2.0 {
             let history =
                 complete_series_history64(history, series, c_re, c_im, orbit_re, orbit_im);
-            return finish_escaped_pixel64(
+            let mut escaped_state = EscapedPerturbState64 {
                 iter,
+                ref_index,
+                dz: Complex64 {
+                    re: dz_re,
+                    im: dz_im,
+                },
                 z,
                 derivative,
-                parameter,
-                pixel_span,
                 history,
+            };
+            refine_escaped_perturbation64(
+                &mut escaped_state,
+                Complex64 { re: c_re, im: c_im },
+                orbit_re,
+                orbit_im,
+                limit,
+            );
+            return finish_escaped_pixel64(
+                iter,
+                escaped_state.iter,
+                escaped_state.z,
+                escaped_state.derivative,
+                pixel_span,
+                escaped_state.history,
                 rebase_count,
             );
         }
@@ -3868,12 +3925,19 @@ fn perturb64(
         }
 
         derivative.step_finite(z);
-        let dz2_re = dz_re * dz_re - dz_im * dz_im;
-        let dz2_im = 2.0 * dz_re * dz_im;
-        let two_ref_dz_re = 2.0 * (step_ref_re * dz_re - step_ref_im * dz_im);
-        let two_ref_dz_im = 2.0 * (step_ref_re * dz_im + step_ref_im * dz_re);
-        dz_re = two_ref_dz_re + dz2_re + c_re;
-        dz_im = two_ref_dz_im + dz2_im + c_im;
+        let next = perturb_step64(
+            Complex64 {
+                re: step_ref_re,
+                im: step_ref_im,
+            },
+            Complex64 {
+                re: dz_re,
+                im: dz_im,
+            },
+            Complex64 { re: c_re, im: c_im },
+        );
+        dz_re = next.re;
+        dz_im = next.im;
         iter += 1;
         ref_index += 1;
     }
@@ -3953,18 +4017,18 @@ fn failed_pixel_result64(iter: u32, rebase_count: u32) -> PixelResult64 {
 #[cfg(any(test, not(target_arch = "wasm32")))]
 fn finish_escaped_pixel64(
     escape_iter: u32,
+    post_iter: u32,
     z: Complex64,
     derivative: ScaledDerivative64,
-    parameter: Complex64,
     pixel_span: f64,
     history: OrbitHistory64,
     rebase_count: u32,
 ) -> PixelResult64 {
     finish_escaped_pixel_with_log64(
         escape_iter,
+        post_iter,
         z,
         derivative,
-        parameter,
         pixel_span,
         pixel_span.abs().ln(),
         history,
@@ -3975,23 +4039,14 @@ fn finish_escaped_pixel64(
 #[allow(clippy::too_many_arguments)]
 fn finish_escaped_pixel_with_log64(
     escape_iter: u32,
-    mut z: Complex64,
-    mut derivative: ScaledDerivative64,
-    parameter: Complex64,
+    post_iter: u32,
+    z: Complex64,
+    derivative: ScaledDerivative64,
     pixel_span: f64,
     log_pixel_span: f64,
-    mut history: OrbitHistory64,
+    history: OrbitHistory64,
     rebase_count: u32,
 ) -> PixelResult64 {
-    let mut post_iter = escape_iter;
-    refine_escaped_orbit64(
-        &mut z,
-        &mut derivative,
-        parameter,
-        &mut history,
-        &mut post_iter,
-    );
-
     let radius_squared = z.re * z.re + z.im * z.im;
     let log_radius = 0.5 * radius_squared.ln();
     let (smooth, nu_frac) = render_continuous_iteration_from_log64(post_iter, log_radius);
@@ -4019,29 +4074,68 @@ fn finish_escaped_pixel_with_log64(
     }
 }
 
-fn refine_escaped_orbit64(
-    z: &mut Complex64,
-    derivative: &mut ScaledDerivative64,
-    parameter: Complex64,
-    history: &mut OrbitHistory64,
-    post_iter: &mut u32,
+fn refine_escaped_perturbation64(
+    state: &mut EscapedPerturbState64,
+    c_delta: Complex64,
+    orbit_re: &[f64],
+    orbit_im: &[f64],
+    limit: usize,
 ) {
     // Continuous_iter_pp normalizes against the configured bailout, so its
     // fractional iteration is valid only after the orbit actually reaches M.
-    // A fixed refinement count leaves slowly escaping points near c = -2 below
-    // M and creates a color plateau at the initial |z|_inf = 2 escape boundary.
-    while z.re * z.re + z.im * z.im < RENDER_FIELDLINE_BAILOUT_SQUARED {
-        derivative.step_finite(*z);
-        *z = complex_add64(complex_square64(*z), parameter);
-        *post_iter += 1;
-        if !complex_is_finite64(*z) {
+    // Keep the deep-zoom parameter as reference + delta throughout refinement;
+    // reconstructing an absolute f64 parameter here quantizes sub-ULP pixels.
+    while state.z.re * state.z.re + state.z.im * state.z.im < RENDER_FIELDLINE_BAILOUT_SQUARED {
+        if state.ref_index > limit {
             break;
         }
-        history.push(OrbitSample64 {
-            iter: *post_iter,
-            z: *z,
-            derivative: *derivative,
+
+        let reference = Complex64 {
+            re: orbit_re[state.ref_index],
+            im: orbit_im[state.ref_index],
+        };
+        let z_norm = state.z.re.abs().max(state.z.im.abs());
+        let dz_norm = state.dz.re.abs().max(state.dz.im.abs());
+        let mut step_reference = reference;
+        if state.ref_index > 0 && (z_norm < dz_norm || state.ref_index == limit) {
+            state.dz = state.z;
+            state.ref_index = 0;
+            step_reference = Complex64 {
+                re: orbit_re[0],
+                im: orbit_im[0],
+            };
+        }
+
+        state.derivative.step_finite(state.z);
+        state.dz = perturb_step64(step_reference, state.dz, c_delta);
+        state.iter += 1;
+        state.ref_index += 1;
+        if state.ref_index > limit {
+            break;
+        }
+        state.z = Complex64 {
+            re: orbit_re[state.ref_index] + state.dz.re,
+            im: orbit_im[state.ref_index] + state.dz.im,
+        };
+        if !complex_is_finite64(state.z) {
+            break;
+        }
+        state.history.push(OrbitSample64 {
+            iter: state.iter,
+            z: state.z,
+            derivative: state.derivative,
         });
+    }
+}
+
+fn perturb_step64(reference: Complex64, dz: Complex64, c_delta: Complex64) -> Complex64 {
+    let factor = Complex64 {
+        re: reference.re + reference.re + dz.re,
+        im: reference.im + reference.im + dz.im,
+    };
+    Complex64 {
+        re: dz.re * factor.re - dz.im * factor.im + c_delta.re,
+        im: dz.re * factor.im + dz.im * factor.re + c_delta.im,
     }
 }
 
@@ -5535,7 +5629,102 @@ pub fn compute_reference(
     let cr = parse_float(center_re, bits)?;
     let ci = parse_float(center_im, bits)?;
     let orbit = run_two_mul_sparse_orbit(&cr, &ci, max_iter, p, DEFAULT_REFERENCE_CHECK_INTERVAL);
-    build_reference_value(orbit)
+    build_reference_value(orbit, 0.0, 0.0)
+}
+
+#[wasm_bindgen]
+#[allow(clippy::too_many_arguments)]
+pub fn compute_view_reference(
+    center_re: &str,
+    center_im: &str,
+    scale: &str,
+    width: f64,
+    height: f64,
+    max_iter: u32,
+    precision_bits: u32,
+) -> Result<JsValue, JsValue> {
+    let bits = precision_bits.max(estimate_precision_bits(scale, max_iter));
+    let p = precision(bits);
+    let center_re = parse_float(center_re, bits)?;
+    let center_im = parse_float(center_im, bits)?;
+    let scale = parse_float(scale, bits)?;
+    let center_x = width.max(1.0) * 0.5;
+    let center_y = height.max(1.0) * 0.5;
+    let mut best_orbit = run_two_mul_sparse_orbit(
+        &center_re,
+        &center_im,
+        max_iter,
+        p,
+        DEFAULT_REFERENCE_CHECK_INTERVAL,
+    );
+    let mut best_screen_x = center_x;
+    let mut best_screen_y = center_y;
+    let minimum_orbit = max_iter.min(REFERENCE_RESELECTION_MIN_ORBIT);
+    if best_orbit.escaped_at >= minimum_orbit {
+        return build_reference_value(best_orbit, best_screen_x, best_screen_y);
+    }
+
+    let pixel_span = bf_from_f64(BASE_VIEW_WIDTH, bits).div(&scale, p, RM).div(
+        &bf_from_f64(width.max(1.0), bits),
+        p,
+        RM,
+    );
+
+    // Prefer the nearest binary64 coordinate when it is still inside the
+    // viewport.  Adjacent views then select the same physical reference
+    // instead of picking different points from the fallback probe grid.
+    let snapped_re = bf_from_f64(bf_to_f64(&center_re), bits);
+    let snapped_im = bf_from_f64(bf_to_f64(&center_im), bits);
+    let snapped_dx = bf_to_f64(&center_re.sub(&snapped_re, p, RM).div(&pixel_span, p, RM));
+    let snapped_dy = bf_to_f64(&center_im.sub(&snapped_im, p, RM).div(&pixel_span, p, RM));
+    let snapped_screen_x = center_x - snapped_dx;
+    let snapped_screen_y = center_y - snapped_dy;
+    if snapped_screen_x.is_finite()
+        && snapped_screen_y.is_finite()
+        && (0.0..=width.max(1.0)).contains(&snapped_screen_x)
+        && (0.0..=height.max(1.0)).contains(&snapped_screen_y)
+    {
+        let snapped_orbit = run_two_mul_sparse_orbit(
+            &snapped_re,
+            &snapped_im,
+            max_iter,
+            p,
+            DEFAULT_REFERENCE_CHECK_INTERVAL,
+        );
+        if snapped_orbit.escaped_at > best_orbit.escaped_at {
+            best_orbit = snapped_orbit;
+            best_screen_x = snapped_screen_x;
+            best_screen_y = snapped_screen_y;
+            if best_orbit.escaped_at >= max_iter {
+                return build_reference_value(best_orbit, best_screen_x, best_screen_y);
+            }
+        }
+    }
+
+    for (x_fraction, y_fraction) in REFERENCE_CANDIDATE_OFFSETS {
+        let screen_dx = width.max(1.0) * x_fraction;
+        let screen_dy = height.max(1.0) * y_fraction;
+        let candidate_re =
+            center_re.add(&pixel_span.mul(&bf_from_f64(screen_dx, bits), p, RM), p, RM);
+        let candidate_im =
+            center_im.add(&pixel_span.mul(&bf_from_f64(screen_dy, bits), p, RM), p, RM);
+        let candidate_orbit = run_two_mul_sparse_orbit(
+            &candidate_re,
+            &candidate_im,
+            max_iter,
+            p,
+            DEFAULT_REFERENCE_CHECK_INTERVAL,
+        );
+        if candidate_orbit.escaped_at > best_orbit.escaped_at {
+            best_orbit = candidate_orbit;
+            best_screen_x = center_x + screen_dx;
+            best_screen_y = center_y + screen_dy;
+            if best_orbit.escaped_at >= max_iter {
+                break;
+            }
+        }
+    }
+    build_reference_value(best_orbit, best_screen_x, best_screen_y)
 }
 
 #[cfg(test)]
@@ -5716,30 +5905,97 @@ mod tests {
             re: -2.000_005,
             im: 0.000_25,
         };
-        let mut z = parameter;
-        let mut derivative = ScaledDerivative64::from_complex(Complex64 { re: 1.0, im: 0.0 });
+        let z = parameter;
+        let derivative = ScaledDerivative64::from_complex(Complex64 { re: 1.0, im: 0.0 });
         let mut history = OrbitHistory64::new();
         history.push(OrbitSample64 {
             iter: 1,
             z,
             derivative,
         });
-        let mut post_iter = 1;
-
-        refine_escaped_orbit64(
-            &mut z,
-            &mut derivative,
-            parameter,
-            &mut history,
-            &mut post_iter,
+        let mut state = EscapedPerturbState64 {
+            iter: 1,
+            ref_index: 1,
+            dz: Complex64 { re: 0.0, im: 0.0 },
+            z,
+            derivative,
+            history,
+        };
+        refine_escaped_perturbation64(
+            &mut state,
+            Complex64 { re: 0.0, im: 0.0 },
+            &[0.0, parameter.re],
+            &[0.0, parameter.im],
+            1,
         );
 
         assert!(
-            post_iter > 1 + 8,
+            state.iter > 1 + 8,
             "regression sample must exceed the old fixed cap"
         );
-        assert!(z.re * z.re + z.im * z.im >= RENDER_FIELDLINE_BAILOUT_SQUARED);
-        assert!(complex_is_finite64(z));
+        assert!(
+            state.z.re * state.z.re + state.z.im * state.z.im >= RENDER_FIELDLINE_BAILOUT_SQUARED
+        );
+        assert!(complex_is_finite64(state.z));
+    }
+
+    #[test]
+    fn escaped_refinement_preserves_sub_ulp_parameter_deltas() {
+        let low = -1e-16;
+        let high = 1e-16;
+        assert_eq!(-2.0 + low, -2.0 + high);
+
+        let make_state = |dz_re: f64| {
+            let escaped_re = f64::from_bits(2.0f64.to_bits() + 1);
+            let z = Complex64 {
+                re: escaped_re,
+                im: 0.0,
+            };
+            let derivative = ScaledDerivative64::from_complex(Complex64 { re: 1.0, im: 0.0 });
+            let mut history = OrbitHistory64::new();
+            history.push(OrbitSample64 {
+                iter: 2,
+                z,
+                derivative,
+            });
+            EscapedPerturbState64 {
+                iter: 2,
+                ref_index: 2,
+                dz: Complex64 { re: dz_re, im: 0.0 },
+                z,
+                derivative,
+                history,
+            }
+        };
+        let orbit_re = [0.0, -2.0, 2.0, 2.0];
+        let orbit_im = [0.0, 0.0, 0.0, 0.0];
+        let mut left = make_state(4e-16);
+        let mut right = make_state(6e-16);
+        refine_escaped_perturbation64(
+            &mut left,
+            Complex64 { re: low, im: 0.0 },
+            &orbit_re,
+            &orbit_im,
+            3,
+        );
+        refine_escaped_perturbation64(
+            &mut right,
+            Complex64 { re: high, im: 0.0 },
+            &orbit_re,
+            &orbit_im,
+            3,
+        );
+
+        assert!(complex_is_finite64(left.z));
+        assert!(complex_is_finite64(right.z));
+        assert!(left.z.re * left.z.re + left.z.im * left.z.im >= RENDER_FIELDLINE_BAILOUT_SQUARED);
+        assert!(
+            right.z.re * right.z.re + right.z.im * right.z.im >= RENDER_FIELDLINE_BAILOUT_SQUARED
+        );
+        assert_ne!(
+            (left.z.re.to_bits(), left.z.im.to_bits()),
+            (right.z.re.to_bits(), right.z.im.to_bits())
+        );
     }
 
     #[test]
@@ -6040,12 +6296,12 @@ mod tests {
     fn invalid_fieldline_falls_back_to_log_continuous_iteration() {
         let result = finish_escaped_pixel64(
             7,
+            7,
             Complex64 {
                 re: 1000.0,
                 im: 0.0,
             },
             ScaledDerivative64::from_complex(Complex64 { re: 1.0, im: 0.0 }),
-            Complex64 { re: 0.0, im: 0.0 },
             1e-6,
             OrbitHistory64::new(),
             0,

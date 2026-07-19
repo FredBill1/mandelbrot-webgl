@@ -1,5 +1,5 @@
 import init, {
-  compute_reference,
+  compute_view_reference,
   estimate_max_iter_bounded_radius,
   estimate_precision_bits,
   prepare_tiles,
@@ -18,19 +18,33 @@ export async function computeReferenceWasm(input: {
   centerRe: string;
   centerIm: string;
   scale: string;
+  width: number;
+  height: number;
   maxIter: number;
   minPrecisionBits: number;
 }): Promise<RawReferenceResult> {
   await initRenderWasm();
   const precisionBits = Math.max(input.minPrecisionBits, estimate_precision_bits(input.scale, input.maxIter));
-  const raw = compute_reference(input.centerRe, input.centerIm, input.maxIter, precisionBits) as {
+  const raw = compute_view_reference(
+    input.centerRe,
+    input.centerIm,
+    input.scale,
+    input.width,
+    input.height,
+    input.maxIter,
+    precisionBits
+  ) as {
     escaped_at: number;
+    screen_x: number;
+    screen_y: number;
     orbit_re: Float64Array | number[];
     orbit_im: Float64Array | number[];
   };
   const orbitRe = asFloat64(raw.orbit_re);
   const orbitIm = asFloat64(raw.orbit_im);
   return {
+    screenX: raw.screen_x,
+    screenY: raw.screen_y,
     maxIterBoundedRadius: estimate_max_iter_bounded_radius(raw.escaped_at, input.maxIter, orbitRe, orbitIm),
     orbitRe,
     orbitIm
